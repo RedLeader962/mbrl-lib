@@ -570,7 +570,7 @@ def create_agent_from_hub(repo_id: str, token: str = None):
 
             from mbrl.planning.sac_wrapper import SACAgent
 
-            agent: pytorch_sac.SAC = hydra.utils.instantiate(cfg.algorithm.agent)
+            agent: pytorch_sac.SAC = hydra.utils.instantiate(cfg.algorithm.agent, _recursive_=False)
             agent.load_checkpoint(ckpt_path=temp_dir / "checkpoint.pth")
             return SACAgent(agent)
         else:

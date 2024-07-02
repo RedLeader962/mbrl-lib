@@ -1,5 +1,6 @@
-omegaconf>=2.0,<2.1
-hydra-core>=1.0.3
+omegaconf>=2.0
+# hydra-core>=1.1
+hydra-core==1.1.0
 termcolor>=1.1.0
 tensorboard>=2.4.0
 imageio>=2.9.0
