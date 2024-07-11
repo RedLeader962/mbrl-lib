@@ -524,7 +524,9 @@ class TrajectoryOptimizer:
     ):
         optimizer_cfg.lower_bound = np.tile(action_lb, (planning_horizon, 1)).tolist()
         optimizer_cfg.upper_bound = np.tile(action_ub, (planning_horizon, 1)).tolist()
-        self.optimizer: Optimizer = hydra.utils.instantiate(optimizer_cfg, _recursive_=False)
+        self.optimizer: Optimizer = hydra.utils.instantiate(
+            optimizer_cfg, _recursive_=False
+        )
         self.initial_solution = (
             ((torch.tensor(action_lb) + torch.tensor(action_ub)) / 2)
             .float()
