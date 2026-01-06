@@ -1,0 +1,17 @@
+# A2G Core Configuration
+A2G:
+  super_project: "mbrl-lib"
+  workflow: "supervised"  # supervised | autonomous
+
+# Specialized Guidelines Activation
+specialized_guidelines:
+  - "guidelines.dna.md"
+  - "guidelines.markdown.md"
+  - "guidelines.n2st.md"
+  - "guidelines.nbs.md"
+  - "guidelines.python.md"
+  - "guidelines.shell_script.md"
+
+branches:
+  bleeding_edge: "dev"
+  release: "main"
