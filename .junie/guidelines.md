@@ -29,15 +29,16 @@ See A2G general guidelines for complete procedures and requirements.
 
 ## Repository Organization
 
-- `.dockerized_norlab` contains DNA configuration files.
+[//]: # (- `.dockerized_norlab` contains DNA configuration files.)
 - `.junie/` contains AI agent related files.
 - `.junie/ai_agent_guidelines` contains _AI Agent Guidelines (A2G)_ with entrypoint at
   `.junie/ai_agent_guidelines/README.md`.
-- `src/` contains repository source code.
+- `mbrl/` contains repository source code.
 - `tests/` contains tests files.
-- `artifact/` contains runtime produced data such as experimental log, plot and trained model.
-- `data/` contains input data such as _test data_, _demo data_ or _experimental data_.
-- `utilities/` contains external libraries.
+- `exp/` contains runtime produced data such as experimental log, plot and trained model.
+
+[//]: # (- `data/` contains input data such as _test data_, _demo data_ or _experimental data_.)
+[//]: # (- `utilities/` contains external libraries.)
 
 [//]: # (TODO: add missing directory)
 
