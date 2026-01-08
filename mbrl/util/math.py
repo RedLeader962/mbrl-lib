@@ -92,10 +92,10 @@ def truncated_normal_(
     return tensor
 
 
-class Normalizer:
+class Normalizer(torch.nn.Module):
     """Class that keeps a running mean and variance and normalizes data accordingly.
 
-    The statistics kept are stored in torch tensors.
+    The statistics kept are stored in torch tensors as registered buffers.
 
     Args:
         in_size (int): the size of the data that will be normalized.
@@ -106,10 +106,15 @@ class Normalizer:
     _STATS_FNAME = "env_stats.pickle"
 
     def __init__(self, in_size: int, device: torch.device, dtype=torch.float32):
-        self.mean = torch.zeros((1, in_size), device=device, dtype=dtype)
-        self.std = torch.ones((1, in_size), device=device, dtype=dtype)
+        super().__init__()
+        self.register_buffer("mean", torch.zeros((1, in_size), dtype=dtype))
+        self.register_buffer("std", torch.ones((1, in_size), dtype=dtype))
         self.eps = 1e-12 if dtype == torch.double else 1e-5
-        self.device = device
+        self.to(device)
+
+    @property
+    def device(self):
+        return self.mean.device
 
     def update_stats(self, data: mbrl.types.TensorType):
         """Updates the stored statistics using the given data.
@@ -126,8 +131,11 @@ class Normalizer:
             data = data.float()
         data = data.to(self.device)
         self.mean = data.mean(0, keepdim=True)
-        self.std = data.std(0, keepdim=True)
-        self.std[self.std < self.eps] = 1.0
+        if data.shape[0] > 1:
+            self.std = data.std(0, keepdim=True)
+        else:
+            self.std = torch.ones_like(self.mean)
+        self.std[torch.logical_or(self.std < self.eps, torch.isnan(self.std))] = 1.0
 
     def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
         """Normalizes the value according to the stored statistics.
@@ -177,8 +185,8 @@ class Normalizer:
         """Loads saved statistics from the given path."""
         with open(pathlib.Path(results_dir) / self._STATS_FNAME, "rb") as f:
             stats = pickle.load(f)
-            self.mean = torch.from_numpy(stats["mean"]).to(self.device)
-            self.std = torch.from_numpy(stats["std"]).to(self.device)
+            self.mean.copy_(torch.from_numpy(stats["mean"]).to(self.device))
+            self.std.copy_(torch.from_numpy(stats["std"]).to(self.device))
 
     def save(self, save_dir: Union[str, pathlib.Path]):
         """Saves stored statistics to the given path."""
