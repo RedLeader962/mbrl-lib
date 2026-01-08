@@ -79,13 +79,14 @@ class EnsembleLinearLayer(nn.Module):
 
 def to_tensor(x: mbrl.types.TensorType):
     if isinstance(x, torch.Tensor):
-        return x
-    if isinstance(x, np.ndarray):
-        return torch.from_numpy(x)
-    raise ValueError("Input must be torch.Tensor or np.ndarray.")
+        res = x
+    elif isinstance(x, np.ndarray):
+        res = torch.from_numpy(x)
+    else:
+        raise ValueError("Input must be torch.Tensor or np.ndarray.")
+    return res
 
 
-# TODO [maybe] this could be computed in closed form but this is much simpler
 def get_cnn_output_size(
     conv_layers: nn.ModuleList,
     num_input_channels: int,
