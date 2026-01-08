@@ -4,8 +4,14 @@
 # LICENSE file in the root directory of this source tree.
 import gymnasium as gym
 import numpy as np
-import pybulletgym
 import pytest
+try:
+    import pybulletgym
+except ImportError:
+    pybulletgym = None
+
+if pybulletgym is None:
+    pytest.skip("pybulletgym not installed", allow_module_level=True)
 
 from mbrl.util import create_handler_from_str
 

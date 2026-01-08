@@ -6,11 +6,22 @@ import os
 import pathlib
 import tempfile
 
-import gym
+try:
+    import gym
+except ImportError:
+    gym = None
 import gymnasium
 import hydra
 import numpy as np
-import pybulletgym  # register PyBullet enviroments with open ai gym
+import pytest
+try:
+    import pybulletgym  # register PyBullet enviroments with open ai gym
+except ImportError:
+    pybulletgym = None
+
+if gym is None or pybulletgym is None:
+    pytest.skip("gym or pybulletgym not installed", allow_module_level=True)
+
 import torch
 import yaml
 from omegaconf import OmegaConf

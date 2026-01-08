@@ -1,7 +1,7 @@
 import numpy as np
 from dm_control import suite
 from dm_env import specs
-from gym import core, spaces
+from gymnasium import core, spaces
 
 from mbrl.util.math import quantize_obs
 
@@ -156,13 +156,18 @@ class DMCWrapper(core.Env):
         obs = self._get_obs(time_step)
         self.current_state = _flatten_obs(time_step.observation)
         extra["discount"] = time_step.discount
-        return obs, reward, done, extra
+        terminated = done
+        truncated = False  # TimeLimit wrapper handles truncation
+        return obs, reward, terminated, truncated, extra
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        if seed is not None:
+            self.seed(seed)
         time_step = self._env.reset()
         self.current_state = _flatten_obs(time_step.observation)
         obs = self._get_obs(time_step)
-        return obs
+        return obs, {}
 
     def render(self, mode="rgb_array", height=None, width=None, camera_id=0):
         assert mode == "rgb_array", "only support rgb_array mode, given %s" % mode
