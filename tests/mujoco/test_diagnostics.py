@@ -9,6 +9,7 @@ import tempfile
 import gymnasium as gym
 import hydra
 import numpy as np
+import pytest
 import torch
 import yaml
 from omegaconf import OmegaConf
@@ -171,6 +172,10 @@ def test_finetuner():
 
 
 def test_visualizer():
+    import shutil
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not found, skipping visualizer test")
+
     with open(_HYDRA_DIR / "config.yaml", "w") as f:
         OmegaConf.save(_CFG, f)
 
