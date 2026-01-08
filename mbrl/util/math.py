@@ -121,7 +121,10 @@ class Normalizer:
         """
         assert data.ndim == 2 and data.shape[1] == self.mean.shape[1]
         if isinstance(data, np.ndarray):
-            data = torch.from_numpy(data).to(self.device)
+            data = torch.from_numpy(data)
+        if self.device.type == "mps" and data.dtype == torch.float64:
+            data = data.float()
+        data = data.to(self.device)
         self.mean = data.mean(0, keepdim=True)
         self.std = data.std(0, keepdim=True)
         self.std[self.std < self.eps] = 1.0
@@ -139,8 +142,14 @@ class Normalizer:
             (torch.Tensor): The normalized value.
         """
         if isinstance(val, np.ndarray):
-            val = torch.from_numpy(val).to(self.device)
-        return (val - self.mean) / self.std
+            val = torch.from_numpy(val)
+        if not isinstance(val, torch.Tensor):
+            val = torch.tensor(val)
+        
+        if self.device.type == "mps" and val.dtype == torch.float64:
+            val = val.float()
+        val = val.to(self.device)
+        return (val.to(self.mean.dtype) - self.mean) / self.std
 
     def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
         """De-normalizes the value according to the stored statistics.
@@ -155,8 +164,14 @@ class Normalizer:
             (torch.Tensor): The de-normalized value.
         """
         if isinstance(val, np.ndarray):
-            val = torch.from_numpy(val).to(self.device)
-        return self.std * val + self.mean
+            val = torch.from_numpy(val)
+        if not isinstance(val, torch.Tensor):
+            val = torch.tensor(val)
+            
+        if self.device.type == "mps" and val.dtype == torch.float64:
+            val = val.float()
+        val = val.to(self.device)
+        return self.std * val.to(self.mean.dtype) + self.mean
 
     def load(self, results_dir: Union[str, pathlib.Path]):
         """Loads saved statistics from the given path."""

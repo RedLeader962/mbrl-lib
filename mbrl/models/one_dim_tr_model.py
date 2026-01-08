@@ -106,8 +106,14 @@ class OneDTransitionRewardModel(Model):
     ) -> torch.Tensor:
         if self.obs_process_fn:
             obs = self.obs_process_fn(obs)
-        obs = model_util.to_tensor(obs).to(self.device)
-        action = model_util.to_tensor(action).to(self.device)
+        obs = model_util.to_tensor(obs)
+        action = model_util.to_tensor(action)
+        if self.device.type == "mps":
+            if obs.dtype == torch.float64:
+                obs = obs.float()
+            if action.dtype == torch.float64:
+                action = action.float()
+        obs = obs.to(self.device)
         action = action.to(self.device)
         model_in = torch.cat([obs, action], dim=obs.ndim - 1)
         if self.input_normalizer:
@@ -133,7 +139,10 @@ class OneDTransitionRewardModel(Model):
 
         model_in = self._get_model_input(obs, action)
         if self.learned_rewards:
-            reward = model_util.to_tensor(reward).to(self.device).unsqueeze(reward.ndim)
+            reward = model_util.to_tensor(reward)
+            if self.device.type == "mps" and reward.dtype == torch.float64:
+                reward = reward.float()
+            reward = reward.to(self.device).unsqueeze(reward.ndim)
             target = torch.cat([target_obs, reward], dim=obs.ndim - 1)
         else:
             target = target_obs

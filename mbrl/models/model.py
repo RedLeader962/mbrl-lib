@@ -56,7 +56,10 @@ class Model(pl.LightningModule, abc.ABC):
         def _convert(x):
             if x is None:
                 return None
-            res = to_tensor(x).to(self.device)
+            res = to_tensor(x)
+            if self.device.type == "mps" and res.dtype == torch.float64:
+                res = res.float()
+            res = res.to(self.device)
             if as_float:
                 return res.float()
             return res
