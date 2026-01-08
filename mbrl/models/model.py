@@ -6,6 +6,7 @@ import abc
 import pathlib
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
+import pytorch_lightning as pl
 import torch
 from torch import nn as nn
 
@@ -16,7 +17,7 @@ from mbrl.types import ModelInput, TransitionBatch
 # ---------------------------------------------------------------------------
 #                           ABSTRACT MODEL CLASS
 # ---------------------------------------------------------------------------
-class Model(nn.Module, abc.ABC):
+class Model(pl.LightningModule, abc.ABC):
     """Base abstract class for all dynamics models.
 
     All classes derived from `Model` must implement the following methods:
@@ -40,12 +41,14 @@ class Model(nn.Module, abc.ABC):
 
     def __init__(
         self,
-        device,
+        device: Union[str, torch.device],
         *args,
         **kwargs,
     ):
         super().__init__()
-        self.device = device
+        # self.device is a read-only property in LightningModule.
+        # It's automatically updated when using self.to(device).
+        self.to(device)
 
     def _process_batch(
         self, batch: TransitionBatch, as_float: bool = True
@@ -86,6 +89,11 @@ class Model(nn.Module, abc.ABC):
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Computes a loss that can be used to update the model using backpropagation.
 
+
+        .. note::
+            This method is part of the legacy API and is used by Lightning method `training_step`.
+
+
         Args:
             model_in (tensor or batch of transitions): the inputs to the model.
             target (tensor, optional): the expected output for the given inputs, if it
@@ -103,6 +111,9 @@ class Model(nn.Module, abc.ABC):
         self, model_in: ModelInput, target: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Computes an evaluation score for the model over the given input/target.
+
+        .. note::
+            This method is part of the legacy API and is used by Lightning method `validation_step`.
 
         This method should compute a non-reduced score for the model, intended mostly for
         logging/debugging purposes (so, it should not keep gradient information).
@@ -134,6 +145,10 @@ class Model(nn.Module, abc.ABC):
     ) -> Tuple[float, Dict[str, Any]]:
         """Updates the model using backpropagation with given input and target tensors.
 
+        .. warning::
+            This method is deprecated and will be removed in a future version.
+            Please use `training_step` or `pytorch_lightning.Trainer` instead.
+
         Provides a basic update function, following the steps below:
 
         .. code-block:: python
@@ -153,6 +168,13 @@ class Model(nn.Module, abc.ABC):
              (float): the numeric value of the computed loss.
              (dict): any additional metadata dictionary computed by :meth:`loss`.
         """
+        import warnings
+        warnings.warn(
+            "Model.update is deprecated and will be removed in a future version. "
+            "Please use `training_step` or `pytorch_lightning.Trainer` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
         self.train()
         optimizer.zero_grad()
         loss, meta = self.loss(model_in, target)
@@ -236,6 +258,33 @@ class Model(nn.Module, abc.ABC):
     def __len__(self):
         return 1
 
+    def training_step(self, batch: TransitionBatch, batch_idx: int):
+        loss, meta = self.loss(batch)
+        if isinstance(loss, tuple):
+            loss = loss[0]
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: train loss is {loss.item()}. Stopping training.")
+            self.trainer.should_stop = True
+
+        self.log("train/loss", loss, batch_size=len(batch))
+        if meta:
+            self.log_dict({f"train/{k}": v for k, v in meta.items()}, batch_size=len(batch))
+        return {**meta, "loss": loss}
+
+    def validation_step(self, batch: TransitionBatch, batch_idx: int):
+        val_score, meta = self.eval_score(batch)
+        if isinstance(val_score, tuple):
+            val_score = val_score[0]
+        val_loss = val_score.mean()
+        if torch.isnan(val_loss) or torch.isinf(val_loss):
+            print(f"Warning: val loss is {val_loss.item()}.")
+
+        self.log("val/loss", val_loss, batch_size=len(batch))
+        if meta:
+            self.log_dict({f"val/{k}": v for k, v in meta.items()}, batch_size=len(batch))
+        return {**meta, "score": val_loss, "val_score": val_score}
+
+
     def save(self, save_dir: Union[str, pathlib.Path]):
         """Saves the model to the given directory."""
         torch.save(self.state_dict(), pathlib.Path(save_dir) / self._MODEL_FNAME)
@@ -292,9 +341,7 @@ class Ensemble(Model, abc.ABC):
         super().__init__(device)
         self.num_members = num_members
         self.propagation_method = propagation_method
-        self.device = torch.device(device)
         self.deterministic = deterministic
-        self.to(device)
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> Tuple[torch.Tensor, ...]:
         """Computes the output of the dynamics model.
@@ -306,7 +353,6 @@ class Ensemble(Model, abc.ABC):
             (tuple of tensors): all tensors predicted by the model (e.g., .mean and logvar).
         """
 
-    # TODO this and eval_score are no longer necessary
     @abc.abstractmethod
     def loss(
         self,

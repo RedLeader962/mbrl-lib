@@ -45,7 +45,6 @@ class ModelEnv:
         self.dynamics_model = model
         self.termination_fn = termination_fn
         self.reward_fn = reward_fn
-        self.device = model.device
 
         self.observation_space = env.observation_space
         self.action_space = env.action_space
@@ -56,7 +55,7 @@ class ModelEnv:
         if generator:
             self._rng = generator
         else:
-            self._rng = torch.Generator(device=self.device)
+            self._rng = torch.Generator(device=self.dynamics_model.device)
         self._return_as_np = True
 
     def reset(
@@ -107,9 +106,9 @@ class ModelEnv:
         """
         assert len(actions.shape) == 2  # batch, action_dim
         with torch.no_grad():
-            # if actions is tensor, code assumes it's already on self.device
+            # if actions is tensor, code assumes it's already on the model's device
             if isinstance(actions, np.ndarray):
-                actions = torch.from_numpy(actions).to(self.device)
+                actions = torch.from_numpy(actions).to(self.dynamics_model.device)
             (
                 next_observs,
                 pred_rewards,
@@ -173,8 +172,8 @@ class ModelEnv:
             initial_obs_batch = np.tile(initial_state, tiling_shape).astype(np.float32)
             model_state = self.reset(initial_obs_batch, return_as_np=False)
             batch_size = initial_obs_batch.shape[0]
-            total_rewards = torch.zeros(batch_size, 1).to(self.device)
-            terminated = torch.zeros(batch_size, 1, dtype=bool).to(self.device)
+            total_rewards = torch.zeros(batch_size, 1).to(self.dynamics_model.device)
+            terminated = torch.zeros(batch_size, 1, dtype=bool).to(self.dynamics_model.device)
             for time_step in range(horizon):
                 action_for_step = action_sequences[:, time_step, :]
                 action_batch = torch.repeat_interleave(

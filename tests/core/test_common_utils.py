@@ -16,12 +16,11 @@ import mbrl.util.common as utils
 
 class MockModel(models.Model):
     def __init__(self, x, y, in_size, out_size):
-        super().__init__(None)
+        super().__init__("cpu")
         self.in_size = in_size
         self.out_size = out_size
         self.x = x
         self.y = y
-        self.device = "cpu"
         self.net = torch.nn.Linear(in_size, out_size)
 
     def loss(self, model_in, target):

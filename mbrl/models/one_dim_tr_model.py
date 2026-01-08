@@ -90,7 +90,6 @@ class OneDTransitionRewardModel(Model):
                 self.model.device,
                 dtype=torch.double if normalize_double_precision else torch.float,
             )
-        self.device = self.model.device
         self.learned_rewards = learned_rewards
         self.target_is_delta = target_is_delta
         self.no_delta_list = no_delta_list if no_delta_list else []
@@ -109,6 +108,7 @@ class OneDTransitionRewardModel(Model):
             obs = self.obs_process_fn(obs)
         obs = model_util.to_tensor(obs).to(self.device)
         action = model_util.to_tensor(action).to(self.device)
+        action = action.to(self.device)
         model_in = torch.cat([obs, action], dim=obs.ndim - 1)
         if self.input_normalizer:
             # Normalizer lives on device
@@ -125,7 +125,11 @@ class OneDTransitionRewardModel(Model):
                 target_obs[..., dim] = next_obs[..., dim]
         else:
             target_obs = next_obs
-        target_obs = model_util.to_tensor(target_obs).to(self.device)
+        
+        target_obs = model_util.to_tensor(target_obs)
+        if self.device.type == "mps" and target_obs.dtype == torch.float64:
+            target_obs = target_obs.float()
+        target_obs = target_obs.to(self.device)
 
         model_in = self._get_model_input(obs, action)
         if self.learned_rewards:
@@ -133,11 +137,14 @@ class OneDTransitionRewardModel(Model):
             target = torch.cat([target_obs, reward], dim=obs.ndim - 1)
         else:
             target = target_obs
+        
         return model_in.float(), target.float()
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> Tuple[torch.Tensor, ...]:
         """Calls forward method of base model with the given input and args."""
-        return self.model.forward(x, *args, **kwargs)
+        if self.device.type == "mps" and x.dtype == torch.float64:
+            x = x.float()
+        return self.model.forward(x.to(self.device), *args, **kwargs)
 
     def update_normalizer(self, batch: mbrl.types.TransitionBatch):
         """Updates the normalizer statistics using the batch of transition data.

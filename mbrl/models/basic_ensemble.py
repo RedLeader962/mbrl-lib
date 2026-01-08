@@ -192,11 +192,10 @@ class BasicEnsemble(Ensemble):
             f"'random_model', 'fixed_model', 'expectation'."
         )
 
-    # TODO replace the inputs with a single tensor
     def loss(  # type: ignore
         self,
         model_ins: Sequence[torch.Tensor],
-        targets: Optional[Sequence[torch.Tensor]] = None,
+        target: Optional[Sequence[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Computes average loss over the losses of all members of the ensemble.
 
@@ -205,18 +204,19 @@ class BasicEnsemble(Ensemble):
 
         Args:
             model_ins (sequence of tensors): one input for each model in the ensemble.
-            targets (sequence of tensors): one target for each model in the ensemble.
+            target (sequence of tensors): one target for each model in the ensemble.
 
         Returns:
             (tensor): the average loss over all members.
         """
-        assert targets is not None
+        assert target is not None
         avg_ensemble_loss: torch.Tensor = 0.0
         ensemble_meta = {}
         for i, model in enumerate(self.members):
             model.train()
-            loss, meta = model.loss(model_ins[i], targets[i])
-            ensemble_meta[f"model_{i}"] = meta
+            loss, meta = model.loss(model_ins[i], target[i])
+            for k, v in meta.items():
+                ensemble_meta[f"model_{i}/{k}"] = v
             avg_ensemble_loss += loss
         return avg_ensemble_loss / len(self.members), ensemble_meta
 
@@ -244,7 +244,8 @@ class BasicEnsemble(Ensemble):
             for i, model in enumerate(self.members):
                 model.eval()
                 score, meta = model.eval_score(inputs[i], targets[i])
-                ensemble_meta[f"model_{i}"] = meta
+                for k, v in meta.items():
+                    ensemble_meta[f"model_{i}/{k}"] = v
 
                 if score.ndim == 3:
                     assert score.shape[0] == 1

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import hydra
 import omegaconf
+import pytorch_lightning as pl
 import torch
 from torch import nn as nn
 from torch.nn import functional as F
@@ -95,17 +96,19 @@ class GaussianMLP(Ensemble):
                 activation_func = hydra.utils.instantiate(cfg, _recursive_=False)
             return activation_func
 
+        self.activation = create_activation()
+
         def create_linear_layer(l_in, l_out):
             return EnsembleLinearLayer(ensemble_size, l_in, l_out)
 
         hidden_layers = [
-            nn.Sequential(create_linear_layer(in_size, hid_size), create_activation())
+            nn.Sequential(create_linear_layer(in_size, hid_size), self.activation)
         ]
         for i in range(num_layers - 1):
             hidden_layers.append(
                 nn.Sequential(
                     create_linear_layer(hid_size, hid_size),
-                    create_activation(),
+                    self.activation,
                 )
             )
         self.hidden_layers = nn.Sequential(*hidden_layers)
@@ -137,6 +140,7 @@ class GaussianMLP(Ensemble):
             self.mean_and_logvar.set_elite(self.elite_models)
             self.mean_and_logvar.toggle_use_only_elite()
 
+
     def _default_forward(
         self, x: torch.Tensor, only_elite: bool = False, **_kwargs
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -161,20 +165,38 @@ class GaussianMLP(Ensemble):
         num_models = (
             len(self.elite_models) if self.elite_models is not None else len(self)
         )
-        shuffled_x = x[:, model_shuffle_indices, ...].view(
-            num_models, batch_size // num_models, -1
-        )
+        shuffled_x = x[:, model_shuffle_indices, ...]
+        
+        # Pad shuffled_x if batch_size is not multiple of num_models
+        orig_batch_size = shuffled_x.shape[1]
+        padding_size = (num_models - (orig_batch_size % num_models)) % num_models
+        if padding_size > 0:
+            padding = torch.zeros((x.shape[0], padding_size, x.shape[-1]), device=x.device)
+            shuffled_x = torch.cat([shuffled_x, padding], dim=1)
+        
+        new_batch_size = shuffled_x.shape[1]
+        shuffled_x = shuffled_x.view(num_models, new_batch_size // num_models, -1)
 
         mean, logvar = self._default_forward(shuffled_x, only_elite=True)
         # note that mean and logvar are shuffled
-        mean = mean.view(batch_size, -1)
-        mean[model_shuffle_indices] = mean.clone()  # invert the shuffle
+        mean = mean.view(new_batch_size, -1)
+        if padding_size > 0:
+            mean = mean[:orig_batch_size]
+
+        # Invert the shuffle
+        # We need a tensor to store the un-shuffled result
+        unshuffled_mean = torch.empty_like(mean)
+        unshuffled_mean[model_shuffle_indices] = mean
 
         if logvar is not None:
-            logvar = logvar.view(batch_size, -1)
-            logvar[model_shuffle_indices] = logvar.clone()  # invert the shuffle
+            logvar = logvar.view(new_batch_size, -1)
+            if padding_size > 0:
+                logvar = logvar[:orig_batch_size]
+            unshuffled_logvar = torch.empty_like(logvar)
+            unshuffled_logvar[model_shuffle_indices] = logvar
+            return unshuffled_mean, unshuffled_logvar
 
-        return mean, logvar
+        return unshuffled_mean, None
 
     def _forward_ensemble(
         self,
@@ -192,12 +214,6 @@ class GaussianMLP(Ensemble):
         model_len = (
             len(self.elite_models) if self.elite_models is not None else len(self)
         )
-        if x.shape[0] % model_len != 0:
-            raise ValueError(
-                f"GaussianMLP ensemble requires batch size to be a multiple of the "
-                f"number of models. Current batch size is {x.shape[0]} for "
-                f"{model_len} models."
-            )
         x = x.unsqueeze(0)
         if self.propagation_method == "random_model":
             # passing generator causes segmentation fault
@@ -363,14 +379,6 @@ class GaussianMLP(Ensemble):
     def sample_propagation_indices(
         self, batch_size: int, _rng: torch.Generator
     ) -> torch.Tensor:
-        model_len = (
-            len(self.elite_models) if self.elite_models is not None else len(self)
-        )
-        if batch_size % model_len != 0:
-            raise ValueError(
-                "To use GaussianMLP's ensemble propagation, the batch size must "
-                "be a multiple of the number of models in the ensemble."
-            )
         # rng causes segmentation fault, see https://github.com/pytorch/pytorch/issues/44714
         return torch.randperm(batch_size, device=self.device)
 

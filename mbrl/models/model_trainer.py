@@ -5,17 +5,23 @@
 import copy
 import functools
 import itertools
-from typing import Callable, Dict, List, Optional, Tuple
+import tempfile
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import pytorch_lightning as pl
 import torch
 import tqdm
 from torch import optim as optim
+from torch.utils.data import DataLoader, IterableDataset
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
 from mbrl.util.logger import Logger
 from mbrl.util.replay_buffer import BootstrapIterator, TransitionIterator
+from mbrl.util.torchrl_util import transition_batch_to_tensordict
 
-from .model import Model
+from .model import Ensemble, Model
+from .one_dim_tr_model import OneDTransitionRewardModel
 
 MODEL_LOG_FORMAT = [
     ("train_iteration", "I", "int"),
@@ -26,6 +32,134 @@ MODEL_LOG_FORMAT = [
     ("model_val_score", "MVSCORE", "float"),
     ("model_best_val_score", "MBVSCORE", "float"),
 ]
+
+
+class _IteratorDataset(IterableDataset):
+    def __init__(self, it: TransitionIterator):
+        self.it = it
+
+    def __iter__(self):
+        return iter(self.it)
+
+    def __len__(self):
+        return len(self.it)
+
+
+class _LegacyCallback(pl.Callback):
+    def __init__(self, train_iteration, legacy_callback, batch_callback, logger=None):
+        self.train_iteration = train_iteration
+        self.legacy_callback = legacy_callback
+        self.batch_callback = batch_callback
+        self.logger = logger
+        self.train_losses = []
+        self.val_losses = []
+        self.epoch_val_scores = []
+        self.best_val_loss = float("inf")
+        self.best_avg_scores = None
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self.epoch_val_scores = []
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        train_loss = metrics.get(
+            "train/loss", metrics.get("train_loss", torch.tensor(0.0))
+        ).item()
+        val_loss = metrics.get(
+            "val/loss", metrics.get("val_loss", torch.tensor(0.0))
+        ).item()
+
+        self.train_losses.append(train_loss)
+        self.val_losses.append(val_loss)
+
+        if self.legacy_callback:
+            # We need to match legacy callback arguments
+            self.legacy_callback(
+                pl_module, self.train_iteration, trainer.current_epoch
+            )
+
+        if self.logger:
+            log_dict = {
+                "train_iteration": self.train_iteration,
+                "epoch": trainer.current_epoch,
+                "train_dataset_size": len(trainer.train_dataloader.dataset.it),
+                "val_dataset_size": len(trainer.val_dataloaders.dataset.it)
+                if trainer.val_dataloaders
+                else 0,
+                "model_loss": train_loss,
+                "model_val_score": val_loss,
+                "model_best_val_score": self.best_val_loss
+                if self.best_val_loss != float("inf")
+                else val_loss,
+            }
+
+            for k, v in metrics.items():
+                if k not in ["train/loss", "val/loss", "train_loss", "val_loss"]:
+                    if isinstance(v, torch.Tensor):
+                        v = v.item()
+                    log_dict[k] = v
+
+            self.logger.log_data("model_train", log_dict)
+            self.logger._dump("model_train")
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self.batch_callback:
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+            meta = (
+                {k: v for k, v in outputs.items() if k != "loss"}
+                if isinstance(outputs, dict)
+                else {}
+            )
+
+            if isinstance(loss, torch.Tensor):
+                loss = loss.detach().cpu().item()
+
+            meta["loss"] = loss
+            self.batch_callback(trainer.current_epoch, loss, meta, "train")
+
+    def on_validation_batch_end(
+        self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
+    ):
+        val_score = None
+        if isinstance(outputs, dict):
+            val_score = outputs.get("val_score")
+
+        if self.batch_callback:
+            score = outputs
+            meta = {}
+            if isinstance(outputs, dict):
+                score = outputs.get("score", outputs)
+                meta = {
+                    k: v
+                    for k, v in outputs.items()
+                    if k not in ["score", "val_score"]
+                }
+
+            if isinstance(score, torch.Tensor):
+                score = score.detach().cpu().numpy()
+
+            meta["score"] = score
+            self.batch_callback(trainer.current_epoch, score, meta, "eval")
+
+        if val_score is not None:
+            self.epoch_val_scores.append(val_score.detach().cpu())
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self.epoch_val_scores:
+            first = self.epoch_val_scores[0]
+            if first.ndim == 3:  # Ensemble (E, B, Od)
+                # Concatenate along batch dimension (dim 1)
+                all_scores = torch.cat(self.epoch_val_scores, dim=1)
+                # Average over batch (1) and output dim (2) to get (E,)
+                avg_scores = all_scores.mean(dim=(1, 2))
+
+                current_loss = avg_scores.mean().item()
+                if current_loss < self.best_val_loss:
+                    self.best_val_loss = current_loss
+                    self.best_avg_scores = avg_scores
+
+            # Clear memory
+            self.epoch_val_scores = []
 
 
 class ModelTrainer:
@@ -60,12 +194,21 @@ class ModelTrainer:
                 dump_frequency=1,
             )
 
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            lr=optim_lr,
-            weight_decay=weight_decay,
-            eps=optim_eps,
-        )
+        self.optim_lr = optim_lr
+        self.weight_decay = weight_decay
+        self.optim_eps = optim_eps
+
+        # Optimizer configuration is now handled via monkeypatching configure_optimizers
+        # on the model instance, which Lightning will call during fit().
+        def configure_optimizers():
+            return optim.Adam(
+                self.model.parameters(),
+                lr=self.optim_lr,
+                weight_decay=self.weight_decay,
+                eps=self.optim_eps,
+            )
+
+        self.model.configure_optimizers = configure_optimizers
 
     def train(
         self,
@@ -73,7 +216,7 @@ class ModelTrainer:
         dataset_val: Optional[TransitionIterator] = None,
         num_epochs: Optional[int] = None,
         patience: Optional[int] = None,
-        improvement_threshold: float = 0.01,
+        improvement_threshold: float = 0.0,
         callback: Optional[Callable] = None,
         batch_callback: Optional[Callable] = None,
         evaluate: bool = True,
@@ -81,137 +224,118 @@ class ModelTrainer:
     ) -> Tuple[List[float], List[float]]:
         """Trains the model for some number of epochs.
 
-        This method iterates over the stored train dataset, one batch of transitions at a time,
-        updates the model.
-
-        If a validation dataset is provided in the constructor, this method will also evaluate
-        the model over the validation data once per training epoch. The method will keep track
-        of the weights with the best validation score, and after training the weights of the
-        model will be set to the best weights. If no validation dataset is provided, the method
-        will keep the model with the best loss over training data.
-
-        Args:
-            dataset_train (:class:`mbrl.util.TransitionIterator`): the iterator to
-                use for the training data.
-            dataset_val (:class:`mbrl.util.TransitionIterator`, optional):
-                an iterator to use for the validation data.
-            num_epochs (int, optional): if provided, the maximum number of epochs to train for.
-                Default is ``None``, which indicates there is no limit.
-            patience (int, optional): if provided, the patience to use for training. That is,
-                training will stop after ``patience`` number of epochs without improvement.
-                Ignored if ``evaluate=False`.
-            improvement_threshold (float): The threshold in relative decrease of the evaluation
-                score at which the model is seen as having improved.
-                Ignored if ``evaluate=False`.
-            callback (callable, optional): if provided, this function will be called after
-                every training epoch with the following positional arguments::
-
-                    - the model that's being trained
-                    - total number of calls made to ``trainer.train()``
-                    - current epoch
-                    - training loss
-                    - validation score (for ensembles, factored per member)
-                    - best validation score so far
-
-            batch_callback (callable, optional): if provided, this function will be called
-                for every batch with the output of ``model.update()`` (during training),
-                and ``model.eval_score()`` (during evaluation). It will be called
-                with four arguments ``(epoch_index, loss/score, meta, mode)``, where
-                ``mode`` is one of ``"train"`` or ``"eval"``, indicating if the callback
-                was called during training or evaluation.
-
-            evaluate (bool, optional): if ``True``, the trainer will use ``model.eval_score()``
-                to keep track of the best model. If ``False`` the model will not compute
-                an evaluation score, and simply train for some number of epochs. Defaults to
-                ``True``.
-
-            silent (bool): if ``True`` logging and progress bar are deactivated. Defaults
-                to ``False``.
-
-        Returns:
-            (tuple of two list(float)): the history of training losses and validation losses.
-
+        This method refactors the original training loop to use pytorch_lightning.Trainer.
         """
-        eval_dataset = dataset_train if dataset_val is None else dataset_val
-
-        training_losses, val_scores = [], []
-        best_weights: Optional[Dict] = None
-        epoch_iter = range(num_epochs) if num_epochs else itertools.count()
-        epochs_since_update = 0
-        best_val_score = self.evaluate(eval_dataset) if evaluate else None
-        # only enable tqdm if training for a single epoch,
-        # otherwise it produces too much output
-        disable_tqdm = silent or (num_epochs is None or num_epochs > 1)
-
-        for epoch in epoch_iter:
-            if batch_callback:
-                batch_callback_epoch = functools.partial(batch_callback, epoch)
-            else:
-                batch_callback_epoch = None
-            batch_losses: List[float] = []
-            for batch in tqdm.tqdm(dataset_train, disable=disable_tqdm):
-                loss, meta = self.model.update(batch, self.optimizer)
-                batch_losses.append(loss)
-                if batch_callback_epoch:
-                    batch_callback_epoch(loss, meta, "train")
-            total_avg_loss = np.mean(batch_losses).mean().item()
-            training_losses.append(total_avg_loss)
-
-            eval_score = None
-            model_val_score = 0
-            if evaluate:
-                eval_score = self.evaluate(
-                    eval_dataset, batch_callback=batch_callback_epoch
-                )
-                val_scores.append(eval_score.mean().item())
-
-                maybe_best_weights = self.maybe_get_best_weights(
-                    best_val_score, eval_score, improvement_threshold
-                )
-                if maybe_best_weights:
-                    best_val_score = torch.minimum(best_val_score, eval_score)
-                    best_weights = maybe_best_weights
-                    epochs_since_update = 0
-                else:
-                    epochs_since_update += 1
-                model_val_score = eval_score.mean()
-
-            if self.logger and not silent:
-                self.logger.log_data(
-                    self._LOG_GROUP_NAME,
-                    {
-                        "iteration": self._train_iteration,
-                        "epoch": epoch,
-                        "train_dataset_size": dataset_train.num_stored,
-                        "val_dataset_size": (
-                            dataset_val.num_stored if dataset_val is not None else 0
-                        ),
-                        "model_loss": total_avg_loss,
-                        "model_val_score": model_val_score,
-                        "model_best_val_score": (
-                            best_val_score.mean() if best_val_score is not None else 0
-                        ),
-                    },
-                )
-            if callback:
-                callback(
-                    self.model,
-                    self._train_iteration,
-                    epoch,
-                    total_avg_loss,
-                    eval_score,
-                    best_val_score,
-                )
-
-            if patience and epochs_since_update >= patience:
-                break
-
-        # saving the best models:
-        if evaluate:
-            self._maybe_set_best_weights_and_elite(best_weights, best_val_score)
-
         self._train_iteration += 1
-        return training_losses, val_scores
+
+        # Bridge TransitionIterator to Lightning DataLoader
+        train_loader = DataLoader(_IteratorDataset(dataset_train), batch_size=None)
+        val_loader = None
+        if evaluate:
+            eval_dataset = dataset_train if dataset_val is None else dataset_val
+            val_loader = DataLoader(_IteratorDataset(eval_dataset), batch_size=None)
+
+        # Lightning Callbacks
+        callbacks = []
+        if evaluate and dataset_val and patience is not None:
+            callbacks.append(
+                EarlyStopping(
+                    monitor="val/loss",
+                    patience=patience,
+                    min_delta=improvement_threshold,
+                    mode="min",
+                    check_on_train_epoch_end=False,
+                )
+            )
+
+        # We can also add a custom callback for legacy callbacks
+        legacy_callback = _LegacyCallback(
+            self._train_iteration, callback, batch_callback, logger=self.logger
+        )
+        callbacks.append(legacy_callback)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_callback = ModelCheckpoint(
+                monitor="val/loss",
+                mode="min",
+                save_top_k=1,
+                save_weights_only=True,
+                dirpath=temp_dir,
+                filename="best_model",
+            )
+            callbacks.append(checkpoint_callback)
+
+            if self.model.device.type == "cuda":
+                accelerator = "gpu"
+                devices = 1
+            elif self.model.device.type == "mps":
+                accelerator = "mps"
+                devices = 1
+            else:
+                accelerator = "cpu"
+                devices = "auto"
+
+            trainer = pl.Trainer(
+                max_epochs=num_epochs,
+                callbacks=callbacks,
+                enable_progress_bar=not silent,
+                devices=devices,
+                accelerator=accelerator,
+                logger=False,  # We use the custom logger
+                num_sanity_val_steps=0,
+            )
+
+            trainer.fit(self.model, train_loader, val_loader)
+
+            # Restore best weights
+            if evaluate and checkpoint_callback.best_model_path:
+                self.model.load_state_dict(
+                    torch.load(checkpoint_callback.best_model_path)["state_dict"]
+                )
+
+            # Select elite models if it's an Ensemble or OneDTransitionRewardModel wrapping an Ensemble
+            is_ensemble = isinstance(self.model, Ensemble)
+            is_oned_ensemble = isinstance(
+                self.model, OneDTransitionRewardModel
+            ) and isinstance(self.model.model, Ensemble)
+
+            if is_ensemble or is_oned_ensemble:
+                avg_scores = legacy_callback.best_avg_scores
+
+                # Fallback to manual evaluation if scores weren't captured (e.g. evaluate=False)
+                if avg_scores is None and evaluate:
+                    # Should not happen if evaluate=True unless no validation batches ran
+                    pass
+                elif avg_scores is None:
+                    # If evaluate=False, we explicitly check if we need to run it now?
+                    # Original logic implied if is_ensemble is True, we evaluate.
+                    # But if evaluate=False, we don't have val_loader.
+                    # We create one now.
+                    eval_dataset = (
+                        dataset_train if dataset_val is None else dataset_val
+                    )
+                    val_score = self.evaluate(eval_dataset)
+                    if val_score.ndim > 0:
+                        avg_scores = (
+                            val_score.mean(dim=tuple(range(1, val_score.ndim)))
+                            if val_score.ndim > 1
+                            else val_score
+                        )
+                
+                # Move to device if needed
+                if avg_scores is not None:
+                     avg_scores = avg_scores.to(self.model.device)
+
+                if avg_scores is not None:
+                    num_elites = getattr(self.model, "num_elites", None)
+                    if is_oned_ensemble and num_elites is None:
+                        num_elites = getattr(self.model.model, "num_elites", None)
+
+                    if num_elites:
+                        elite_indices = torch.argsort(avg_scores)[:num_elites]
+                        self.model.set_elite(elite_indices.tolist())
+
+        return legacy_callback.train_losses, legacy_callback.val_losses
 
     def evaluate(
         self, dataset: TransitionIterator, batch_callback: Optional[Callable] = None

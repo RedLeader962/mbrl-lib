@@ -291,7 +291,7 @@ def test_model_env_expectation_random():
         seen = set()
         # Check that all models produced some output in the batch
         for j, val in enumerate(diff):
-            v = int(val)
+            v = int(val.item())
             assert v in member_incs
             seen.add(v)
             history[j] += str(member_incs.index(v))
@@ -323,7 +323,7 @@ def test_model_env_expectation_fixed():
         seen = set()
         # Check that all models produced some output in the batch
         for j, val in enumerate(diff):
-            v = int(val)
+            v = int(val.item())
             assert v in member_incs
             seen.add(v)
             history[j] += str(member_incs.index(v))
