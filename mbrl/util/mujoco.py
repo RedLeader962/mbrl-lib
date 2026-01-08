@@ -54,13 +54,13 @@ class FreezeMujoco(Freeze):
 
     def __enter__(self):
         self._init_state = (
-            self._env.env.data.qpos.ravel().copy(),
-            self._env.env.data.qvel.ravel().copy(),
+            self._env.unwrapped.data.qpos.ravel().copy(),
+            self._env.unwrapped.data.qvel.ravel().copy(),
         )
         self._elapsed_steps = self._env._elapsed_steps
 
     def __exit__(self, *_args):
-        self._env.set_state(*self._init_state)
+        self._env.unwrapped.set_state(*self._init_state)
         self._env._elapsed_steps = self._elapsed_steps
 
 
@@ -116,8 +116,8 @@ class MujocoEnvHandler(EnvHandler):
 
         """
         state = (
-            env.env.data.qpos.ravel().copy(),
-            env.env.data.qvel.ravel().copy(),
+            env.unwrapped.data.qpos.ravel().copy(),
+            env.unwrapped.data.qvel.ravel().copy(),
         )
         elapsed_steps = env._elapsed_steps
         return state, elapsed_steps
@@ -132,5 +132,5 @@ class MujocoEnvHandler(EnvHandler):
             state (tuple): see :func:`get_current_state` for a description.
             env (:class:`gym.wrappers.TimeLimit`): the environment.
         """
-        env.set_state(*state[0])
+        env.unwrapped.set_state(*state[0])
         env._elapsed_steps = state[1]
