@@ -265,15 +265,13 @@ class ModelTrainer:
             )
             callbacks.append(checkpoint_callback)
 
+            devices = "auto"
             if self.model.device.type == "cuda":
                 accelerator = "gpu"
-                devices = 1
             elif self.model.device.type == "mps":
                 accelerator = "mps"
-                devices = 1
             else:
                 accelerator = "cpu"
-                devices = "auto"
 
             trainer = pl.Trainer(
                 max_epochs=num_epochs,
@@ -284,7 +282,7 @@ class ModelTrainer:
                 logger=False,  # We use the custom logger
                 num_sanity_val_steps=0,
             )
-
+            # trainer.
             trainer.fit(self.model, train_loader, val_loader)
 
             # Restore best weights
