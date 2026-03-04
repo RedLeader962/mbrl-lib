@@ -61,7 +61,7 @@ class SAC(object):
             self.policy_optim = Adam(self.policy.parameters(), lr=args.lr)
 
     def select_action(self, state, batched=False, evaluate=False):
-        state = torch.FloatTensor(state)
+        state = torch.as_tensor(state).float()
         if not batched:
             state = state.unsqueeze(0)
         state = state.to(self.device)
@@ -86,11 +86,11 @@ class SAC(object):
             _,
         ) = memory.sample(batch_size).astuple()
 
-        state_batch = torch.FloatTensor(state_batch).to(self.device)
-        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
-        action_batch = torch.FloatTensor(action_batch).to(self.device)
-        reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
-        mask_batch = torch.FloatTensor(mask_batch).to(self.device).unsqueeze(1)
+        state_batch = torch.as_tensor(state_batch).float().to(self.device)
+        next_state_batch = torch.as_tensor(next_state_batch).float().to(self.device)
+        action_batch = torch.as_tensor(action_batch).float().to(self.device)
+        reward_batch = torch.as_tensor(reward_batch).float().to(self.device).unsqueeze(1)
+        mask_batch = torch.as_tensor(mask_batch).float().to(self.device).unsqueeze(1)
         if reverse_mask:
             mask_batch = mask_batch.logical_not()
 

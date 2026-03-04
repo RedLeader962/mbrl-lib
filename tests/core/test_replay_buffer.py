@@ -462,22 +462,34 @@ def _add_dummy_trajectories_to_buffer(buffer, dummy, num_trajectories, max_len, 
 
 # This function checks that batches are returning correct trajectories
 # Assumes that buffer entries were added with _add_dummy_trajectories_to_buffer
+def _to_np(x):
+    """Convert torch tensor to numpy for test assertions."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return x
+
+
 def _check_non_ensemble_sequence_batch(
     batch, expected_batch_size, sequence_length, obs_shape=(1, 1)
 ):
     assert batch.obs.shape == (expected_batch_size, sequence_length) + obs_shape
     assert batch.rewards.shape == (expected_batch_size, sequence_length)
 
+    obs = _to_np(batch.obs)
+    act = _to_np(batch.act)
+    next_obs = _to_np(batch.next_obs)
+    terminateds = _to_np(batch.terminateds)
+
     for t in range(1, sequence_length):
         # all trajectories are built so that the o[t + 1] - o[t] = 1
-        assert np.all(batch.obs[:, t] - batch.obs[:, t - 1] == 1)
+        assert np.all(obs[:, t] - obs[:, t - 1] == 1)
 
     # also check that actions and next_obs are ok
-    assert np.all(batch.obs - batch.act == -1)
-    assert np.all(batch.obs - batch.next_obs == -2)
-    if np.any(batch.terminateds):
+    assert np.all(obs - act == -1)
+    assert np.all(obs - next_obs == -2)
+    if np.any(terminateds):
         # Any terminateds must be at the end of a trajectory
-        assert not np.any(batch.terminateds[:, :-1])
+        assert not np.any(terminateds[:, :-1])
 
 
 def test_sequence_iterator():
@@ -526,7 +538,7 @@ def test_sequence_iterator():
                 # only do this for full batches
                 if expected_batch_size == 8:
                     for e2 in range(e1 + 1, ensemble_size_):
-                        assert not np.allclose(batch.obs[e1, :, 0], batch.obs[e2, :, 0])
+                        assert not np.allclose(_to_np(batch.obs[e1, :, 0]), _to_np(batch.obs[e2, :, 0]))
 
                 # Now check that each ensemble batch is consistent
                 _check_non_ensemble_sequence_batch(
@@ -540,6 +552,8 @@ def test_sequence_iterator():
         obs_second_epoch = []
         for batch_idx, batch in enumerate(iterator):
             obs_second_epoch.append(batch.obs)
+        obs_first_epoch = [_to_np(o) for o in obs_first_epoch]
+        obs_second_epoch = [_to_np(o) for o in obs_second_epoch]
         obs_first_epoch = np.concatenate(obs_first_epoch, axis=1)
         obs_second_epoch = np.concatenate(obs_second_epoch, axis=1)
         is_same_as_first_epoch = np.allclose(obs_first_epoch, obs_second_epoch)

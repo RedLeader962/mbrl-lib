@@ -8,10 +8,10 @@ from typing import Callable, Optional, Tuple, Union
 import numpy as np
 import torch
 
+TensorType = Union[torch.Tensor, np.ndarray]
 RewardFnType = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 TermFnType = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-ObsProcessFnType = Callable[[np.ndarray], np.ndarray]
-TensorType = Union[torch.Tensor, np.ndarray]
+ObsProcessFnType = Callable[[TensorType], TensorType]
 TrajectoryEvalFnType = Callable[[TensorType, torch.Tensor], torch.Tensor]
 
 Transition = Tuple[

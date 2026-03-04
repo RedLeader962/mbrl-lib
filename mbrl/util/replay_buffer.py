@@ -18,6 +18,7 @@ from torchrl.data import (
     TensorStorage,
 )
 
+import mbrl.types as mbrl_types
 from mbrl.types import TransitionBatch
 from mbrl.util.torchrl_util import (
     tensordict_to_transition_batch,
@@ -28,12 +29,21 @@ from mbrl.util.torchrl_util import (
 def _consolidate_batches(batches: Sequence[TransitionBatch]) -> TransitionBatch:
     len_batches = len(batches)
     b0 = batches[0]
-    obs = np.empty((len_batches,) + b0.obs.shape, dtype=b0.obs.dtype)
-    act = np.empty((len_batches,) + b0.act.shape, dtype=b0.act.dtype)
-    next_obs = np.empty((len_batches,) + b0.obs.shape, dtype=b0.obs.dtype)
-    rewards = np.empty((len_batches,) + b0.rewards.shape, dtype=np.float32)
-    terminateds = np.empty((len_batches,) + b0.terminateds.shape, dtype=bool)
-    truncateds = np.empty((len_batches,) + b0.truncateds.shape, dtype=bool)
+    # Support both torch and numpy fields
+    if isinstance(b0.obs, torch.Tensor):
+        obs = torch.empty((len_batches,) + b0.obs.shape, dtype=b0.obs.dtype)
+        act = torch.empty((len_batches,) + b0.act.shape, dtype=b0.act.dtype)
+        next_obs = torch.empty((len_batches,) + b0.obs.shape, dtype=b0.obs.dtype)
+        rewards = torch.empty((len_batches,) + b0.rewards.shape, dtype=torch.float32)
+        terminateds = torch.empty((len_batches,) + b0.terminateds.shape, dtype=torch.bool)
+        truncateds = torch.empty((len_batches,) + b0.truncateds.shape, dtype=torch.bool)
+    else:
+        obs = np.empty((len_batches,) + b0.obs.shape, dtype=b0.obs.dtype)
+        act = np.empty((len_batches,) + b0.act.shape, dtype=b0.act.dtype)
+        next_obs = np.empty((len_batches,) + b0.obs.shape, dtype=b0.obs.dtype)
+        rewards = np.empty((len_batches,) + b0.rewards.shape, dtype=np.float32)
+        terminateds = np.empty((len_batches,) + b0.terminateds.shape, dtype=bool)
+        truncateds = np.empty((len_batches,) + b0.truncateds.shape, dtype=bool)
     for i, b in enumerate(batches):
         obs[i] = b.obs
         act[i] = b.act
@@ -420,7 +430,26 @@ class ReplayBuffer:
 
     This class is now a wrapper around torchrl.data.ReplayBuffer.
     It maintains the same API as the original ReplayBuffer.
+
+    Args:
+        capacity (int): the maximum number of transitions to store.
+        obs_shape (sequence of ints): the shape of observations.
+        action_shape (sequence of ints): the shape of actions.
+        obs_type (type): the numpy dtype for observations.
+        action_type (type): the numpy dtype for actions.
+        reward_type (type): the numpy dtype for rewards.
+        rng (np.random.Generator, optional): a random number generator.
+        max_trajectory_length (int, optional): if given, the buffer will
+            store trajectory information.
+        output_torch (bool, optional): if ``True`` (default), output methods
+            (``get_all``, ``sample``, ``_batch_from_indices``) return
+            ``TransitionBatch`` with ``torch.Tensor`` fields.  If ``False``,
+            fields are ``np.ndarray`` (legacy behaviour) and a
+            ``FutureWarning`` is emitted.
     """
+
+    _BUFFER_FNAME = "replay_buffer.pt"
+    _LEGACY_BUFFER_FNAME = "replay_buffer.npz"
 
     def __init__(
         self,
@@ -432,6 +461,7 @@ class ReplayBuffer:
         reward_type: Type = np.float32,
         rng: Optional[np.random.Generator] = None,
         max_trajectory_length: Optional[int] = None,
+        output_torch: Optional[bool] = None,
     ):
         self.capacity = capacity
         self.obs_shape = obs_shape
@@ -441,6 +471,18 @@ class ReplayBuffer:
         self.reward_type = reward_type
         self._rng = rng if rng else np.random.default_rng()
         self.max_trajectory_length = max_trajectory_length
+
+        # Output format control
+        self._output_torch = output_torch if output_torch is not None else True
+        if not self._output_torch:
+            warnings.warn(
+                "ReplayBuffer is configured to return numpy arrays. This mode "
+                "is deprecated and will be removed in a future version. "
+                "Set output_torch=True or omit the parameter to use torch "
+                "tensors for better performance.",
+                FutureWarning,
+                stacklevel=2,
+            )
 
         self.cur_idx = 0
         self.num_stored = 0
@@ -476,27 +518,39 @@ class ReplayBuffer:
 
     @property
     def obs(self):
-        return self._batch_from_indices(np.arange(len(self._storage))).obs
+        """Returns full storage observations as numpy (legacy inspection API)."""
+        td = self._torchrl_rb.storage[np.arange(len(self._storage))]
+        return td["observation"].detach().cpu().numpy()
 
     @property
     def next_obs(self):
-        return self._batch_from_indices(np.arange(len(self._storage))).next_obs
+        """Returns full storage next observations as numpy (legacy inspection API)."""
+        td = self._torchrl_rb.storage[np.arange(len(self._storage))]
+        return td["next", "observation"].detach().cpu().numpy()
 
     @property
     def action(self):
-        return self._batch_from_indices(np.arange(len(self._storage))).act
+        """Returns full storage actions as numpy (legacy inspection API)."""
+        td = self._torchrl_rb.storage[np.arange(len(self._storage))]
+        return td["action"].detach().cpu().numpy()
 
     @property
     def reward(self):
-        return self._batch_from_indices(np.arange(len(self._storage))).rewards
+        """Returns full storage rewards as numpy (legacy inspection API)."""
+        td = self._torchrl_rb.storage[np.arange(len(self._storage))]
+        return td["next", "reward"].squeeze(-1).detach().cpu().numpy()
 
     @property
     def terminated(self):
-        return self._batch_from_indices(np.arange(len(self._storage))).terminateds
+        """Returns full storage terminated flags as numpy (legacy inspection API)."""
+        td = self._torchrl_rb.storage[np.arange(len(self._storage))]
+        return td["next", "terminated"].squeeze(-1).detach().cpu().numpy()
 
     @property
     def truncated(self):
-        return self._batch_from_indices(np.arange(len(self._storage))).truncateds
+        """Returns full storage truncated flags as numpy (legacy inspection API)."""
+        td = self._torchrl_rb.storage[np.arange(len(self._storage))]
+        return td["next", "truncated"].squeeze(-1).detach().cpu().numpy()
 
     @property
     def stores_trajectories(self) -> bool:
@@ -557,72 +611,103 @@ class ReplayBuffer:
 
     def add(
         self,
-        obs: np.ndarray,
-        action: np.ndarray,
-        next_obs: np.ndarray,
+        obs: mbrl_types.TensorType,
+        action: mbrl_types.TensorType,
+        next_obs: mbrl_types.TensorType,
         reward: float,
         terminated: bool,
         truncated: bool,
     ):
-        """Adds a transition to the replay buffer."""
-        obs = np.array(obs)
-        action = np.array(action)
-        next_obs = np.array(next_obs)
-        batch = TransitionBatch(
-            obs=obs[None, ...],
-            act=action[None, ...],
-            next_obs=next_obs[None, ...],
-            rewards=np.array([reward], dtype=self.reward_type),
-            terminateds=np.array([terminated], dtype=bool),
-            truncateds=np.array([truncated], dtype=bool),
+        """Adds a transition to the replay buffer.
+
+        Accepts both numpy arrays and torch tensors.
+        """
+        obs = torch.as_tensor(np.asarray(obs))
+        action = torch.as_tensor(np.asarray(action))
+        next_obs = torch.as_tensor(np.asarray(next_obs))
+        reward_t = torch.tensor([reward], dtype=getattr(torch, str(np.dtype(self.reward_type))))
+        terminated_t = torch.tensor([terminated], dtype=torch.bool)
+        truncated_t = torch.tensor([truncated], dtype=torch.bool)
+
+        td = TensorDict(
+            {
+                "observation": obs.unsqueeze(0),
+                "action": action.unsqueeze(0),
+                "next": {
+                    "observation": next_obs.unsqueeze(0),
+                    "reward": reward_t.unsqueeze(-1),
+                    "terminated": terminated_t.unsqueeze(-1),
+                    "truncated": truncated_t.unsqueeze(-1),
+                },
+            },
+            batch_size=[1],
         )
-        self.add_batch(
-            batch.obs,
-            batch.act,
-            batch.next_obs,
-            batch.rewards,
-            batch.terminateds,
-            batch.truncateds,
-        )
+        self._storage[int(self.cur_idx)] = td[0]
+        if self.stores_trajectories:
+            self._trajectory_bookkeeping(bool(terminated or truncated))
+        else:
+            self.cur_idx = (self.cur_idx + 1) % self.capacity
+            self.num_stored = min(self.num_stored + 1, self.capacity)
 
     def add_batch(
         self,
-        obs: np.ndarray,
-        action: np.ndarray,
-        next_obs: np.ndarray,
-        reward: np.ndarray,
-        terminated: np.ndarray,
-        truncated: np.ndarray,
+        obs: mbrl_types.TensorType,
+        action: mbrl_types.TensorType,
+        next_obs: mbrl_types.TensorType,
+        reward: mbrl_types.TensorType,
+        terminated: mbrl_types.TensorType,
+        truncated: mbrl_types.TensorType,
     ):
-        """Adds a batch of transitions to the replay buffer."""
-        batch = TransitionBatch(
-            obs=obs,
-            act=action,
-            next_obs=next_obs,
-            rewards=reward,
-            terminateds=terminated,
-            truncateds=truncated,
-        )
-        td = transition_batch_to_tensordict(batch)
-        
+        """Adds a batch of transitions to the replay buffer.
+
+        Accepts both numpy arrays and torch tensors.
+        """
+        obs = torch.as_tensor(np.asarray(obs)) if not isinstance(obs, torch.Tensor) else obs
+        action = torch.as_tensor(np.asarray(action)) if not isinstance(action, torch.Tensor) else action
+        next_obs = torch.as_tensor(np.asarray(next_obs)) if not isinstance(next_obs, torch.Tensor) else next_obs
+        reward = torch.as_tensor(np.asarray(reward)) if not isinstance(reward, torch.Tensor) else reward
+        terminated = torch.as_tensor(np.asarray(terminated)) if not isinstance(terminated, torch.Tensor) else terminated
+        truncated = torch.as_tensor(np.asarray(truncated)) if not isinstance(truncated, torch.Tensor) else truncated
+
+        # Ensure reward/terminated/truncated have correct shape for storage
+        if reward.ndim == 1:
+            reward_store = reward.unsqueeze(-1)
+        else:
+            reward_store = reward
+        if terminated.ndim == 1:
+            terminated_store = terminated.unsqueeze(-1)
+        else:
+            terminated_store = terminated
+        if truncated.ndim == 1:
+            truncated_store = truncated.unsqueeze(-1)
+        else:
+            truncated_store = truncated
+
         batch_size = obs.shape[0]
-        # Manually manage indices to match legacy behavior
         for i in range(batch_size):
-            self._storage[int(self.cur_idx)] = td[i]
+            self._storage[int(self.cur_idx)] = TensorDict(
+                {
+                    "observation": obs[i],
+                    "action": action[i],
+                    "next": {
+                        "observation": next_obs[i],
+                        "reward": reward_store[i],
+                        "terminated": terminated_store[i],
+                        "truncated": truncated_store[i],
+                    },
+                },
+                batch_size=[],
+            )
             if self.stores_trajectories:
-                self._trajectory_bookkeeping(bool(terminated[i] or truncated[i]))
+                self._trajectory_bookkeeping(bool(terminated[i].item() if isinstance(terminated[i], torch.Tensor) else terminated[i]) or bool(truncated[i].item() if isinstance(truncated[i], torch.Tensor) else truncated[i]))
             else:
                 self.cur_idx = (self.cur_idx + 1) % self.capacity
                 self.num_stored = min(self.num_stored + 1, self.capacity)
 
-        if self.stores_trajectories:
-             # trajectory_bookkeeping handles cur_idx and num_stored
-             pass
-
     def sample(self, batch_size: int) -> TransitionBatch:
         """Samples a batch of transitions from the replay buffer."""
         td = self._torchrl_rb.sample(batch_size)
-        return tensordict_to_transition_batch(td)
+        return tensordict_to_transition_batch(td, as_torch=self._output_torch)
 
     def sample_trajectory(self) -> Optional[TransitionBatch]:
         """Samples a full trajectory from the replay buffer."""
@@ -641,67 +726,99 @@ class ReplayBuffer:
         """Returns a batch of transitions from the given indices."""
         # TensorStorage supports advanced indexing
         td = self._torchrl_rb.storage[indices]
-        return tensordict_to_transition_batch(td)
+        return tensordict_to_transition_batch(td, as_torch=self._output_torch)
 
     def __len__(self):
         return self.num_stored
 
     def save(self, save_dir: Union[pathlib.Path, str]):
-        """Saves the replay buffer to a given directory."""
-        path = pathlib.Path(save_dir) / "replay_buffer.npz"
-        all_td = self._torchrl_rb.storage[: self.num_stored]
-        batch = tensordict_to_transition_batch(all_td)
-        np.savez(
-            path,
-            obs=batch.obs,
-            next_obs=batch.next_obs,
-            action=batch.act,
-            reward=batch.rewards,
-            terminated=batch.terminateds,
-            truncated=batch.truncateds,
-            num_stored=self.num_stored,
-            cur_idx=self.cur_idx,
-            trajectory_indices=np.array(self.trajectory_indices, dtype=object) if self.trajectory_indices is not None else [],
+        """Saves the replay buffer to a torch file."""
+        save_dir = pathlib.Path(save_dir)
+        all_td = self._torchrl_rb.storage[:int(self.num_stored)]
+        torch.save(
+            {
+                "tensordict": all_td.cpu(),
+                "num_stored": int(self.num_stored),
+                "cur_idx": int(self.cur_idx),
+                "trajectory_indices": self.trajectory_indices,
+            },
+            save_dir / self._BUFFER_FNAME,
         )
 
     def load(self, load_dir: Union[pathlib.Path, str]):
-        """Loads the replay buffer from a given directory."""
-        path = pathlib.Path(load_dir) / "replay_buffer.npz"
-        data = np.load(path, allow_pickle=True)
-        self.num_stored = data["num_stored"]
-        self.cur_idx = data["cur_idx"]
-        batch = TransitionBatch(
-            obs=data["obs"],
-            act=data["action"],
-            next_obs=data["next_obs"],
-            rewards=data["reward"],
-            terminateds=data["terminated"],
-            truncateds=data["truncated"],
-        )
-        td = transition_batch_to_tensordict(batch)
-        self._torchrl_rb.extend(td)
-        if "trajectory_indices" in data and len(data["trajectory_indices"]):
-            self.trajectory_indices = data["trajectory_indices"].tolist()
+        """Loads the replay buffer from a torch file, with legacy npz fallback."""
+        load_dir = pathlib.Path(load_dir)
+        pt_path = load_dir / self._BUFFER_FNAME
+        npz_path = load_dir / self._LEGACY_BUFFER_FNAME
+
+        if pt_path.exists():
+            data = torch.load(pt_path, weights_only=False)
+            td = data["tensordict"]
+            self.num_stored = data["num_stored"]
+            self.cur_idx = data["cur_idx"]
+            if data.get("trajectory_indices") is not None:
+                self.trajectory_indices = data["trajectory_indices"]
+            # Write directly into storage
+            self._storage[:len(td)] = td
+        elif npz_path.exists():
+            warnings.warn(
+                f"Loading replay buffer from legacy numpy format "
+                f"'{self._LEGACY_BUFFER_FNAME}'. Please re-save to migrate "
+                f"to the new '{self._BUFFER_FNAME}' format.",
+                FutureWarning,
+            )
+            data = np.load(npz_path, allow_pickle=True)
+            self.num_stored = int(data["num_stored"])
+            self.cur_idx = int(data["cur_idx"])
+            batch = TransitionBatch(
+                obs=data["obs"],
+                act=data["action"],
+                next_obs=data["next_obs"],
+                rewards=data["reward"],
+                terminateds=data["terminated"],
+                truncateds=data["truncated"],
+            )
+            td = transition_batch_to_tensordict(batch)
+            self._torchrl_rb.extend(td)
+            if "trajectory_indices" in data and len(data["trajectory_indices"]):
+                self.trajectory_indices = data["trajectory_indices"].tolist()
+        else:
+            raise FileNotFoundError(
+                f"No replay buffer found at '{pt_path}' or '{npz_path}'."
+            )
 
     def get_all(self, shuffle: bool = False) -> TransitionBatch:
         """Returns all transitions stored in the replay buffer."""
         if self.num_stored == 0:
-             return TransitionBatch(
-                 obs=np.empty((0, *self.obs_shape), dtype=self.obs_type),
-                 act=np.empty((0, *self.action_shape), dtype=self.action_type),
-                 next_obs=np.empty((0, *self.obs_shape), dtype=self.obs_type),
-                 rewards=np.empty(0, dtype=self.reward_type),
-                 terminateds=np.empty(0, dtype=bool),
-                 truncateds=np.empty(0, dtype=bool),
-             )
-        
+            if self._output_torch:
+                obs_dtype = getattr(torch, str(np.dtype(self.obs_type)))
+                act_dtype = getattr(torch, str(np.dtype(self.action_type)))
+                rew_dtype = getattr(torch, str(np.dtype(self.reward_type)))
+                return TransitionBatch(
+                    obs=torch.empty((0, *self.obs_shape), dtype=obs_dtype),
+                    act=torch.empty((0, *self.action_shape), dtype=act_dtype),
+                    next_obs=torch.empty((0, *self.obs_shape), dtype=obs_dtype),
+                    rewards=torch.empty(0, dtype=rew_dtype),
+                    terminateds=torch.empty(0, dtype=torch.bool),
+                    truncateds=torch.empty(0, dtype=torch.bool),
+                )
+            else:
+                return TransitionBatch(
+                    obs=np.empty((0, *self.obs_shape), dtype=self.obs_type),
+                    act=np.empty((0, *self.action_shape), dtype=self.action_type),
+                    next_obs=np.empty((0, *self.obs_shape), dtype=self.obs_type),
+                    rewards=np.empty(0, dtype=self.reward_type),
+                    terminateds=np.empty(0, dtype=bool),
+                    truncateds=np.empty(0, dtype=bool),
+                )
+
         # Use slicing on storage for efficiency
         td = self._torchrl_rb.storage[:int(self.num_stored)]
-        
+
         if shuffle:
             indices = self._rng.permutation(len(td))
             td = td[indices]
-        return tensordict_to_transition_batch(td)
+        return tensordict_to_transition_batch(td, as_torch=self._output_torch)
 
     @property
     def rng(self) -> np.random.Generator:

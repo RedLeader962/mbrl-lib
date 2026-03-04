@@ -77,14 +77,29 @@ class EnsembleLinearLayer(nn.Module):
         self.use_only_elite = not self.use_only_elite
 
 
-def to_tensor(x: mbrl.types.TensorType):
+def to_tensor(x: mbrl.types.TensorType) -> torch.Tensor:
+    """Converts input to a torch.Tensor.
+
+    If the input is already a ``torch.Tensor`` it is returned as-is (fast
+    path).  If it is a ``np.ndarray`` it is converted and a
+    ``UserWarning`` is emitted to guide downstream code toward using torch
+    tensors directly.
+    """
     if isinstance(x, torch.Tensor):
-        res = x
-    elif isinstance(x, np.ndarray):
-        res = torch.from_numpy(x)
-    else:
-        raise ValueError("Input must be torch.Tensor or np.ndarray.")
-    return res
+        return x
+    if isinstance(x, np.ndarray):
+        import warnings
+
+        warnings.warn(
+            "model_util.to_tensor received a numpy array. If this data "
+            "originated from a ReplayBuffer or TransitionIterator, consider "
+            "updating your code to work with torch tensors directly for "
+            "better performance.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return torch.from_numpy(x)
+    raise ValueError("Input must be torch.Tensor or np.ndarray.")
 
 
 def get_cnn_output_size(
