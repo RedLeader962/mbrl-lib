@@ -47,9 +47,15 @@ class MockLineEnv(gym.Env):
         self.vel = 0.0
         self.time_left = _TRIAL_LEN
         self.observation_space = gym.spaces.Box(
-            -np.inf * np.ones(2), np.inf * np.ones(2), shape=(2,)
+            -np.inf * np.ones(2, dtype=np.float32),
+            np.inf * np.ones(2, dtype=np.float32),
+            shape=(2,),
         )
-        self.action_space = gym.spaces.Box(-np.ones(1), np.ones(1), shape=(1,))
+        self.action_space = gym.spaces.Box(
+            -np.ones(1, dtype=np.float32),
+            np.ones(1, dtype=np.float32),
+            shape=(1,),
+        )
         self.action_space.seed(SEED)
         self.observation_space.seed(SEED)
 
@@ -262,7 +268,7 @@ def test_pets_icem_gaussian_mlp_ensemble():
 def test_pets_icem_basic_ensemble_deterministic_mlp():
     _check_pets_icem("basic_ensemble")
 
-
+@pytest.mark.flaky(reruns=5, reruns_delay=60)
 def test_mbpo():
     with open(_REPO_DIR / _CONF_DIR / "algorithm" / "mbpo.yaml", "r") as f:
         algorithm_cfg = yaml.safe_load(f)

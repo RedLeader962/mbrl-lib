@@ -294,7 +294,9 @@ class Model(pl.LightningModule, abc.ABC):
 
     def load(self, load_dir: Union[str, pathlib.Path]):
         """Loads the model from the given path."""
-        self.load_state_dict(torch.load(pathlib.Path(load_dir) / self._MODEL_FNAME))
+        self.load_state_dict(
+            torch.load(pathlib.Path(load_dir) / self._MODEL_FNAME, weights_only=True)
+        )
 
 
 # ---------------------------------------------------------------------------
