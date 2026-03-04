@@ -3,7 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 import pathlib
-import pickle
+import warnings
 from typing import Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -95,7 +95,8 @@ def truncated_normal_(
 class Normalizer(torch.nn.Module):
     """Class that keeps a running mean and variance and normalizes data accordingly.
 
-    The statistics kept are stored in torch tensors as registered buffers.
+    The statistics are stored as registered buffers, ensuring they are
+    included in ``state_dict()`` and correctly moved between devices.
 
     Args:
         in_size (int): the size of the data that will be normalized.
@@ -103,39 +104,66 @@ class Normalizer(torch.nn.Module):
         dtype (torch.dtype): the data type to use for the normalizer.
     """
 
-    _STATS_FNAME = "env_stats.pickle"
+    _STATS_FNAME = "env_stats.pt"
+    _LEGACY_STATS_FNAME = "env_stats.pickle"
 
     def __init__(self, in_size: int, device: torch.device, dtype=torch.float32):
         super().__init__()
         self.register_buffer("mean", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("std", torch.ones((1, in_size), dtype=dtype))
-        self.eps = 1e-12 if dtype == torch.double else 1e-5
+        self.register_buffer(
+            "eps", torch.tensor(1e-12 if dtype == torch.double else 1e-5)
+        )
         self.to(device)
 
     @property
     def device(self):
         return self.mean.device
 
+    def _to_tensor(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        """Convert input to a tensor on the correct device, handling MPS dtype."""
+        if isinstance(val, np.ndarray):
+            val = torch.from_numpy(val)
+        if not isinstance(val, torch.Tensor):
+            val = torch.tensor(val)
+        if self.device.type == "mps" and val.dtype == torch.float64:
+            val = val.float()
+        return val.to(self.device)
+
     def update_stats(self, data: mbrl.types.TensorType):
         """Updates the stored statistics using the given data.
 
-        Equivalent to `self.stats.mean = data.mean(0) and self.stats.std = data.std(0)`.
+        Equivalent to ``self.mean = data.mean(0)`` and ``self.std = data.std(0)``.
 
         Args:
             data (np.ndarray or torch.Tensor): The data used to compute the statistics.
         """
         assert data.ndim == 2 and data.shape[1] == self.mean.shape[1]
-        if isinstance(data, np.ndarray):
-            data = torch.from_numpy(data)
-        if self.device.type == "mps" and data.dtype == torch.float64:
-            data = data.float()
-        data = data.to(self.device)
-        self.mean = data.mean(0, keepdim=True)
+        data = self._to_tensor(data)
+
+        if data.shape[0] < 10:
+            warnings.warn(
+                f"Normalizer.update_stats called with only {data.shape[0]} samples. "
+                "Statistics may be unreliable.",
+                RuntimeWarning,
+            )
+
+        if torch.isnan(data).any() or torch.isinf(data).any():
+            warnings.warn(
+                "Normalizer.update_stats received data containing NaN or Inf. "
+                "These entries will be replaced with zeros.",
+                RuntimeWarning,
+            )
+            data = torch.where(torch.isfinite(data), data, torch.zeros_like(data))
+
+        self.mean.copy_(data.mean(0, keepdim=True))
         if data.shape[0] > 1:
-            self.std = data.std(0, keepdim=True)
+            self.std.copy_(data.std(0, keepdim=True))
         else:
-            self.std = torch.ones_like(self.mean)
-        self.std[torch.logical_or(self.std < self.eps, torch.isnan(self.std))] = 1.0
+            self.std.fill_(1.0)
+
+        self.std.clamp_(min=self.eps.item())
+        self.std[torch.isnan(self.std)] = 1.0
 
     def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
         """Normalizes the value according to the stored statistics.
@@ -149,15 +177,9 @@ class Normalizer(torch.nn.Module):
         Returns:
             (torch.Tensor): The normalized value.
         """
-        if isinstance(val, np.ndarray):
-            val = torch.from_numpy(val)
-        if not isinstance(val, torch.Tensor):
-            val = torch.tensor(val)
-        
-        if self.device.type == "mps" and val.dtype == torch.float64:
-            val = val.float()
-        val = val.to(self.device)
-        return (val.to(self.mean.dtype) - self.mean) / self.std
+        val = self._to_tensor(val)
+        result = (val.to(self.mean.dtype) - self.mean) / self.std
+        return torch.where(torch.isfinite(result), result, torch.zeros_like(result))
 
     def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
         """De-normalizes the value according to the stored statistics.
@@ -171,29 +193,46 @@ class Normalizer(torch.nn.Module):
         Returns:
             (torch.Tensor): The de-normalized value.
         """
-        if isinstance(val, np.ndarray):
-            val = torch.from_numpy(val)
-        if not isinstance(val, torch.Tensor):
-            val = torch.tensor(val)
-            
-        if self.device.type == "mps" and val.dtype == torch.float64:
-            val = val.float()
-        val = val.to(self.device)
-        return self.std * val.to(self.mean.dtype) + self.mean
-
-    def load(self, results_dir: Union[str, pathlib.Path]):
-        """Loads saved statistics from the given path."""
-        with open(pathlib.Path(results_dir) / self._STATS_FNAME, "rb") as f:
-            stats = pickle.load(f)
-            self.mean.copy_(torch.from_numpy(stats["mean"]).to(self.device))
-            self.std.copy_(torch.from_numpy(stats["std"]).to(self.device))
+        val = self._to_tensor(val)
+        result = self.std * val.to(self.mean.dtype) + self.mean
+        return torch.where(torch.isfinite(result), result, torch.zeros_like(result))
 
     def save(self, save_dir: Union[str, pathlib.Path]):
-        """Saves stored statistics to the given path."""
+        """Saves statistics to a torch file."""
         save_dir = pathlib.Path(save_dir)
-        with open(save_dir / self._STATS_FNAME, "wb") as f:
-            pickle.dump(
-                {"mean": self.mean.cpu().numpy(), "std": self.std.cpu().numpy()}, f
+        torch.save(
+            {"mean": self.mean.cpu(), "std": self.std.cpu(), "eps": self.eps.cpu()},
+            save_dir / self._STATS_FNAME,
+        )
+
+    def load(self, load_dir: Union[str, pathlib.Path]):
+        """Loads statistics from a torch file, with legacy pickle fallback."""
+        load_dir = pathlib.Path(load_dir)
+        pt_path = load_dir / self._STATS_FNAME
+        pickle_path = load_dir / self._LEGACY_STATS_FNAME
+
+        if pt_path.exists():
+            stats = torch.load(pt_path, weights_only=True)
+            self.mean.copy_(stats["mean"].to(self.device))
+            self.std.copy_(stats["std"].to(self.device))
+            if "eps" in stats:
+                self.eps.copy_(stats["eps"].to(self.device))
+        elif pickle_path.exists():
+            warnings.warn(
+                f"Loading normalizer from legacy pickle format "
+                f"'{self._LEGACY_STATS_FNAME}'. Please re-save to migrate "
+                f"to the new '{self._STATS_FNAME}' format.",
+                FutureWarning,
+            )
+            import pickle
+
+            with open(pickle_path, "rb") as f:
+                stats = pickle.load(f)
+                self.mean.copy_(torch.from_numpy(stats["mean"]).to(self.device))
+                self.std.copy_(torch.from_numpy(stats["std"]).to(self.device))
+        else:
+            raise FileNotFoundError(
+                f"No normalizer stats found at '{pt_path}' or '{pickle_path}'."
             )
 
 
