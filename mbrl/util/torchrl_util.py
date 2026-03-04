@@ -42,31 +42,40 @@ def transition_batch_to_tensordict(
     return TensorDict(data, batch_size=[batch_size], device=device)
 
 
-def tensordict_to_transition_batch(td: TensorDict) -> TransitionBatch:
+def tensordict_to_transition_batch(
+    td: TensorDict, as_torch: bool = True
+) -> TransitionBatch:
     """Converts a TensorDict to a TransitionBatch.
 
     Args:
         td (TensorDict): The TensorDict to convert.
+        as_torch (bool): If ``True`` (default), the returned
+            ``TransitionBatch`` fields are ``torch.Tensor``.  If ``False``,
+            fields are converted to ``np.ndarray`` (legacy behaviour).
 
     Returns:
         (TransitionBatch): The converted TransitionBatch.
     """
-    def _to_numpy(x):
-        if isinstance(x, torch.Tensor):
-            return x.detach().cpu().numpy()
-        return x
+    if as_torch:
+        def _extract(x):
+            return x.detach() if x.requires_grad else x
+    else:
+        def _extract(x):
+            if isinstance(x, torch.Tensor):
+                return x.detach().cpu().numpy()
+            return x
 
     return TransitionBatch(
-        obs=_to_numpy(td["observation"]),
-        act=_to_numpy(td["action"]),
-        next_obs=_to_numpy(td["next", "observation"]),
-        rewards=_to_numpy(td["next", "reward"].squeeze(-1))
+        obs=_extract(td["observation"]),
+        act=_extract(td["action"]),
+        next_obs=_extract(td["next", "observation"]),
+        rewards=_extract(td["next", "reward"].squeeze(-1))
         if td["next", "reward"].shape[-1] == 1
-        else _to_numpy(td["next", "reward"]),
-        terminateds=_to_numpy(td["next", "terminated"].squeeze(-1))
+        else _extract(td["next", "reward"]),
+        terminateds=_extract(td["next", "terminated"].squeeze(-1))
         if td["next", "terminated"].shape[-1] == 1
-        else _to_numpy(td["next", "terminated"]),
-        truncateds=_to_numpy(td["next", "truncated"].squeeze(-1))
+        else _extract(td["next", "terminated"]),
+        truncateds=_extract(td["next", "truncated"].squeeze(-1))
         if td["next", "truncated"].shape[-1] == 1
-        else _to_numpy(td["next", "truncated"]),
+        else _extract(td["next", "truncated"]),
     )

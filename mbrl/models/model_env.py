@@ -59,7 +59,7 @@ class ModelEnv:
         self._return_as_np = True
 
     def reset(
-        self, initial_obs_batch: np.ndarray, return_as_np: bool = True
+        self, initial_obs_batch: mbrl.types.TensorType, return_as_np: bool = True
     ) -> Dict[str, torch.Tensor]:
         """Resets the model environment.
 
@@ -77,8 +77,10 @@ class ModelEnv:
         if isinstance(self.dynamics_model, mbrl.models.OneDTransitionRewardModel):
             assert len(initial_obs_batch.shape) == 2  # batch, obs_dim
         with torch.no_grad():
+            if isinstance(initial_obs_batch, np.ndarray):
+                initial_obs_batch = initial_obs_batch.astype(np.float32)
             model_state = self.dynamics_model.reset(
-                initial_obs_batch.astype(np.float32), rng=self._rng
+                initial_obs_batch, rng=self._rng
             )
         self._return_as_np = return_as_np
         return model_state if model_state is not None else {}
@@ -166,10 +168,12 @@ class ModelEnv:
             population_size, horizon, action_dim = action_sequences.shape
             # either 1-D state or 3-D pixel observation
             assert initial_state.ndim in (1, 3)
-            tiling_shape = (num_particles * population_size,) + tuple(
-                [1] * initial_state.ndim
+            initial_obs_tensor = torch.as_tensor(
+                initial_state, dtype=torch.float32, device=self.dynamics_model.device
             )
-            initial_obs_batch = np.tile(initial_state, tiling_shape).astype(np.float32)
+            initial_obs_batch = initial_obs_tensor.unsqueeze(0).expand(
+                num_particles * population_size, *initial_state.shape
+            ).contiguous()
             model_state = self.reset(initial_obs_batch, return_as_np=False)
             batch_size = initial_obs_batch.shape[0]
             total_rewards = torch.zeros(batch_size, 1).to(self.dynamics_model.device)
