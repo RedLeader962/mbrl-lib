@@ -19,6 +19,13 @@ Transition = Tuple[
 ]
 
 
+def _type_aware_indexing(data: TensorType) -> TensorType | float | int | bool:
+    if isinstance(data, torch.Tensor) and data.ndim == 0:
+        return data.item()
+    else:
+        return data
+
+
 @dataclass
 class TransitionBatch:
     """Represents a batch of transitions"""
@@ -45,12 +52,12 @@ class TransitionBatch:
 
     def __getitem__(self, item):
         return TransitionBatch(
-            self.obs[item],
-            self.act[item],
-            self.next_obs[item],
-            self.rewards[item],
-            self.terminateds[item],
-            self.truncateds[item],
+                _type_aware_indexing(self.obs[item]),
+                _type_aware_indexing(self.act[item]),
+                _type_aware_indexing(self.next_obs[item]),
+                _type_aware_indexing(self.rewards[item]),
+                _type_aware_indexing(self.terminateds[item]),
+                _type_aware_indexing(self.truncateds[item]),
         )
 
     @staticmethod
