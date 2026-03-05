@@ -249,16 +249,18 @@ class ModelTrainer:
         self.weight_decay = weight_decay
         self.optim_eps = optim_eps
 
-        # Optimizer configuration is handled via monkey-patching
-        # ``configure_optimizers`` on the model instance, which Lightning will
-        # call during ``fit()``.
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=self.optim_lr,
+            weight_decay=self.weight_decay,
+            eps=self.optim_eps,
+        )
+
+        # Monkey-patch ``configure_optimizers`` on the model instance so that
+        # Lightning reuses the same optimizer instance.  This allows users to
+        # attach LR schedulers to ``self.optimizer`` before calling ``train()``.
         def configure_optimizers():
-            return optim.Adam(
-                self.model.parameters(),
-                lr=self.optim_lr,
-                weight_decay=self.weight_decay,
-                eps=self.optim_eps,
-            )
+            return self.optimizer
 
         self.model.configure_optimizers = configure_optimizers
 
