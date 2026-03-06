@@ -1,16 +1,18 @@
-[![PyPi Version](https://img.shields.io/pypi/v/mbrl)](https://pypi.org/project/mbrl/)
+[//]: # ([![PyPi Version]&#40;https://img.shields.io/pypi/v/mbrl&#41;]&#40;https://pypi.org/project/mbrl/&#41;)
 [![Main](https://github.com/facebookresearch/mbrl-lib/workflows/CI/badge.svg)](https://github.com/facebookresearch/mbrl-lib/actions?query=workflow%3ACI)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/facebookresearch/mbrl-lib/tree/main/LICENSE)
-[![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/release/python-360/)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/release/python-360/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
  
 
-# MBRL-Lib
+# MBRL-Lib (RedLeader962 fork)
 
 ``mbrl`` is a toolbox for facilitating development of 
 Model-Based Reinforcement Learning algorithms. It provides easily interchangeable 
 modeling and planning components, and a set of utility functions that allow writing
 model-based RL algorithms with only a few lines of code. 
+
+Fork improvements include support for Tensordict and TorchRL replay-buffer, PyTorch-Lightning, latest hydra versions and more.
 
 See also our companion [paper](https://arxiv.org/abs/2104.10159). 
 

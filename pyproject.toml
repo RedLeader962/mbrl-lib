@@ -1,0 +1,110 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mbrl"
+dynamic = ["version"]
+description = "A PyTorch first fork of the original Facebook AI Research mbrl-lib (a PyTorch library for model-based reinforcement learning research) with support for Tensordict and TorchRL replay-buffer, PyTorch-Lightning, latest hydra versions and more."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    { name = "Facebook AI Research" },
+    { name = "Luc Coupal" },
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torchrl",
+    "tensordict",
+    "lightning",
+    "omegaconf>=2.1.2",
+    "hydra-core>=1.1.2",
+    "termcolor>=1.1.0",
+    "tensorboard>=2.4.0",
+    "imageio>=2.9.0",
+    "numpy>=1.19.1",
+    "matplotlib>=3.3.1",
+    "gymnasium>=0.26.3",
+    "jupyter>=1.0.0",
+    "pytest>=6.0.1",
+    "sk-video>=1.1.10",
+    "tqdm>=4.48.2",
+    "ffmpeg",
+]
+
+[project.optional-dependencies]
+dev = [
+    "sphinx>=3.3.1",
+    "nbsphinx>=0.8.0",
+    "sphinx-rtd-theme>=0.5.0",
+    "flake8>=3.9.2",
+    "mypy>=0.991",
+    "black>=23.1.0",
+    "importlib_metadata<5",
+    "pytest>=6.0.1",
+    "types-pyyaml>=0.1.6",
+    "types-termcolor>=0.1.0",
+    "pre-commit>=2.7.1",
+    "gymnasium[mujoco]>=0.26.3",
+    "pybullet",
+]
+
+[project.urls]
+Homepage = "https://github.com/RedLeader962/mbrl-lib"
+
+[tool.setuptools.dynamic]
+version = {attr = "mbrl.__version__"}
+
+[tool.setuptools.packages.find]
+where = [
+    ".",
+    "mbrl"
+]
+exclude = [
+    "tests",
+    "tests.*",
+    "mbrl/third_party/dmc2gym",
+]
+
+[tool.setuptools]
+include-package-data = true
+zip-safe = false
+
+[tool.flake8]
+# E203, W503 conflict with black
+ignore = ["E203", "W503"]
+max-line-length = 100
+per-file-ignores = [
+    "*/__init__.py:F401",
+    "mbrl/env/mujoco_envs.py:F401",
+    "tests/*:F401",
+]
+exclude = ["mbrl/third_party/*"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+show_error_codes = true
+strict_optional = false
+
+[[tool.mypy.overrides]]
+module = "torch.*"
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+[tool.isort]
+profile = "black"
