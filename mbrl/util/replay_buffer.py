@@ -540,6 +540,17 @@ class ReplayBuffer:
         td = self._torchrl_rb.storage[np.arange(len(self._storage))]
         return td["next", "reward"].squeeze(-1).detach().cpu().numpy()
 
+    @reward.setter
+    def reward(self, value):
+        """Sets rewards in the underlying storage (legacy mutation API)."""
+        value_t = torch.as_tensor(np.asarray(value), dtype=getattr(torch, str(np.dtype(self.reward_type))))
+        if value_t.ndim == 1:
+            value_t = value_t.unsqueeze(-1)
+        indices = np.arange(len(value_t))
+        td = self._torchrl_rb.storage[indices]
+        td["next", "reward"] = value_t
+        self._torchrl_rb.storage[indices] = td
+
     @property
     def terminated(self):
         """Returns full storage terminated flags as numpy (legacy inspection API)."""
@@ -768,8 +779,14 @@ class ReplayBuffer:
                 FutureWarning,
             )
             data = np.load(npz_path, allow_pickle=True)
-            self.num_stored = int(data["num_stored"])
-            self.cur_idx = int(data["cur_idx"])
+            if "num_stored" in data:
+                self.num_stored = int(data["num_stored"])
+            else:
+                self.num_stored = len(data["obs"])
+            if "cur_idx" in data:
+                self.cur_idx = int(data["cur_idx"])
+            else:
+                self.cur_idx = self.num_stored % self.capacity
             batch = TransitionBatch(
                 obs=data["obs"],
                 act=data["action"],

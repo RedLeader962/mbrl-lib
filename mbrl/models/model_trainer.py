@@ -83,6 +83,12 @@ class _LegacyCallback(pl.Callback):
     # ------------------------------------------------------------------ #
     def on_validation_epoch_start(self, trainer, pl_module):
         self._epoch_val_scores: List[torch.Tensor] = []
+        # Toggle bootstrap off for validation, matching legacy evaluate() behavior
+        val_dl = trainer.val_dataloaders
+        if val_dl is not None:
+            ds = val_dl.dataset if hasattr(val_dl, 'dataset') else None
+            if ds is not None and hasattr(ds, 'it') and isinstance(ds.it, BootstrapIterator):
+                ds.it.toggle_bootstrap()
 
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
@@ -113,6 +119,13 @@ class _LegacyCallback(pl.Callback):
             self._epoch_val_scores.append(val_score.detach().cpu())
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        # Toggle bootstrap back on after validation
+        val_dl = trainer.val_dataloaders
+        if val_dl is not None:
+            ds = val_dl.dataset if hasattr(val_dl, 'dataset') else None
+            if ds is not None and hasattr(ds, 'it') and isinstance(ds.it, BootstrapIterator):
+                ds.it.toggle_bootstrap()
+
         if not self._epoch_val_scores:
             return
 
@@ -333,6 +346,11 @@ class ModelTrainer:
                 validation losses.
         """
         self._train_iteration += 1
+
+        # Ensure model is in train mode before fitting.  A previous
+        # ``pl.Trainer.fit()`` call may leave the model in eval mode after
+        # its validation loop, and creating a new Trainer does not restore it.
+        self.model.train()
 
         # Bridge TransitionIterator to Lightning DataLoader
         train_loader = DataLoader(
