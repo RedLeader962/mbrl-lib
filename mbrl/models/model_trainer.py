@@ -4,7 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 import copy
 import logging
-import sys
 import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -78,6 +77,7 @@ class _LegacyCallback(pl.Callback):
 
         # Best-weight tracking (replaces ModelCheckpoint)
         self.best_val_score: Optional[torch.Tensor] = None
+        self.current_epoch_val_score: Optional[torch.Tensor] = None
         self.best_weights: Optional[Dict] = None
 
     # ------------------------------------------------------------------ #
@@ -154,6 +154,7 @@ class _LegacyCallback(pl.Callback):
             self.best_val_score = torch.minimum(self.best_val_score, epoch_avg_scores)
             self.best_weights = maybe_best
 
+        self.current_epoch_val_score = epoch_avg_scores
         self._epoch_val_scores = []
 
     # ------------------------------------------------------------------ #
@@ -209,7 +210,7 @@ class _LegacyCallback(pl.Callback):
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
 
-        eval_score = self.best_val_score
+        eval_score = self.current_epoch_val_score if self.current_epoch_val_score is not None else self.best_val_score
         best_val_score = self.best_val_score
 
         if self.legacy_callback:
@@ -333,13 +334,6 @@ class ModelTrainer:
                 enable_checkpointing=False,
             )
 
-        # Force eager CUDA runtime initialization so that any diagnostic
-        # message (e.g. "No CUDA runtime is found, using CUDA_HOME=...")
-        # is printed now, before the ERLL progress bar starts.
-        if torch.cuda.is_available():
-            torch.cuda.init()
-        sys.stderr.flush()
-        sys.stdout.flush()
 
     def train(
         self,

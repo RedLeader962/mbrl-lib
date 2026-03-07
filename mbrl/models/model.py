@@ -15,6 +15,23 @@ from mbrl.types import ModelInput, TransitionBatch
 
 
 # ---------------------------------------------------------------------------
+#  Module-level helper – decorated with @torch.compiler.disable so that
+#  Lightning ``self.log`` / ``self.log_dict`` calls (which use
+#  data-dependent string keys) run in eager mode and avoid dynamo
+#  recompilation warnings, while the *method* itself keeps a normal
+#  signature that Lightning can introspect.
+# ---------------------------------------------------------------------------
+@torch.compiler.disable
+def _log_metrics_eager(module, prefix, loss_val, meta, batch_size):
+    module.log(f"{prefix}/loss", loss_val, batch_size=batch_size)
+    if meta:
+        module.log_dict(
+            {f"{prefix}/{k}": v for k, v in meta.items()},
+            batch_size=batch_size,
+        )
+
+
+# ---------------------------------------------------------------------------
 #                           ABSTRACT MODEL CLASS
 # ---------------------------------------------------------------------------
 class Model(pl.LightningModule, abc.ABC):
@@ -269,9 +286,7 @@ class Model(pl.LightningModule, abc.ABC):
             print(f"Warning: train loss is {loss.item()}. Stopping training.")
             self.trainer.should_stop = True
 
-        self.log("train/loss", loss, batch_size=len(batch))
-        if meta:
-            self.log_dict({f"train/{k}": v for k, v in meta.items()}, batch_size=len(batch))
+        _log_metrics_eager(self, "train", loss, meta, len(batch))
         return {**meta, "loss": loss}
 
     def validation_step(self, batch: TransitionBatch, batch_idx: int):
@@ -282,9 +297,7 @@ class Model(pl.LightningModule, abc.ABC):
         if torch.isnan(val_loss) or torch.isinf(val_loss):
             print(f"Warning: val loss is {val_loss.item()}.")
 
-        self.log("val/loss", val_loss, batch_size=len(batch))
-        if meta:
-            self.log_dict({f"val/{k}": v for k, v in meta.items()}, batch_size=len(batch))
+        _log_metrics_eager(self, "val", val_loss, meta, len(batch))
         return {**meta, "score": val_loss, "val_score": val_score}
 
 
