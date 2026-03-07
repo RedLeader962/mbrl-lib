@@ -69,7 +69,7 @@ class Model(pl.LightningModule, abc.ABC):
 
     def _process_batch(
         self, batch: TransitionBatch, as_float: bool = True
-    ) -> Tuple[torch.Tensor, ...]:
+    ) -> Tuple[Union[None, torch.Tensor], ...]:
         def _convert(x):
             if x is None:
                 return None
