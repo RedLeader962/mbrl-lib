@@ -35,7 +35,8 @@ class TestBasicFunctionality:
         )
         assert norm.mean.dtype == torch.double
         assert norm.std.dtype == torch.double
-        assert norm.eps.item() == pytest.approx(1e-12)
+        assert norm.eps.item() == pytest.approx(1e-14)
+        assert norm.eps.dtype == torch.double
 
     def test_update_stats_basic(self):
         norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE))
@@ -284,6 +285,85 @@ class TestDeviceDtype:
 
 
 # ------------------------------------------------------------------ #
+#  6.5b — Input Dtype Preservation
+# ------------------------------------------------------------------ #
+class TestDtypePreservation:
+    """Verify that normalize/denormalize return tensors in the caller's dtype."""
+
+    def test_normalize_float32_input_float32_normalizer(self):
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE), dtype=torch.float32)
+        data = torch.randn(50, 2, dtype=torch.float32)
+        norm.update_stats(data)
+        result = norm.normalize(data)
+        assert result.dtype == torch.float32
+
+    def test_normalize_float64_input_float64_normalizer(self):
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE), dtype=torch.float64)
+        data = torch.randn(50, 2, dtype=torch.float64)
+        norm.update_stats(data)
+        result = norm.normalize(data)
+        assert result.dtype == torch.float64
+
+    def test_normalize_float32_input_float64_normalizer_preserves_float32(self):
+        """float32 input to a double-precision normalizer must return float32."""
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE), dtype=torch.float64)
+        data_f64 = torch.randn(50, 2, dtype=torch.float64)
+        norm.update_stats(data_f64)
+        query = torch.randn(10, 2, dtype=torch.float32)
+        result = norm.normalize(query)
+        assert result.dtype == torch.float32
+
+    def test_normalize_float64_input_float32_normalizer_preserves_float64(self):
+        """float64 input to a single-precision normalizer must return float64."""
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE), dtype=torch.float32)
+        data = torch.randn(50, 2, dtype=torch.float32)
+        norm.update_stats(data)
+        query = torch.randn(10, 2, dtype=torch.float64)
+        result = norm.normalize(query)
+        assert result.dtype == torch.float64
+
+    def test_denormalize_float32_input_float64_normalizer_preserves_float32(self):
+        """float32 input to a double-precision denormalizer must return float32."""
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE), dtype=torch.float64)
+        data_f64 = torch.randn(50, 2, dtype=torch.float64)
+        norm.update_stats(data_f64)
+        query = torch.randn(10, 2, dtype=torch.float32)
+        result = norm.denormalize(query)
+        assert result.dtype == torch.float32
+
+    def test_denormalize_float64_input_float32_normalizer_preserves_float64(self):
+        """float64 input to a single-precision denormalizer must return float64."""
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE), dtype=torch.float32)
+        data = torch.randn(50, 2, dtype=torch.float32)
+        norm.update_stats(data)
+        query = torch.randn(10, 2, dtype=torch.float64)
+        result = norm.denormalize(query)
+        assert result.dtype == torch.float64
+
+    def test_round_trip_cross_dtype_precision(self):
+        """Round-trip through double normalizer with float32 input stays accurate."""
+        norm = mbrl.util.math.Normalizer(3, torch.device(_DEVICE), dtype=torch.float64)
+        data_f64 = torch.randn(100, 3, dtype=torch.float64)
+        norm.update_stats(data_f64)
+        query = torch.randn(20, 3, dtype=torch.float32)
+        reconstructed = norm.denormalize(norm.normalize(query))
+        assert reconstructed.dtype == torch.float32
+        assert torch.allclose(reconstructed, query, atol=1e-5)
+
+    def test_normalize_uses_high_precision_arithmetic(self):
+        """Even when output is float32, internal arithmetic should use float64
+        when the normalizer stores double stats — reducing catastrophic cancellation."""
+        norm = mbrl.util.math.Normalizer(1, torch.device(_DEVICE), dtype=torch.float64)
+        # A large mean makes (val - mean) prone to cancellation in float32
+        norm.mean.fill_(1e7)
+        norm.std.fill_(1.0)
+        val = torch.tensor([[1e7 + 1.0]], dtype=torch.float32)
+        result = norm.normalize(val)
+        # If arithmetic were float32, the result would be 0.0 due to cancellation
+        assert result.item() == pytest.approx(1.0, abs=1e-4)
+
+
+# ------------------------------------------------------------------ #
 #  6.6 — Integration with OneDTransitionRewardModel
 # ------------------------------------------------------------------ #
 class TestIntegration:
@@ -328,3 +408,53 @@ class TestIntegration:
 
         assert torch.allclose(wrapper2.input_normalizer.mean, original_mean)
         assert torch.allclose(wrapper2.input_normalizer.std, original_std)
+
+
+# ------------------------------------------------------------------ #
+#  6.7 — Eps dtype and value consistency
+# ------------------------------------------------------------------ #
+class TestEpsDtypeConsistency:
+    def test_eps_dtype_matches_normalizer_float32(self):
+        """eps buffer dtype must match the normalizer's dtype."""
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE), dtype=torch.float32)
+        assert norm.eps.dtype == torch.float32
+
+    def test_eps_dtype_matches_normalizer_float64(self):
+        """eps buffer dtype must match the normalizer's dtype."""
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE), dtype=torch.float64)
+        assert norm.eps.dtype == torch.float64
+
+    def test_eps_value_float32(self):
+        norm = mbrl.util.math.Normalizer(1, torch.device(_DEVICE), dtype=torch.float32)
+        assert norm.eps.item() == pytest.approx(1e-5)
+
+    def test_eps_value_float64(self):
+        norm = mbrl.util.math.Normalizer(1, torch.device(_DEVICE), dtype=torch.float64)
+        assert norm.eps.item() == pytest.approx(1e-14)
+
+    def test_eps_clamps_std_float32(self):
+        """For float32 normalizer, std must never fall below eps (~1e-5)."""
+        norm = mbrl.util.math.Normalizer(1, torch.device(_DEVICE), dtype=torch.float32)
+        # Near-constant data: true std ≈ 1e-7, well below eps=1e-5
+        data = torch.ones(100, 1, dtype=torch.float32) + torch.randn(100, 1) * 1e-7
+        norm.update_stats(data)
+        # Use approx to account for float32 representation of 1e-5
+        assert norm.std.item() == pytest.approx(1e-5, rel=1e-6)
+
+    def test_eps_clamps_std_float64(self):
+        """For float64 normalizer, std must never fall below 1e-14."""
+        norm = mbrl.util.math.Normalizer(1, torch.device(_DEVICE), dtype=torch.float64)
+        # Near-constant data: true std ≈ 1e-15, below eps=1e-14
+        data = torch.ones(100, 1, dtype=torch.float64) + torch.randn(100, 1).double() * 1e-15
+        norm.update_stats(data)
+        assert norm.std.item() >= 1e-14
+
+    def test_float64_eps_preserves_fine_variance(self):
+        """float64 normalizer with eps=1e-14 must NOT clamp variance at 1e-10 scale."""
+        norm = mbrl.util.math.Normalizer(1, torch.device(_DEVICE), dtype=torch.float64)
+        data = torch.ones(100, 1, dtype=torch.float64) + torch.randn(100, 1).double() * 1e-10
+        true_std = data.std(0).item()
+        norm.update_stats(data)
+        # With the old eps=1e-12 this would pass too, but with eps=1e-14 the
+        # normalizer can preserve even finer variance distinctions.
+        assert norm.std.item() == pytest.approx(true_std, rel=1e-6)

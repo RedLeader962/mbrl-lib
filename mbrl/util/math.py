@@ -111,9 +111,12 @@ class Normalizer(torch.nn.Module):
         super().__init__()
         self.register_buffer("mean", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("std", torch.ones((1, in_size), dtype=dtype))
-        self.register_buffer(
-            "eps", torch.tensor(1e-12 if dtype == torch.double else 1e-5)
-        )
+        # Minimum std floor chosen relative to each dtype's machine epsilon:
+        #   float32  machine eps ≈ 1.19e-7  →  eps = 1e-5  (~84× machine eps)
+        #   float64  machine eps ≈ 2.22e-16 →  eps = 1e-14 (~45× machine eps)
+        # The buffer is stored in the normalizer's own dtype for consistency.
+        _eps_value = 1e-14 if dtype == torch.double else 1e-5
+        self.register_buffer("eps", torch.tensor(_eps_value, dtype=dtype))
         self.to(device)
 
     @property
@@ -171,6 +174,12 @@ class Normalizer(torch.nn.Module):
         Equivalent to (val - mu) / sigma, where mu and sigma are the stored mean and
         standard deviation, respectively.
 
+        The output tensor preserves the input dtype: if the caller passes a
+        ``float32`` tensor the result is ``float32``, even when the normalizer
+        stores its statistics in ``float64`` (and vice-versa).  Internal
+        arithmetic is always performed at the higher of the two precisions to
+        avoid unnecessary loss of significance.
+
         Args:
             val (float, np.ndarray or torch.Tensor): The value to normalize.
 
@@ -178,14 +187,25 @@ class Normalizer(torch.nn.Module):
             (torch.Tensor): The normalized value.
         """
         val = self._to_tensor(val)
-        result = (val.to(self.mean.dtype) - self.mean) / self.std
-        return torch.where(torch.isfinite(result), result, torch.zeros_like(result))
+        input_dtype = val.dtype
+        compute_dtype = (
+            torch.float64
+            if val.dtype == torch.float64 or self.mean.dtype == torch.float64
+            else self.mean.dtype
+        )
+        result = (val.to(compute_dtype) - self.mean.to(compute_dtype)) / self.std.to(
+            compute_dtype
+        )
+        result = torch.where(torch.isfinite(result), result, torch.zeros_like(result))
+        return result.to(input_dtype)
 
     def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
         """De-normalizes the value according to the stored statistics.
 
         Equivalent to sigma * val + mu, where mu and sigma are the stored mean and
         standard deviation, respectively.
+
+        The output tensor preserves the input dtype (see :meth:`normalize`).
 
         Args:
             val (float, np.ndarray or torch.Tensor): The value to de-normalize.
@@ -194,8 +214,17 @@ class Normalizer(torch.nn.Module):
             (torch.Tensor): The de-normalized value.
         """
         val = self._to_tensor(val)
-        result = self.std * val.to(self.mean.dtype) + self.mean
-        return torch.where(torch.isfinite(result), result, torch.zeros_like(result))
+        input_dtype = val.dtype
+        compute_dtype = (
+            torch.float64
+            if val.dtype == torch.float64 or self.mean.dtype == torch.float64
+            else self.mean.dtype
+        )
+        result = self.std.to(compute_dtype) * val.to(compute_dtype) + self.mean.to(
+            compute_dtype
+        )
+        result = torch.where(torch.isfinite(result), result, torch.zeros_like(result))
+        return result.to(input_dtype)
 
     def save(self, save_dir: Union[str, pathlib.Path]):
         """Saves statistics to a torch file."""
