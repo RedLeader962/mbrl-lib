@@ -138,17 +138,14 @@ def test_create_replay_buffer():
     obs_shape = (6,)
     act_shape = (4,)
 
-    def _check_shapes(how_many):
-        assert buffer.obs.shape == (how_many, obs_shape[0])
-        assert buffer.next_obs.shape == (how_many, obs_shape[0])
-        assert buffer.action.shape == (how_many, act_shape[0])
-        assert buffer.reward.shape == (how_many,)
-        assert buffer.terminated.shape == (how_many,)
-        assert buffer.truncated.shape == (how_many,)
+    def _check_capacity(expected_capacity):
+        # Property accessors return only stored items (num_stored rows),
+        # so verify capacity via the dedicated attribute.
+        assert buffer.capacity == expected_capacity
 
     # Test reading from the above configuration and no bootstrap replay buffer
     buffer = utils.create_replay_buffer(cfg, obs_shape, act_shape)
-    _check_shapes(num_trials * trial_length)
+    _check_capacity(num_trials * trial_length)
 
     # Now add a training bootstrap and override the dataset size
     for dtype in [np.float32, np.double]:
@@ -164,7 +161,7 @@ def test_create_replay_buffer():
         )
         for array in [buffer.obs, buffer.action, buffer.reward]:
             assert array.dtype == dtype
-        _check_shapes(1500)
+        _check_capacity(1500)
 
 
 class MockModelEnv:
@@ -395,8 +392,10 @@ def test_bootstrap_rb_sample_obs3d():
         buffer.add(obs, np.zeros(act_shape), obs + 1, 0, False, False)
         obs += 1
 
-    assert buffer.obs.shape == (capacity,) + obs_shape
-    assert buffer.next_obs.shape == (capacity,) + obs_shape
+    # Property accessors return only stored items (num_stored rows)
+    num_added = 20 * batch_size
+    assert buffer.obs.shape == (num_added,) + obs_shape
+    assert buffer.next_obs.shape == (num_added,) + obs_shape
 
     it, _ = mbrl.util.common.get_basic_buffer_iterators(
         buffer, batch_size, 0.0, ensemble_size=ensemble_size
