@@ -9,11 +9,13 @@ import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-import pytorch_lightning as pl
 import torch
 from torch import optim as optim
 from torch.utils.data import DataLoader, IterableDataset
-from pytorch_lightning.callbacks import EarlyStopping
+from pytorch_lightning.callbacks import EarlyStopping, RichModelSummary
+from pytorch_lightning.utilities.model_summary import summarize as pl_summarize
+import pytorch_lightning as pl
+
 
 from mbrl.util.logger import Logger
 from mbrl.util.replay_buffer import BootstrapIterator, TransitionIterator
@@ -331,6 +333,36 @@ class ModelTrainer:
         sys.stderr.flush()
         sys.stdout.flush()
 
+        self._model_summary_printed = False
+
+    def print_model_summary_once(self):
+        """Print the Lightning model summary table to stdout.
+
+        The summary is printed only on the first call; subsequent calls are
+        no-ops.  Call this **before** creating any external progress bar so
+        that the table appears above the bar rather than interleaved with it.
+        """
+        if not self._model_summary_printed:
+            model = self.model
+            # print(model)
+            if hasattr(model, 'model'):
+                # Show the model that learns something instead of the OneDTransitionRewardModel wrapper
+                model = self.model.model
+
+            if hasattr(model, 'description'):
+                print(model.description)
+
+            summary = pl_summarize(model, max_depth=1)
+            RichModelSummary.summarize(
+                summary_data=summary._get_summary_data(),
+                total_parameters=summary.total_parameters,
+                trainable_parameters=summary.trainable_parameters,
+                model_size=summary.model_size,
+                total_training_modes=summary.total_training_modes,
+                total_flops=getattr(summary, "total_flops", 0),
+            )
+            print()  # blank line after the summary
+            self._model_summary_printed = True
 
     def train(
         self,
@@ -402,6 +434,9 @@ class ModelTrainer:
         """
         self._train_iteration += 1
 
+        if not silent:
+            self.print_model_summary_once()
+
         # Ensure model is in train mode before fitting.  A previous
         # ``pl.Trainer.fit()`` call may leave the model in eval mode after
         # its validation loop, and creating a new Trainer does not restore it.
@@ -463,7 +498,8 @@ class ModelTrainer:
                 trainer = pl.Trainer(
                     max_epochs=max_epochs,
                     callbacks=callbacks,
-                    enable_progress_bar=not silent,
+                    enable_progress_bar=False,
+                    enable_model_summary=False,
                     devices="auto",
                     accelerator=self._accelerator,
                     logger=False,
