@@ -168,6 +168,7 @@ class Normalizer(torch.nn.Module):
         self.std.clamp_(min=self.eps.item())
         self.std[torch.isnan(self.std)] = 1.0
 
+    @torch.compiler.disable
     def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
         """Normalizes the value according to the stored statistics.
 
@@ -214,6 +215,7 @@ class Normalizer(torch.nn.Module):
                 result = torch.zeros_like(result)
         return result.to(input_dtype)
 
+    @torch.compiler.disable
     def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
         """De-normalizes the value according to the stored statistics.
 
