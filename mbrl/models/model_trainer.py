@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 import copy
 import logging
+import sys
 import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -85,12 +86,14 @@ class _LegacyCallback(pl.Callback):
     # ------------------------------------------------------------------ #
     def on_validation_epoch_start(self, trainer, pl_module):
         self._epoch_val_scores: List[torch.Tensor] = []
+        self._bootstrap_was_toggled = False
         # Toggle bootstrap off for validation, matching legacy evaluate() behavior
         val_dl = trainer.val_dataloaders
         if val_dl is not None:
             ds = val_dl.dataset if hasattr(val_dl, 'dataset') else None
             if ds is not None and hasattr(ds, 'it') and isinstance(ds.it, BootstrapIterator):
                 ds.it.toggle_bootstrap()
+                self._bootstrap_was_toggled = True
 
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
@@ -121,12 +124,14 @@ class _LegacyCallback(pl.Callback):
             self._epoch_val_scores.append(val_score.detach().cpu())
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        # Toggle bootstrap back on after validation
-        val_dl = trainer.val_dataloaders
-        if val_dl is not None:
-            ds = val_dl.dataset if hasattr(val_dl, 'dataset') else None
-            if ds is not None and hasattr(ds, 'it') and isinstance(ds.it, BootstrapIterator):
-                ds.it.toggle_bootstrap()
+        # Always restore bootstrap if it was toggled, regardless of scores
+        if self._bootstrap_was_toggled:
+            val_dl = trainer.val_dataloaders
+            if val_dl is not None:
+                ds = val_dl.dataset if hasattr(val_dl, 'dataset') else None
+                if ds is not None and hasattr(ds, 'it') and isinstance(ds.it, BootstrapIterator):
+                    ds.it.toggle_bootstrap()
+            self._bootstrap_was_toggled = False
 
         if not self._epoch_val_scores:
             return
@@ -247,6 +252,15 @@ class _LegacyCallback(pl.Callback):
             self.logger.log_data("model_train", log_dict)
             self.logger._dump("model_train")
 
+        # Safety net: force-restore bootstrap if validation didn't clean up
+        if hasattr(self, '_bootstrap_was_toggled') and self._bootstrap_was_toggled:
+            val_dl = trainer.val_dataloaders
+            if val_dl is not None:
+                ds = val_dl.dataset if hasattr(val_dl, 'dataset') else None
+                if ds is not None and hasattr(ds, 'it') and isinstance(ds.it, BootstrapIterator):
+                    ds.it.toggle_bootstrap()
+            self._bootstrap_was_toggled = False
+
 
 class ModelTrainer:
     """Trainer for dynamics models.
@@ -309,30 +323,13 @@ class ModelTrainer:
         else:
             self._accelerator = "cpu"
 
-        # Pre-build the ``pl.Trainer`` instance so it is reused across
-        # ``train()`` calls instead of being re-created every ERLL epoch.
-        # Per-call settings (callbacks, max_epochs, silent) are updated
-        # in-place before each ``fit()`` via ``_configure_trainer``.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", ".*GPU available but not used.*"
-            )
-            warnings.filterwarnings(
-                "ignore", ".*does not have many workers.*"
-            )
-            warnings.filterwarnings(
-                "ignore", ".*IterableDataset.*__len__.*"
-            )
-            self._trainer = pl.Trainer(
-                max_epochs=1000,
-                callbacks=[],
-                enable_progress_bar=False,
-                devices="auto",
-                accelerator=self._accelerator,
-                logger=False,
-                num_sanity_val_steps=0,
-                enable_checkpointing=False,
-            )
+        # Eagerly initialize CUDA and flush streams so that subsequent
+        # ``pl.Trainer`` constructions in ``train()`` do not trigger
+        # repeated diagnostics or lazy-init overhead.
+        if torch.cuda.is_available():
+            torch.cuda.init()
+        sys.stderr.flush()
+        sys.stdout.flush()
 
 
     def train(
@@ -446,8 +443,6 @@ class ModelTrainer:
 
         max_epochs = num_epochs if num_epochs is not None else 1000
 
-        self._configure_trainer(max_epochs, callbacks, silent)
-
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore", ".*GPU available but not used.*"
@@ -458,13 +453,24 @@ class ModelTrainer:
             warnings.filterwarnings(
                 "ignore", ".*IterableDataset.*__len__.*"
             )
+
             # Suppress Lightning's "Trainer.fit stopped: max_epochs=N
             # reached." info message that clutters ERLL progress output.
             _pl_logger = logging.getLogger("pytorch_lightning")
             _prev_level = _pl_logger.level
             _pl_logger.setLevel(logging.WARNING)
             try:
-                self._trainer.fit(self.model, train_loader, val_loader)
+                trainer = pl.Trainer(
+                    max_epochs=max_epochs,
+                    callbacks=callbacks,
+                    enable_progress_bar=not silent,
+                    devices="auto",
+                    accelerator=self._accelerator,
+                    logger=False,
+                    num_sanity_val_steps=0,
+                    enable_checkpointing=False,
+                )
+                trainer.fit(self.model, train_loader, val_loader)
             finally:
                 _pl_logger.setLevel(_prev_level)
 
@@ -475,27 +481,6 @@ class ModelTrainer:
             )
 
         return legacy_cb.train_losses, legacy_cb.val_losses
-
-    def _configure_trainer(
-        self,
-        max_epochs: int,
-        callbacks: List,
-        silent: bool,
-    ) -> None:
-        """Update the pre-built ``pl.Trainer`` with per-call settings.
-
-        This avoids the overhead of constructing a new ``pl.Trainer`` on every
-        ``train()`` invocation while still allowing per-call customisation of
-        *max_epochs*, *callbacks* and *silent* mode.
-        """
-        self._trainer.fit_loop.max_epochs = max_epochs
-        # Reset the epoch / step counters so each ``fit()`` call starts from
-        # epoch 0 instead of continuing from where the previous call left off.
-        self._trainer.fit_loop.epoch_progress.current.completed = 0
-        self._trainer.fit_loop.epoch_progress.current.started = 0
-        self._trainer.fit_loop.epoch_progress.current.processed = 0
-        self._trainer.callbacks = callbacks
-        self._trainer.enable_progress_bar = not silent
 
     def evaluate(
         self, dataset: TransitionIterator, batch_callback: Optional[Callable] = None
