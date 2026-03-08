@@ -192,10 +192,16 @@ class _LegacyCallback(pl.Callback):
         which sets ``param.grad`` to ``None``.  The legacy callback (invoked
         at epoch end) expects gradients to still be available for monitoring.
         We therefore clone them here so they survive the zero-grad call.
+
+        Uses in-place copy to reuse the same buffer across steps,
+        eliminating repeated memory allocation overhead.
         """
         for param in pl_module.parameters():
             if param.requires_grad and param.grad is not None:
-                param._last_grad = param.grad.clone()
+                if hasattr(param, "_last_grad") and param._last_grad is not None:
+                    param._last_grad.copy_(param.grad)  # In-place, no allocation
+                else:
+                    param._last_grad = param.grad.clone()  # First-time allocation only
 
     # ------------------------------------------------------------------ #
     #  End-of-epoch logging and legacy callback

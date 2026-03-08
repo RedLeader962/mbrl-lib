@@ -205,7 +205,8 @@ class TestNumericalRobustness:
     def test_normalize_degenerate_stats(self):
         norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE))
         norm.mean.fill_(float("inf"))
-        result = norm.normalize(torch.ones(1, 2))
+        with pytest.warns(RuntimeWarning, match="non-finite values"):
+            result = norm.normalize(torch.ones(1, 2))
         assert torch.isfinite(result).all()
         assert torch.allclose(result, torch.zeros(1, 2))
 
@@ -458,3 +459,68 @@ class TestEpsDtypeConsistency:
         # With the old eps=1e-12 this would pass too, but with eps=1e-14 the
         # normalizer can preserve even finer variance distinctions.
         assert norm.std.item() == pytest.approx(true_std, rel=1e-6)
+
+
+# ------------------------------------------------------------------ #
+#  6.8 — Non-finite Warn-and-Clamp Behavior
+# ------------------------------------------------------------------ #
+class TestNonFiniteWarnAndClamp:
+    """Verify that normalize/denormalize warn and clamp (not zero) on non-finite values."""
+
+    def test_normalize_warns_on_non_finite(self):
+        """RuntimeWarning must be raised when normalize produces non-finite values."""
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE))
+        norm.mean.fill_(float("inf"))
+        with pytest.warns(RuntimeWarning, match="non-finite values"):
+            norm.normalize(torch.ones(1, 2))
+
+    def test_denormalize_warns_on_non_finite(self):
+        """RuntimeWarning must be raised when denormalize produces non-finite values."""
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE))
+        norm.std.fill_(float("inf"))
+        with pytest.warns(RuntimeWarning, match="non-finite values"):
+            norm.denormalize(torch.tensor([[1e30, 1e30]]))
+
+    def test_normalize_clamps_to_finite_range(self):
+        """Non-finite values should be clamped to [min, max] of the finite values."""
+        norm = mbrl.util.math.Normalizer(3, torch.device(_DEVICE))
+        data = torch.randn(50, 3)
+        norm.update_stats(data)
+        # Force one std entry to zero to trigger inf in division
+        norm.std[0, 0] = 0.0
+        with pytest.warns(RuntimeWarning, match="non-finite values"):
+            result = norm.normalize(torch.ones(1, 3))
+        assert torch.isfinite(result).all()
+        # The non-finite dimension should be clamped to the range of
+        # the finite dimensions, not zeroed
+        finite_vals = result[torch.isfinite(result)]
+        assert finite_vals.numel() == result.numel()
+
+    def test_normalize_all_non_finite_fallback_to_zeros(self):
+        """When all values are non-finite, fallback must produce zeros."""
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE))
+        norm.mean.fill_(float("inf"))
+        norm.std.fill_(1.0)
+        with pytest.warns(RuntimeWarning, match="non-finite values"):
+            result = norm.normalize(torch.ones(1, 2))
+        assert torch.allclose(result, torch.zeros(1, 2))
+
+    def test_denormalize_all_non_finite_fallback_to_zeros(self):
+        """When all denormalized values are non-finite, fallback must produce zeros."""
+        norm = mbrl.util.math.Normalizer(2, torch.device(_DEVICE))
+        norm.mean.fill_(float("inf"))
+        norm.std.fill_(float("inf"))
+        with pytest.warns(RuntimeWarning, match="non-finite values"):
+            result = norm.denormalize(torch.ones(1, 2))
+        assert torch.allclose(result, torch.zeros(1, 2))
+
+    def test_no_warning_on_finite_values(self):
+        """No warning should be raised when all values are finite."""
+        norm = mbrl.util.math.Normalizer(3, torch.device(_DEVICE))
+        data = torch.randn(50, 3)
+        norm.update_stats(data)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            # This should not raise any RuntimeWarning about non-finite values
+            norm.normalize(data)
+            norm.denormalize(data)

@@ -649,3 +649,151 @@ def test_sequence_sampler():
 
         assert cnt == batches_per_loop
         assert len(iterator) == batches_per_loop
+
+
+# ------------------------------------------------------------------ #
+#  Vectorized add_batch tests (Issue 2)
+# ------------------------------------------------------------------ #
+def test_add_batch_vectorized_no_wrap():
+    """Vectorized add_batch with batch smaller than capacity (no wrap-around)."""
+    capacity = 50
+    buf = replay_buffer.ReplayBuffer(capacity, (3,), (2,))
+    batch_size = 20
+    obs = np.random.randn(batch_size, 3).astype(np.float32)
+    act = np.random.randn(batch_size, 2).astype(np.float32)
+    next_obs = np.random.randn(batch_size, 3).astype(np.float32)
+    rew = np.random.randn(batch_size).astype(np.float32)
+    term = np.zeros(batch_size, dtype=bool)
+    trunc = np.zeros(batch_size, dtype=bool)
+
+    buf.add_batch(obs, act, next_obs, rew, term, trunc)
+    assert buf.num_stored == batch_size
+    assert buf.cur_idx == batch_size
+
+    all_data = buf.get_all(shuffle=False)
+    np.testing.assert_allclose(all_data.obs.numpy(), obs, atol=1e-6)
+    np.testing.assert_allclose(all_data.act.numpy(), act, atol=1e-6)
+
+
+def test_add_batch_vectorized_wrap_around():
+    """Vectorized add_batch wrapping around the circular buffer."""
+    capacity = 10
+    buf = replay_buffer.ReplayBuffer(capacity, (2,), (1,))
+    # Fill 8 items first
+    obs1 = np.arange(16).reshape(8, 2).astype(np.float32)
+    act1 = np.arange(8).reshape(8, 1).astype(np.float32)
+    nobs1 = obs1 + 1
+    rew1 = np.zeros(8, dtype=np.float32)
+    term1 = np.zeros(8, dtype=bool)
+    trunc1 = np.zeros(8, dtype=bool)
+    buf.add_batch(obs1, act1, nobs1, rew1, term1, trunc1)
+    assert buf.cur_idx == 8
+
+    # Add 5 more — should wrap around
+    obs2 = (np.arange(10).reshape(5, 2) + 100).astype(np.float32)
+    act2 = (np.arange(5).reshape(5, 1) + 100).astype(np.float32)
+    nobs2 = obs2 + 1
+    rew2 = np.ones(5, dtype=np.float32)
+    term2 = np.zeros(5, dtype=bool)
+    trunc2 = np.zeros(5, dtype=bool)
+    buf.add_batch(obs2, act2, nobs2, rew2, term2, trunc2)
+
+    assert buf.num_stored == capacity
+    assert buf.cur_idx == 3  # 8 + 5 = 13, 13 % 10 = 3
+
+    # Verify data integrity via get_all
+    all_data = buf.get_all(shuffle=False)
+    assert all_data.obs.shape[0] == capacity
+
+
+def test_add_batch_trajectory_mode():
+    """add_batch with trajectory mode should still work via slow path."""
+    capacity = 20
+    buf = replay_buffer.ReplayBuffer(
+        capacity, (2,), (1,), max_trajectory_length=5
+    )
+    batch_size = 5
+    obs = np.random.randn(batch_size, 2).astype(np.float32)
+    act = np.random.randn(batch_size, 1).astype(np.float32)
+    nobs = np.random.randn(batch_size, 2).astype(np.float32)
+    rew = np.random.randn(batch_size).astype(np.float32)
+    term = np.array([False, False, False, False, True], dtype=bool)
+    trunc = np.zeros(batch_size, dtype=bool)
+
+    buf.add_batch(obs, act, nobs, rew, term, trunc)
+    assert buf.num_stored == batch_size
+    assert len(buf.trajectory_indices) == 1
+    assert buf.trajectory_indices[0] == (0, 5)
+
+
+# ------------------------------------------------------------------ #
+#  Dtype conversion tests (Issue 3)
+# ------------------------------------------------------------------ #
+def test_replay_buffer_torch_dtype():
+    """ReplayBuffer with torch.dtype should not crash."""
+    buf = replay_buffer.ReplayBuffer(
+        10, (2,), (1,),
+        obs_type=torch.float32,
+        action_type=torch.float32,
+        reward_type=torch.float32,
+    )
+    buf.add(np.zeros(2), np.zeros(1), np.zeros(2), 1.0, False, False)
+    assert buf.num_stored == 1
+
+
+def test_replay_buffer_numpy_dtype():
+    """ReplayBuffer with np.float64 should work as before."""
+    buf = replay_buffer.ReplayBuffer(
+        10, (2,), (1,),
+        obs_type=np.float64,
+        action_type=np.float64,
+        reward_type=np.float64,
+    )
+    buf.add(np.zeros(2), np.zeros(1), np.zeros(2), 1.0, False, False)
+    assert buf.num_stored == 1
+
+
+def test_replay_buffer_string_dtype():
+    """ReplayBuffer with string dtype 'float32' should work."""
+    buf = replay_buffer.ReplayBuffer(
+        10, (2,), (1,),
+        obs_type="float32",
+        action_type="float32",
+        reward_type="float32",
+    )
+    buf.add(np.zeros(2), np.zeros(1), np.zeros(2), 1.0, False, False)
+    assert buf.num_stored == 1
+
+
+def test_replay_buffer_invalid_dtype():
+    """ReplayBuffer with invalid dtype should raise TypeError."""
+    with pytest.raises(TypeError):
+        replay_buffer.ReplayBuffer(
+            10, (2,), (1,),
+            obs_type="not_a_dtype",
+        )
+
+
+# ------------------------------------------------------------------ #
+#  Property accessor tests (Issue 5)
+# ------------------------------------------------------------------ #
+def test_property_accessors_return_only_stored():
+    """Property accessors should return only num_stored items, not full storage."""
+    capacity = 100
+    buf = replay_buffer.ReplayBuffer(capacity, (2,), (1,))
+    n = 10
+    for i in range(n):
+        buf.add(
+            np.array([i, i], dtype=np.float32),
+            np.array([i], dtype=np.float32),
+            np.array([i + 1, i + 1], dtype=np.float32),
+            float(i),
+            False,
+            False,
+        )
+    assert buf.obs.shape[0] == n
+    assert buf.next_obs.shape[0] == n
+    assert buf.action.shape[0] == n
+    assert buf.reward.shape[0] == n
+    assert buf.terminated.shape[0] == n
+    assert buf.truncated.shape[0] == n

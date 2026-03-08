@@ -196,7 +196,22 @@ class Normalizer(torch.nn.Module):
         result = (val.to(compute_dtype) - self.mean.to(compute_dtype)) / self.std.to(
             compute_dtype
         )
-        result = torch.where(torch.isfinite(result), result, torch.zeros_like(result))
+        if not torch.isfinite(result).all():
+            non_finite_count = (~torch.isfinite(result)).sum().item()
+            warnings.warn(
+                f"Normalizer produced {non_finite_count} non-finite values. "
+                "Clamping to finite data range. "
+                "Check input data and normalizer statistics.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            finite_mask = torch.isfinite(result)
+            if finite_mask.any():
+                lo = result[finite_mask].min()
+                hi = result[finite_mask].max()
+                result = result.clamp(lo, hi)
+            else:
+                result = torch.zeros_like(result)
         return result.to(input_dtype)
 
     def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
@@ -223,7 +238,22 @@ class Normalizer(torch.nn.Module):
         result = self.std.to(compute_dtype) * val.to(compute_dtype) + self.mean.to(
             compute_dtype
         )
-        result = torch.where(torch.isfinite(result), result, torch.zeros_like(result))
+        if not torch.isfinite(result).all():
+            non_finite_count = (~torch.isfinite(result)).sum().item()
+            warnings.warn(
+                f"Normalizer produced {non_finite_count} non-finite values. "
+                "Clamping to finite data range. "
+                "Check input data and normalizer statistics.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            finite_mask = torch.isfinite(result)
+            if finite_mask.any():
+                lo = result[finite_mask].min()
+                hi = result[finite_mask].max()
+                result = result.clamp(lo, hi)
+            else:
+                result = torch.zeros_like(result)
         return result.to(input_dtype)
 
     def save(self, save_dir: Union[str, pathlib.Path]):
