@@ -44,6 +44,7 @@ dependencies = [
     "sk-video>=1.1.10",
     "tqdm>=4.48.2",
     "ffmpeg",
+    "deprecated",
 ]
 
 [project.optional-dependencies]
