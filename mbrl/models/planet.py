@@ -11,6 +11,8 @@ import torch.distributions
 import torch.nn as nn
 import torch.nn.functional as F
 
+from deprecated import deprecated
+
 from mbrl.types import TensorType, TransitionBatch
 
 from .model import Model
@@ -481,6 +483,12 @@ class PlaNetModel(Model):
 
         return obs_loss + reward_loss + self.kl_scale * kl_loss, meta
 
+    @deprecated(
+        reason=(
+            "Model.update is deprecated and will be removed in a future version. "
+            "Please use `training_step` or `pytorch_lightning.Trainer` instead."
+        )
+    )
     def update(
         self,
         batch: TransitionBatch,

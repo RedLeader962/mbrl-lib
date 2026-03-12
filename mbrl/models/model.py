@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import pytorch_lightning as pl
 import torch
+from deprecated import deprecated
 from torch import nn as nn
 
 from mbrl.models.util import to_tensor
@@ -157,6 +158,12 @@ class Model(pl.LightningModule, abc.ABC):
                 (e.g., reconstructions, entropy, etc.) that will be used for logging.
         """
 
+    @deprecated(
+        reason=(
+            "Model.update is deprecated and will be removed in a future version. "
+            "Please use `training_step` or `pytorch_lightning.Trainer` instead."
+        )
+    )
     def update(
         self,
         model_in: ModelInput,
@@ -299,7 +306,6 @@ class Model(pl.LightningModule, abc.ABC):
 
         _log_metrics_eager(self, "val", val_loss, meta, len(batch))
         return {**meta, "score": val_loss, "val_score": val_score}
-
 
     def save(self, save_dir: Union[str, pathlib.Path]):
         """Saves the model to the given directory."""

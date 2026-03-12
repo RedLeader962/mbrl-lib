@@ -5,6 +5,7 @@
 import pathlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from deprecated import deprecated
 import torch
 
 import mbrl.models.util as model_util
@@ -192,6 +193,12 @@ class OneDTransitionRewardModel(Model):
         model_in, target = self._process_batch(batch)
         return self.model.loss(model_in, target=target)
 
+    @deprecated(
+        reason=(
+            "Model.update is deprecated and will be removed in a future version. "
+            "Please use `training_step` or `pytorch_lightning.Trainer` instead."
+        )
+    )
     def update(
         self,
         batch: mbrl.types.TransitionBatch,
