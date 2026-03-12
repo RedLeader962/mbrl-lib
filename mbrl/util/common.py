@@ -103,6 +103,8 @@ def create_one_dim_tr_model(
         obs_process_fn=obs_process_fn,
         no_delta_list=cfg.overrides.get("no_delta_list", None),
         num_elites=cfg.overrides.get("num_elites", None),
+        obs_dim=obs_shape[0],
+        act_dim=act_shape[0] if act_shape else 1,
     )
     if model_dir:
         dynamics_model.load(model_dir)

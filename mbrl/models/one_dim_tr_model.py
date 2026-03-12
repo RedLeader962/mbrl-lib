@@ -49,11 +49,9 @@ class OneDTransitionRewardModel(Model):
             the difference respect to the input observations.
             That is, ignoring rewards, pred_obs_{t + 1} = obs_t + model([obs_t, act_t]).
             Defaults to ``True``. Can be deactivated per dimension using ``no_delta_list``.
-        normalize (bool): if true, the wrapper will create a normalizer for model inputs,
-            which will be used every time the model is called using the methods in this
-            class. Assumes the given base model has an attributed ``in_size``.
-            To update the normalizer statistics, the user needs to call
-            :meth:`update_normalizer` before using the model. Defaults to ``False``.
+        normalize (bool): if ``True``, an input normalizer is created (type selected
+            by ``normalizer_type``).  The user must call :meth:`update_normalizer`
+            before using the model.  Defaults to ``False``.
         normalize_double_precision (bool): if ``True``, the normalizer will work with
             double precision.
         learned_rewards (bool): if ``True``, the wrapper considers the last output of the model
@@ -68,6 +66,17 @@ class OneDTransitionRewardModel(Model):
         num_elites (int, optional): if provided, only the best ``num_elites`` models according
             to validation score are used when calling :meth:`predict`. Defaults to
             ``None`` which means that all models will always be included in the elite set.
+        normalizer_type (str): ``"winsorized"`` (default), ``"quantile"`` or
+            ``"standard"``.  When ``"standard"`` a single concatenated
+            ``input_normalizer`` is used; otherwise separate ``obs_normalizer``
+            and ``act_normalizer`` are created.
+        obs_dim (int, optional): single-step observation dimensionality.  Inferred
+            from the model when ``None``.
+        act_dim (int, optional): single-step action dimensionality.  Inferred from
+            the model when ``None``.
+        normalizer_kwargs (dict, optional): extra keyword arguments forwarded to the
+            normalizer factory (e.g. ``clip_range``, ``winsor_percentile``,
+            ``soft_clip_iqr_mult``).
     """
 
     def __init__(
@@ -80,16 +89,58 @@ class OneDTransitionRewardModel(Model):
         obs_process_fn: Optional[mbrl.types.ObsProcessFnType] = None,
         no_delta_list: Optional[List[int]] = None,
         num_elites: Optional[int] = None,
+        normalizer_type: str = "winsorized",
+        obs_dim: Optional[int] = None,
+        act_dim: Optional[int] = None,
+        normalizer_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(model.device)
         self.model = model
+        self.normalizer_type = normalizer_type
+        self._obs_dim = obs_dim
+        self._act_dim = act_dim
+
+        # Normalizer setup
         self.input_normalizer: Optional[mbrl.util.math.Normalizer] = None
+        self.obs_normalizer: Optional[torch.nn.Module] = None
+        self.act_normalizer: Optional[torch.nn.Module] = None
+        norm_dtype = torch.double if normalize_double_precision else torch.float
+        norm_kwargs = normalizer_kwargs or {}
+
         if normalize:
-            self.input_normalizer = mbrl.util.math.Normalizer(
-                self.model.in_size,
-                self.model.device,
-                dtype=torch.double if normalize_double_precision else torch.float,
-            )
+            if normalizer_type == "standard":
+                # Legacy behavior: single normalizer for concatenated [obs, act]
+                self.input_normalizer = mbrl.util.math.Normalizer(
+                    self.model.in_size,
+                    self.model.device,
+                    dtype=norm_dtype,
+                )
+            else:
+                # Robust normalizer: separate obs and act normalizers
+                if obs_dim is None or act_dim is None:
+                    # Attempt to infer from model attributes
+                    if hasattr(model, "singlestep_obs_len") and hasattr(model, "singlestep_act_len"):
+                        obs_dim = obs_dim or model.singlestep_obs_len
+                        act_dim = act_dim or model.singlestep_act_len
+                    elif hasattr(model, "in_size") and hasattr(model, "out_size"):
+                        # Single-step model: out_size = obs_dim, in_size = obs_dim + act_dim
+                        obs_dim = obs_dim or model.out_size
+                        act_dim = act_dim or (model.in_size - model.out_size)
+                    else:
+                        raise ValueError(
+                            f"normalizer_type='{normalizer_type}' requires obs_dim and act_dim "
+                            "to be specified (or the wrapped model must expose "
+                            "singlestep_obs_len / singlestep_act_len or in_size / out_size)."
+                        )
+                self._obs_dim = obs_dim
+                self._act_dim = act_dim
+                self.obs_normalizer = mbrl.util.math.create_normalizer(
+                    normalizer_type, obs_dim, self.model.device, dtype=norm_dtype, **norm_kwargs
+                )
+                self.act_normalizer = mbrl.util.math.create_normalizer(
+                    normalizer_type, act_dim, self.model.device, dtype=norm_dtype, **norm_kwargs
+                )
+
         self.learned_rewards = learned_rewards
         self.target_is_delta = target_is_delta
         self.no_delta_list = no_delta_list if no_delta_list else []
@@ -107,6 +158,92 @@ class OneDTransitionRewardModel(Model):
             val = val.float()
         return val.to(self.device)
 
+    @property
+    def _uses_robust_normalizer(self) -> bool:
+        """True when using separate obs/act normalizers (winsorized or quantile)."""
+        return self.obs_normalizer is not None
+
+    @property
+    def _is_multistep(self) -> bool:
+        return hasattr(self.model, "history_len") and hasattr(self.model, "singlestep_obs_len")
+
+    def _normalize_composed_obs(self, composed_obs: torch.Tensor) -> torch.Tensor:
+        """Normalize a composed observation by decomposing into obs/act blocks.
+
+        For multi-step models, ``composed_obs`` has shape
+        ``(..., Do*H + Da*L)`` where *L* is the number of act timesteps
+        (may be H-1 for batch.obs or H for model_in).  The obs block
+        ``[0, Do*H)`` is reshaped to ``(-1, Do)``, normalized with
+        ``obs_normalizer``, then reshaped back.  The act block
+        ``[Do*H, end)`` is similarly processed with ``act_normalizer``.
+
+        For single-step models, ``obs_normalizer.normalize`` is applied
+        directly (no decomposition needed).
+        """
+        if not self._is_multistep:
+            return self.obs_normalizer.normalize(composed_obs)
+
+        Do = self.model.singlestep_obs_len
+        Da = self.model.singlestep_act_len
+        H = self.model.history_len
+        leading = composed_obs.shape[:-1]
+
+        obs_part = composed_obs[..., : Do * H]
+        act_part = composed_obs[..., Do * H :]
+
+        obs_norm = self.obs_normalizer.normalize(
+            obs_part.reshape(-1, Do)
+        ).reshape(*leading, Do * H)
+
+        if act_part.shape[-1] > 0:
+            act_norm = self.act_normalizer.normalize(
+                act_part.reshape(-1, Da)
+            ).reshape(*leading, act_part.shape[-1])
+            return torch.cat([obs_norm, act_norm], dim=-1)
+
+        return obs_norm
+
+    def _normalize_composed_act(self, action: torch.Tensor) -> torch.Tensor:
+        """Normalize an action tensor that may span multiple timesteps.
+
+        When the last dimension of *action* exceeds ``Da`` (single-step
+        action dim), the tensor is reshaped to ``(-1, Da)``, normalized,
+        and reshaped back.  For single-step actions the normalizer is
+        applied directly.
+        """
+        Da = getattr(self.model, "singlestep_act_len", None)
+        if Da is not None and action.shape[-1] > Da:
+            leading = action.shape[:-1]
+            return self.act_normalizer.normalize(
+                action.reshape(-1, Da)
+            ).reshape(*leading, action.shape[-1])
+        return self.act_normalizer.normalize(action)
+
+    def _denormalize_composed_obs(self, composed_obs_norm: torch.Tensor) -> torch.Tensor:
+        """Inverse of :meth:`_normalize_composed_obs`."""
+        if not self._is_multistep:
+            return self.obs_normalizer.denormalize(composed_obs_norm)
+
+        Do = self.model.singlestep_obs_len
+        Da = self.model.singlestep_act_len
+        H = self.model.history_len
+        leading = composed_obs_norm.shape[:-1]
+
+        obs_part = composed_obs_norm[..., : Do * H]
+        act_part = composed_obs_norm[..., Do * H :]
+
+        obs_denorm = self.obs_normalizer.denormalize(
+            obs_part.reshape(-1, Do)
+        ).reshape(*leading, Do * H)
+
+        if act_part.shape[-1] > 0:
+            act_denorm = self.act_normalizer.denormalize(
+                act_part.reshape(-1, Da)
+            ).reshape(*leading, act_part.shape[-1])
+            return torch.cat([obs_denorm, act_denorm], dim=-1)
+
+        return obs_denorm
+
     def _get_model_input(
         self,
         obs: mbrl.types.TensorType,
@@ -116,9 +253,14 @@ class OneDTransitionRewardModel(Model):
             obs = self.obs_process_fn(obs)
         obs = self._ensure_tensor(obs)
         action = self._ensure_tensor(action)
-        model_in = torch.cat([obs, action], dim=obs.ndim - 1)
-        if self.input_normalizer:
-            model_in = self.input_normalizer.normalize(model_in).float().to(self.device)
+        if self._uses_robust_normalizer:
+            obs = self._normalize_composed_obs(obs).float().to(self.device)
+            action = self._normalize_composed_act(action).float().to(self.device)
+            model_in = torch.cat([obs, action], dim=obs.ndim - 1)
+        else:
+            model_in = torch.cat([obs, action], dim=obs.ndim - 1)
+            if self.input_normalizer:
+                model_in = self.input_normalizer.normalize(model_in).float().to(self.device)
         return model_in
 
     def _process_batch(
@@ -128,11 +270,20 @@ class OneDTransitionRewardModel(Model):
         obs_t = self._ensure_tensor(obs)
         next_obs_t = self._ensure_tensor(next_obs)
         if self.target_is_delta:
-            target_obs = next_obs_t - obs_t
-            for dim in self.no_delta_list:
-                target_obs[..., dim] = next_obs_t[..., dim]
+            if self._uses_robust_normalizer:
+                # Compute delta in normalized space for consistent scaling
+                target_obs = self._normalize_composed_obs(next_obs_t) - self._normalize_composed_obs(obs_t)
+                for dim in self.no_delta_list:
+                    target_obs[..., dim] = self._normalize_composed_obs(next_obs_t)[..., dim]
+            else:
+                target_obs = next_obs_t - obs_t
+                for dim in self.no_delta_list:
+                    target_obs[..., dim] = next_obs_t[..., dim]
         else:
-            target_obs = next_obs_t
+            if self._uses_robust_normalizer:
+                target_obs = self._normalize_composed_obs(next_obs_t)
+            else:
+                target_obs = next_obs_t
 
         model_in = self._get_model_input(obs, action)
         if self.learned_rewards:
@@ -160,7 +311,7 @@ class OneDTransitionRewardModel(Model):
             batch (:class:`mbrl.types.TransitionBatch`): The batch of transition data.
                 Only obs and action will be used, since these are the inputs to the model.
         """
-        if self.input_normalizer is None:
+        if self.input_normalizer is None and not self._uses_robust_normalizer:
             return
         obs = self._ensure_tensor(batch.obs)
         action = self._ensure_tensor(batch.act)
@@ -169,8 +320,27 @@ class OneDTransitionRewardModel(Model):
             action = action.unsqueeze(0)
         if self.obs_process_fn:
             obs = self.obs_process_fn(obs)
-        model_in = torch.cat([obs, action], dim=obs.ndim - 1)
-        self.input_normalizer.update_stats(model_in)
+
+        if self._uses_robust_normalizer:
+            # Update separate obs and act normalizers
+            # For multi-step models, pool across timesteps (Section 3.3.6)
+            if self._is_multistep:
+                Do = self.model.singlestep_obs_len
+                Da = self.model.singlestep_act_len
+                H = self.model.history_len
+                obs_block = obs[..., : Do * H].reshape(-1, Do)  # (N*H, Do)
+                # Act block in composed obs has (H-1) timesteps; pool with batch.act
+                act_from_composed = obs[..., Do * H :].reshape(-1, Da)  # (N*(H-1), Da)
+                act_current = action.reshape(-1, Da)  # (N, Da)
+                act_pooled = torch.cat([act_from_composed, act_current], dim=0)
+                self.obs_normalizer.update_stats(obs_block)
+                self.act_normalizer.update_stats(act_pooled)
+            else:
+                self.obs_normalizer.update_stats(obs)
+                self.act_normalizer.update_stats(action)
+        else:
+            model_in = torch.cat([obs, action], dim=obs.ndim - 1)
+            self.input_normalizer.update_stats(model_in)
 
     def loss(
         self,
@@ -296,11 +466,23 @@ class OneDTransitionRewardModel(Model):
             model_in, model_state, rng=rng, deterministic=deterministic
         )
         next_observs = preds[:, :-1] if self.learned_rewards else preds
-        if self.target_is_delta:
-            tmp_ = next_observs + obs
-            for dim in self.no_delta_list:
-                tmp_[:, dim] = next_observs[:, dim]
-            next_observs = tmp_
+        if self._uses_robust_normalizer:
+            # Model output is in normalized space; denormalize at the output boundary
+            if self.target_is_delta:
+                # Delta is in normalized space; add to normalized obs, then denormalize
+                norm_obs = self.obs_normalizer.normalize(obs)
+                next_observs_norm = next_observs + norm_obs
+                for dim in self.no_delta_list:
+                    next_observs_norm[:, dim] = next_observs[:, dim]
+                next_observs = self.obs_normalizer.denormalize(next_observs_norm)
+            else:
+                next_observs = self.obs_normalizer.denormalize(next_observs)
+        else:
+            if self.target_is_delta:
+                tmp_ = next_observs + obs
+                for dim in self.no_delta_list:
+                    tmp_[:, dim] = next_observs[:, dim]
+                next_observs = tmp_
         rewards = preds[:, -1:] if self.learned_rewards else None
         next_model_state["obs"] = next_observs
         return next_observs, rewards, None, next_model_state
@@ -332,11 +514,23 @@ class OneDTransitionRewardModel(Model):
         self.model.save(save_dir)
         if self.input_normalizer:
             self.input_normalizer.save(save_dir)
+        if self._uses_robust_normalizer:
+            save_dir = pathlib.Path(save_dir)
+            obs_dir = save_dir / "obs_normalizer"
+            act_dir = save_dir / "act_normalizer"
+            obs_dir.mkdir(parents=True, exist_ok=True)
+            act_dir.mkdir(parents=True, exist_ok=True)
+            self.obs_normalizer.save(obs_dir)
+            self.act_normalizer.save(act_dir)
 
     def load(self, load_dir: Union[str, pathlib.Path]):
         self.model.load(load_dir)
         if self.input_normalizer:
             self.input_normalizer.load(load_dir)
+        if self._uses_robust_normalizer:
+            load_dir = pathlib.Path(load_dir)
+            self.obs_normalizer.load(load_dir / "obs_normalizer")
+            self.act_normalizer.load(load_dir / "act_normalizer")
 
     def set_elite(self, elite_indices: Sequence[int]):
         self.model.set_elite(elite_indices)

@@ -380,7 +380,8 @@ class TestIntegration:
             ensemble_size=1,
         )
         wrapper = mbrl.models.OneDTransitionRewardModel(
-            model, target_is_delta=True, normalize=True
+            model, target_is_delta=True, normalize=True,
+            normalizer_type="standard",
         )
         assert wrapper.input_normalizer is not None
 
@@ -403,7 +404,8 @@ class TestIntegration:
                 ensemble_size=1,
             )
             wrapper2 = mbrl.models.OneDTransitionRewardModel(
-                model2, target_is_delta=True, normalize=True
+                model2, target_is_delta=True, normalize=True,
+                normalizer_type="standard",
             )
             wrapper2.load(tmpdir)
 

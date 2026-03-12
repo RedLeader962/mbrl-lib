@@ -343,7 +343,8 @@ class TestOneDTransitionRewardModelTorchPath:
         obs_dim, act_dim = _OBS_SHAPE[0], _ACT_SHAPE[0]
         model = _SimpleMLP(obs_dim + act_dim, obs_dim + 1)
         return mbrl.models.OneDTransitionRewardModel(
-            model, target_is_delta=True, normalize=normalize
+            model, target_is_delta=True, normalize=normalize,
+            obs_dim=obs_dim, act_dim=act_dim,
         )
 
     def test_update_normalizer_torch_input(self):

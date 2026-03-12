@@ -60,8 +60,9 @@ def test_create_one_dim_tr_model():
     assert dynamics_model.model.x == 1 and dynamics_model.model.y == 2
     assert dynamics_model.num_elites is None
     assert dynamics_model.no_delta_list == []
-    # default when no normalization type is given is float
-    assert dynamics_model.input_normalizer.mean.dtype == torch.float32
+    # default normalizer_type is winsorized, so obs_normalizer is used
+    assert dynamics_model.obs_normalizer is not None
+    assert dynamics_model.obs_normalizer.winsorized_mean.dtype == torch.float32
 
     # Check given input/output sizes, overrides active, and no learned rewards option
     cfg.dynamics_model.in_size = 11
@@ -84,7 +85,7 @@ def test_create_one_dim_tr_model():
         cfg = omegaconf.OmegaConf.create(cfg_dict)
         dynamics_model = utils.create_one_dim_tr_model(cfg, obs_shape, act_shape)
         dtype = torch.double if double_norm else torch.float32
-        assert dynamics_model.input_normalizer.mean.dtype == dtype
+        assert dynamics_model.obs_normalizer.winsorized_mean.dtype == dtype
 
 
 class CustomEnsemble(models.BasicEnsemble):

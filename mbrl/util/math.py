@@ -315,6 +315,589 @@ class Normalizer(torch.nn.Module):
             )
 
 
+class WinsorizedNormalizer(torch.nn.Module):
+    """Robust normalizer using winsorized z-score with per-feature adaptive tanh soft-clipping.
+
+    Two-stage pipeline:
+    1. **Winsorized z-score**: clamp data to [q_alpha, q_{1-alpha}] per feature before computing
+       mean/std, then standardize.
+    2. **Per-feature adaptive tanh soft-clip**: derive an automatic clip threshold from the IQR
+       and apply a smooth tanh compression beyond it.
+
+    The transform is differentiable everywhere, monotonic, and has an exact closed-form inverse.
+
+    Args:
+        in_size (int): the size of the data that will be normalized.
+        device (torch.device): the device in which the data will reside.
+        dtype (torch.dtype): the data type to use for the normalizer.
+        winsor_percentile (float): the percentile for winsorization (default 0.05).
+        soft_clip_iqr_mult (float): IQR multiplier for the adaptive clip threshold (default 3.0).
+    """
+
+    _STATS_FNAME = "winsorized_stats.pt"
+
+    def __init__(
+        self,
+        in_size: int,
+        device: torch.device,
+        dtype=torch.float32,
+        winsor_percentile: float = 0.05,
+        soft_clip_iqr_mult: float = 3.0,
+    ):
+        super().__init__()
+        self.register_buffer("winsorized_mean", torch.zeros((1, in_size), dtype=dtype))
+        self.register_buffer("winsorized_std", torch.ones((1, in_size), dtype=dtype))
+        self.register_buffer("q_low", torch.zeros((1, in_size), dtype=dtype))
+        self.register_buffer("q_high", torch.zeros((1, in_size), dtype=dtype))
+        self.register_buffer("iqr", torch.ones((1, in_size), dtype=dtype))
+        self.register_buffer("clip_threshold", torch.full((1, in_size), soft_clip_iqr_mult, dtype=dtype))
+        _eps_value = 1e-14 if dtype == torch.double else 1e-5
+        self.register_buffer("eps", torch.tensor(_eps_value, dtype=dtype))
+        self.winsor_percentile = winsor_percentile
+        self.soft_clip_iqr_mult = soft_clip_iqr_mult
+        self.to(device)
+
+    @property
+    def device(self):
+        return self.winsorized_mean.device
+
+    @property
+    def mean(self):
+        """Alias for compatibility with code expecting a ``mean`` attribute."""
+        return self.winsorized_mean
+
+    @property
+    def std(self):
+        """Alias for compatibility with code expecting a ``std`` attribute."""
+        return self.winsorized_std
+
+    def _to_tensor(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        if isinstance(val, np.ndarray):
+            val = torch.from_numpy(val)
+        if not isinstance(val, torch.Tensor):
+            val = torch.tensor(val)
+        if self.device.type == "mps" and val.dtype == torch.float64:
+            val = val.float()
+        return val.to(self.device)
+
+    def update_stats(self, data: mbrl.types.TensorType):
+        """Compute winsorized statistics and adaptive clip thresholds from *data*.
+
+        Args:
+            data (np.ndarray or torch.Tensor): shape ``(N, in_size)``.
+        """
+        assert data.ndim == 2 and data.shape[1] == self.winsorized_mean.shape[1]
+        data = self._to_tensor(data)
+
+        if data.shape[0] < 10:
+            warnings.warn(
+                f"WinsorizedNormalizer.update_stats called with only {data.shape[0]} samples. "
+                "Statistics may be unreliable.",
+                RuntimeWarning,
+            )
+
+        if torch.isnan(data).any() or torch.isinf(data).any():
+            warnings.warn(
+                "WinsorizedNormalizer.update_stats received data containing NaN or Inf. "
+                "These entries will be replaced with zeros.",
+                RuntimeWarning,
+            )
+            data = torch.where(torch.isfinite(data), data, torch.zeros_like(data))
+
+        alpha = self.winsor_percentile
+        # Compute quantiles per feature
+        q_low = torch.quantile(data, alpha, dim=0, keepdim=True)
+        q_high = torch.quantile(data, 1.0 - alpha, dim=0, keepdim=True)
+        q25 = torch.quantile(data, 0.25, dim=0, keepdim=True)
+        q75 = torch.quantile(data, 0.75, dim=0, keepdim=True)
+
+        self.q_low.copy_(q_low)
+        self.q_high.copy_(q_high)
+        iqr = q75 - q25
+        self.iqr.copy_(iqr)
+
+        # Winsorize: clamp to [q_low, q_high]
+        clamped = data.clamp(min=q_low, max=q_high)
+
+        # Winsorized mean
+        w_mean = clamped.mean(0, keepdim=True)
+        self.winsorized_mean.copy_(w_mean)
+
+        # Winsorized std with Bessel's correction + epsilon
+        if data.shape[0] > 1:
+            w_std = torch.sqrt(
+                ((clamped - w_mean) ** 2).sum(0, keepdim=True) / (data.shape[0] - 1)
+                + self.eps
+            )
+        else:
+            w_std = torch.ones_like(w_mean)
+        w_std.clamp_(min=self.eps.item())
+        w_std[torch.isnan(w_std)] = 1.0
+        self.winsorized_std.copy_(w_std)
+
+        # Per-feature adaptive soft-clip threshold: c_i = gamma * IQR_i / sigma_i
+        clip_t = self.soft_clip_iqr_mult * iqr / w_std
+        # Ensure minimum threshold of 1.0 to avoid degenerate clipping
+        clip_t = clip_t.clamp(min=1.0)
+        self.clip_threshold.copy_(clip_t)
+
+    @staticmethod
+    def _soft_clip(z: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
+        """Per-feature adaptive tanh soft-clip."""
+        abs_z = z.abs()
+        within = abs_z <= threshold
+        excess = abs_z - threshold
+        clipped = z.sign() * (threshold + torch.tanh(excess))
+        return torch.where(within, z, clipped)
+
+    @staticmethod
+    def _soft_clip_inverse(y: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
+        """Exact inverse of per-feature adaptive tanh soft-clip."""
+        abs_y = y.abs()
+        within = abs_y <= threshold
+        excess = (abs_y - threshold).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        unclipped = y.sign() * (threshold + torch.atanh(excess))
+        return torch.where(within, y, unclipped)
+
+    @torch.compiler.disable
+    def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        """Winsorized z-score followed by per-feature adaptive tanh soft-clip.
+
+        Args:
+            val: The value to normalize.
+
+        Returns:
+            The normalized value (same dtype as input).
+        """
+        val = self._to_tensor(val)
+        input_dtype = val.dtype
+        compute_dtype = (
+            torch.float64
+            if val.dtype == torch.float64 or self.winsorized_mean.dtype == torch.float64
+            else self.winsorized_mean.dtype
+        )
+        z = (val.to(compute_dtype) - self.winsorized_mean.to(compute_dtype)) / self.winsorized_std.to(compute_dtype)
+
+        if not torch.isfinite(z).all():
+            non_finite_count = (~torch.isfinite(z)).sum().item()
+            warnings.warn(
+                f"WinsorizedNormalizer produced {non_finite_count} non-finite values. "
+                "Clamping to finite data range.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            finite_mask = torch.isfinite(z)
+            if finite_mask.any():
+                lo = z[finite_mask].min()
+                hi = z[finite_mask].max()
+                z = z.clamp(lo, hi)
+            else:
+                z = torch.zeros_like(z)
+
+        result = self._soft_clip(z, self.clip_threshold.to(compute_dtype))
+        return result.to(input_dtype)
+
+    @torch.compiler.disable
+    def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        """Exact inverse: invert soft-clip then invert z-score.
+
+        Args:
+            val: The normalized value to de-normalize.
+
+        Returns:
+            The de-normalized value (same dtype as input).
+        """
+        val = self._to_tensor(val)
+        input_dtype = val.dtype
+        compute_dtype = (
+            torch.float64
+            if val.dtype == torch.float64 or self.winsorized_mean.dtype == torch.float64
+            else self.winsorized_mean.dtype
+        )
+        z = self._soft_clip_inverse(val.to(compute_dtype), self.clip_threshold.to(compute_dtype))
+        result = z * self.winsorized_std.to(compute_dtype) + self.winsorized_mean.to(compute_dtype)
+
+        if not torch.isfinite(result).all():
+            non_finite_count = (~torch.isfinite(result)).sum().item()
+            warnings.warn(
+                f"WinsorizedNormalizer produced {non_finite_count} non-finite values. "
+                "Clamping to finite data range.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            finite_mask = torch.isfinite(result)
+            if finite_mask.any():
+                lo = result[finite_mask].min()
+                hi = result[finite_mask].max()
+                result = result.clamp(lo, hi)
+            else:
+                result = torch.zeros_like(result)
+        return result.to(input_dtype)
+
+    def save(self, save_dir: Union[str, pathlib.Path]):
+        save_dir = pathlib.Path(save_dir)
+        torch.save(
+            {
+                "winsorized_mean": self.winsorized_mean.cpu(),
+                "winsorized_std": self.winsorized_std.cpu(),
+                "q_low": self.q_low.cpu(),
+                "q_high": self.q_high.cpu(),
+                "iqr": self.iqr.cpu(),
+                "clip_threshold": self.clip_threshold.cpu(),
+                "eps": self.eps.cpu(),
+                "winsor_percentile": self.winsor_percentile,
+                "soft_clip_iqr_mult": self.soft_clip_iqr_mult,
+            },
+            save_dir / self._STATS_FNAME,
+        )
+
+    def load(self, load_dir: Union[str, pathlib.Path]):
+        load_dir = pathlib.Path(load_dir)
+        path = load_dir / self._STATS_FNAME
+        if not path.exists():
+            raise FileNotFoundError(f"No WinsorizedNormalizer stats found at '{path}'.")
+        stats = torch.load(path, weights_only=True)
+        self.winsorized_mean.copy_(stats["winsorized_mean"].to(self.device))
+        self.winsorized_std.copy_(stats["winsorized_std"].to(self.device))
+        self.q_low.copy_(stats["q_low"].to(self.device))
+        self.q_high.copy_(stats["q_high"].to(self.device))
+        self.iqr.copy_(stats["iqr"].to(self.device))
+        self.clip_threshold.copy_(stats["clip_threshold"].to(self.device))
+        if "eps" in stats:
+            self.eps.copy_(stats["eps"].to(self.device))
+        if "winsor_percentile" in stats:
+            self.winsor_percentile = stats["winsor_percentile"]
+        if "soft_clip_iqr_mult" in stats:
+            self.soft_clip_iqr_mult = stats["soft_clip_iqr_mult"]
+
+
+class QuantileNormalizer(torch.nn.Module):
+    """Robust normalizer using empirical CDF mapping to standard normal (quantile normalization).
+
+    Maps each feature's values through its empirical CDF to produce a standard-normal output.
+    Uses ``torch.searchsorted`` for efficient bin lookup and linear interpolation between
+    adjacent quantile boundaries.
+
+    Args:
+        in_size (int): the size of the data that will be normalized.
+        device (torch.device): the device in which the data will reside.
+        dtype (torch.dtype): the data type to use for the normalizer.
+        n_bins (int): number of quantile bins (default 1000).
+        tail_policy (str): ``"linear"`` (default) — extend slope of outermost bin.
+    """
+
+    _STATS_FNAME = "quantile_stats.pt"
+
+    def __init__(
+        self,
+        in_size: int,
+        device: torch.device,
+        dtype=torch.float32,
+        n_bins: int = 1000,
+        tail_policy: str = "linear",
+    ):
+        super().__init__()
+        assert tail_policy in ("linear",), f"Unsupported tail_policy: {tail_policy}"
+        self.n_bins = n_bins
+        self.tail_policy = tail_policy
+
+        # quantile_boundaries: (n_bins+1, in_size) — per-feature empirical quantile boundaries
+        self.register_buffer(
+            "quantile_boundaries",
+            torch.zeros((n_bins + 1, in_size), dtype=dtype),
+        )
+        # target_quantiles: (n_bins+1,) — standard normal target values
+        eps_clamp = 1e-7
+        p = torch.linspace(0.0, 1.0, n_bins + 1, dtype=torch.float64)
+        p_clamped = p.clamp(eps_clamp, 1.0 - eps_clamp)
+        targets = torch.erfinv(2.0 * p_clamped - 1.0) * (2.0 ** 0.5)
+        self.register_buffer("target_quantiles", targets.to(dtype))
+
+        # For mean/std compatibility aliases, compute after update_stats
+        self.register_buffer("_mean_cache", torch.zeros((1, in_size), dtype=dtype))
+        self.register_buffer("_std_cache", torch.ones((1, in_size), dtype=dtype))
+
+        _eps_value = 1e-14 if dtype == torch.double else 1e-5
+        self.register_buffer("eps", torch.tensor(_eps_value, dtype=dtype))
+        self.to(device)
+
+    @property
+    def device(self):
+        return self.quantile_boundaries.device
+
+    @property
+    def mean(self):
+        """Alias: median of data (approximated as the middle quantile boundary)."""
+        return self._mean_cache
+
+    @property
+    def std(self):
+        """Alias: IQR-based scale estimate."""
+        return self._std_cache
+
+    def _to_tensor(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        if isinstance(val, np.ndarray):
+            val = torch.from_numpy(val)
+        if not isinstance(val, torch.Tensor):
+            val = torch.tensor(val)
+        if self.device.type == "mps" and val.dtype == torch.float64:
+            val = val.float()
+        return val.to(self.device)
+
+    def update_stats(self, data: mbrl.types.TensorType):
+        """Compute empirical quantile boundaries per feature.
+
+        Args:
+            data (np.ndarray or torch.Tensor): shape ``(N, in_size)``.
+        """
+        in_size = self.quantile_boundaries.shape[1]
+        assert data.ndim == 2 and data.shape[1] == in_size
+        data = self._to_tensor(data)
+
+        if data.shape[0] < 10:
+            warnings.warn(
+                f"QuantileNormalizer.update_stats called with only {data.shape[0]} samples. "
+                "Statistics may be unreliable.",
+                RuntimeWarning,
+            )
+
+        if torch.isnan(data).any() or torch.isinf(data).any():
+            warnings.warn(
+                "QuantileNormalizer.update_stats received data containing NaN or Inf. "
+                "These entries will be replaced with zeros.",
+                RuntimeWarning,
+            )
+            data = torch.where(torch.isfinite(data), data, torch.zeros_like(data))
+
+        # Probability grid
+        p = torch.linspace(0.0, 1.0, self.n_bins + 1, dtype=data.dtype, device=data.device)
+
+        # Per-feature quantile boundaries
+        boundaries = torch.quantile(data, p, dim=0)  # (n_bins+1, in_size)
+        self.quantile_boundaries.copy_(boundaries)
+
+        # Update compatibility caches
+        mid_idx = self.n_bins // 2
+        self._mean_cache.copy_(boundaries[mid_idx].unsqueeze(0))
+        q25_idx = self.n_bins // 4
+        q75_idx = (3 * self.n_bins) // 4
+        iqr = boundaries[q75_idx] - boundaries[q25_idx]
+        iqr = iqr.clamp(min=self.eps.item())
+        self._std_cache.copy_(iqr.unsqueeze(0))
+
+    @torch.compiler.disable
+    def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        """Map values through empirical CDF to standard normal via linear interpolation.
+
+        Args:
+            val: The value to normalize.
+
+        Returns:
+            The normalized value (same dtype as input).
+        """
+        val = self._to_tensor(val)
+        input_dtype = val.dtype
+        compute_dtype = (
+            torch.float64
+            if val.dtype == torch.float64 or self.quantile_boundaries.dtype == torch.float64
+            else self.quantile_boundaries.dtype
+        )
+        val_c = val.to(compute_dtype)
+        original_shape = val_c.shape
+        # Flatten to 2D: (batch, in_size)
+        if val_c.ndim == 1:
+            val_c = val_c.unsqueeze(0)
+        if val_c.ndim > 2:
+            val_c = val_c.reshape(-1, val_c.shape[-1])
+
+        boundaries = self.quantile_boundaries.to(compute_dtype)  # (K+1, d)
+        targets = self.target_quantiles.to(compute_dtype)  # (K+1,)
+
+        # Transpose boundaries to (d, K+1) for searchsorted along last dim
+        boundaries_t = boundaries.t().contiguous()  # (d, K+1)
+        val_t = val_c.t().contiguous()  # (d, batch)
+
+        # searchsorted: find bin index k such that boundaries[k-1] <= val < boundaries[k]
+        idx = torch.searchsorted(boundaries_t, val_t, right=False)  # (d, batch)
+        idx = idx.clamp(1, self.n_bins)  # ensure valid interpolation range
+
+        # Gather lower and upper boundaries
+        idx_low = (idx - 1).clamp(0, self.n_bins)
+        b_low = torch.gather(boundaries_t, 1, idx_low)  # (d, batch)
+        b_high = torch.gather(boundaries_t, 1, idx)  # (d, batch)
+
+        # Target quantiles for interpolation
+        t_low = targets[idx_low.clamp(0, self.n_bins)]  # broadcast per-feature
+        t_high = targets[idx.clamp(0, self.n_bins)]
+
+        # Linear interpolation
+        denom = (b_high - b_low).clamp(min=1e-12)
+        frac = (val_t - b_low) / denom
+        result_t = t_low + frac * (t_high - t_low)
+
+        # Tail extrapolation (linear)
+        lower_mask = val_t < boundaries_t[:, :1]
+        upper_mask = val_t > boundaries_t[:, -1:]
+        if lower_mask.any():
+            slope_low = (targets[1] - targets[0]) / (boundaries_t[:, 1:2] - boundaries_t[:, 0:1]).clamp(min=1e-12)
+            extrap_low = targets[0] + slope_low * (val_t - boundaries_t[:, 0:1])
+            result_t = torch.where(lower_mask, extrap_low, result_t)
+        if upper_mask.any():
+            slope_high = (targets[-1] - targets[-2]) / (boundaries_t[:, -1:] - boundaries_t[:, -2:-1]).clamp(min=1e-12)
+            extrap_high = targets[-1] + slope_high * (val_t - boundaries_t[:, -1:])
+            result_t = torch.where(upper_mask, extrap_high, result_t)
+
+        result = result_t.t().reshape(original_shape)  # (batch, d) then reshape
+        return result.to(input_dtype)
+
+    @torch.compiler.disable
+    def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        """Inverse: map standard normal values back to data space via linear interpolation.
+
+        Args:
+            val: The normalized value to de-normalize.
+
+        Returns:
+            The de-normalized value (same dtype as input).
+        """
+        val = self._to_tensor(val)
+        input_dtype = val.dtype
+        compute_dtype = (
+            torch.float64
+            if val.dtype == torch.float64 or self.quantile_boundaries.dtype == torch.float64
+            else self.quantile_boundaries.dtype
+        )
+        val_c = val.to(compute_dtype)
+        original_shape = val_c.shape
+        if val_c.ndim == 1:
+            val_c = val_c.unsqueeze(0)
+        if val_c.ndim > 2:
+            val_c = val_c.reshape(-1, val_c.shape[-1])
+
+        boundaries = self.quantile_boundaries.to(compute_dtype)  # (K+1, d)
+        targets = self.target_quantiles.to(compute_dtype)  # (K+1,)
+
+        batch_size = val_c.shape[0]
+        in_size = val_c.shape[1]
+
+        # Search in target_quantiles (sorted 1D) for each value
+        targets_sorted = targets.contiguous()
+        # Expand val_c for searchsorted: (batch * in_size,) searched against (K+1,)
+        val_flat = val_c.reshape(-1)  # (batch * in_size,)
+        idx_flat = torch.searchsorted(targets_sorted, val_flat, right=False)
+        idx_flat = idx_flat.clamp(1, self.n_bins)
+        idx = idx_flat.reshape(batch_size, in_size)  # (batch, in_size)
+
+        idx_low = (idx - 1).clamp(0, self.n_bins)
+
+        t_low = targets[idx_low]  # (batch, in_size)
+        t_high = targets[idx]
+
+        # Gather boundaries per feature
+        # boundaries shape: (K+1, d), we need to gather along dim=0 for each feature
+        b_low = torch.gather(boundaries, 0, idx_low)  # (batch, in_size)
+        b_high = torch.gather(boundaries, 0, idx)
+
+        denom = (t_high - t_low).clamp(min=1e-12)
+        frac = (val_c - t_low) / denom
+        result = b_low + frac * (b_high - b_low)
+
+        # Tail extrapolation
+        lower_mask = val_c < targets[0]
+        upper_mask = val_c > targets[-1]
+        if lower_mask.any():
+            slope_low = (boundaries[1] - boundaries[0]) / (targets[1] - targets[0]).clamp(min=1e-12)
+            extrap_low = boundaries[0] + slope_low * (val_c - targets[0])
+            result = torch.where(lower_mask, extrap_low, result)
+        if upper_mask.any():
+            slope_high = (boundaries[-1] - boundaries[-2]) / (targets[-1] - targets[-2]).clamp(min=1e-12)
+            extrap_high = boundaries[-1] + slope_high * (val_c - targets[-1])
+            result = torch.where(upper_mask, extrap_high, result)
+
+        result = result.reshape(original_shape)
+        return result.to(input_dtype)
+
+    def save(self, save_dir: Union[str, pathlib.Path]):
+        save_dir = pathlib.Path(save_dir)
+        torch.save(
+            {
+                "quantile_boundaries": self.quantile_boundaries.cpu(),
+                "target_quantiles": self.target_quantiles.cpu(),
+                "_mean_cache": self._mean_cache.cpu(),
+                "_std_cache": self._std_cache.cpu(),
+                "eps": self.eps.cpu(),
+                "n_bins": self.n_bins,
+                "tail_policy": self.tail_policy,
+            },
+            save_dir / self._STATS_FNAME,
+        )
+
+    def load(self, load_dir: Union[str, pathlib.Path]):
+        load_dir = pathlib.Path(load_dir)
+        path = load_dir / self._STATS_FNAME
+        if not path.exists():
+            raise FileNotFoundError(f"No QuantileNormalizer stats found at '{path}'.")
+        stats = torch.load(path, weights_only=True)
+        self.quantile_boundaries.copy_(stats["quantile_boundaries"].to(self.device))
+        self.target_quantiles.copy_(stats["target_quantiles"].to(self.device))
+        if "_mean_cache" in stats:
+            self._mean_cache.copy_(stats["_mean_cache"].to(self.device))
+        if "_std_cache" in stats:
+            self._std_cache.copy_(stats["_std_cache"].to(self.device))
+        if "eps" in stats:
+            self.eps.copy_(stats["eps"].to(self.device))
+        if "n_bins" in stats:
+            self.n_bins = stats["n_bins"]
+        if "tail_policy" in stats:
+            self.tail_policy = stats["tail_policy"]
+
+
+def create_normalizer(
+    normalizer_type: str,
+    in_size: int,
+    device: torch.device,
+    dtype=torch.float32,
+    **kwargs,
+) -> torch.nn.Module:
+    """Factory function to create a normalizer by type string.
+
+    Args:
+        normalizer_type: ``"standard"``, ``"winsorized"``, or ``"quantile"``.
+        in_size: feature dimension.
+        device: torch device.
+        dtype: torch dtype.
+        **kwargs: forwarded to the chosen normalizer constructor
+            (e.g. ``winsor_percentile``, ``soft_clip_iqr_mult``, ``n_bins``, ``tail_policy``).
+
+    Returns:
+        A normalizer instance (``Normalizer``, ``WinsorizedNormalizer``, or ``QuantileNormalizer``).
+    """
+    if normalizer_type == "standard":
+        clip_range = kwargs.get("clip_range", None)
+        return Normalizer(in_size, device, dtype=dtype, clip_range=clip_range)
+    elif normalizer_type == "winsorized":
+        return WinsorizedNormalizer(
+            in_size,
+            device,
+            dtype=dtype,
+            winsor_percentile=kwargs.get("winsor_percentile", 0.05),
+            soft_clip_iqr_mult=kwargs.get("soft_clip_iqr_mult", 3.0),
+        )
+    elif normalizer_type == "quantile":
+        return QuantileNormalizer(
+            in_size,
+            device,
+            dtype=dtype,
+            n_bins=kwargs.get("n_bins", 1000),
+            tail_policy=kwargs.get("tail_policy", "linear"),
+        )
+    else:
+        raise ValueError(
+            f"Unknown normalizer_type '{normalizer_type}'. "
+            "Choose from 'standard', 'winsorized', 'quantile'."
+        )
+
+
 # ------------------------------------------------------------------------ #
 # Uncertainty propagation functions
 # ------------------------------------------------------------------------ #
