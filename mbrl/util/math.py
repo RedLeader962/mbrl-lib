@@ -107,7 +107,22 @@ class Normalizer(torch.nn.Module):
     _STATS_FNAME = "env_stats.pt"
     _LEGACY_STATS_FNAME = "env_stats.pickle"
 
-    def __init__(self, in_size: int, device: torch.device, dtype=torch.float32):
+    #: When set, ``normalize()`` clamps the z-score output to
+    #: ``[-clip_range, clip_range]`` after the standard normalization step.
+    #: Useful for heavy-tailed feature distributions (e.g. angular-velocity
+    #: outliers in NeuroBem) that would otherwise saturate downstream
+    #: activation functions. Effective even with non-saturating activations
+    #: such as GELU or LeakyReLU, where extreme values cause large gradient
+    #: magnitudes and numerical instability.
+    clip_range: Optional[float]
+
+    def __init__(
+        self,
+        in_size: int,
+        device: torch.device,
+        dtype=torch.float32,
+        clip_range: Optional[float] = None,
+    ):
         super().__init__()
         self.register_buffer("mean", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("std", torch.ones((1, in_size), dtype=dtype))
@@ -117,6 +132,7 @@ class Normalizer(torch.nn.Module):
         # The buffer is stored in the normalizer's own dtype for consistency.
         _eps_value = 1e-14 if dtype == torch.double else 1e-5
         self.register_buffer("eps", torch.tensor(_eps_value, dtype=dtype))
+        self.clip_range: Optional[float] = clip_range
         self.to(device)
 
     @property
@@ -213,6 +229,8 @@ class Normalizer(torch.nn.Module):
                 result = result.clamp(lo, hi)
             else:
                 result = torch.zeros_like(result)
+        if self.clip_range is not None:
+            result = result.clamp(-self.clip_range, self.clip_range)
         return result.to(input_dtype)
 
     @torch.compiler.disable

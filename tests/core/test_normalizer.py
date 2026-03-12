@@ -524,3 +524,110 @@ class TestNonFiniteWarnAndClamp:
             # This should not raise any RuntimeWarning about non-finite values
             norm.normalize(data)
             norm.denormalize(data)
+
+
+# ------------------------------------------------------------------ #
+#  6.9 — clip_range clamping of z-scored output
+# ------------------------------------------------------------------ #
+class TestClipRange:
+    """Verify clip_range clamps z-scored output inside normalize().
+
+    Motivation: heavy-tailed features (e.g. NeuroBem angular-velocity)
+    produce outliers reaching ±10–15 σ after z-scoring. Without clamping
+    these cause large gradient magnitudes / numerical instability even with
+    non-saturating activations (GELU, LeakyReLU). clip_range=5.0 is the
+    recommended default for NeuroBem.
+    """
+
+    def _make_fitted_normalizer(
+        self, in_size: int, clip_range: float = None
+    ) -> mbrl.util.math.Normalizer:
+        """Return a normalizer fitted to N(0,1) data with given clip_range."""
+        norm = mbrl.util.math.Normalizer(
+            in_size, torch.device(_DEVICE), clip_range=clip_range
+        )
+        data = torch.randn(200, in_size)
+        norm.update_stats(data)
+        return norm
+
+    def test_clip_range_none_by_default(self):
+        """clip_range must default to None (no clamping)."""
+        norm = mbrl.util.math.Normalizer(3, torch.device(_DEVICE))
+        assert norm.clip_range is None
+
+    def test_clip_range_stored_on_init(self):
+        """clip_range passed at construction must be stored on the instance."""
+        norm = mbrl.util.math.Normalizer(3, torch.device(_DEVICE), clip_range=5.0)
+        assert norm.clip_range == 5.0
+
+    def test_clip_range_none_does_not_clamp(self):
+        """When clip_range is None extreme outliers must pass through unchanged."""
+        norm = self._make_fitted_normalizer(3, clip_range=None)
+        # Construct inputs that normalize to ~±15 σ
+        extreme = norm.mean + 15.0 * norm.std
+        result = norm.normalize(extreme)
+        assert result.abs().max().item() == pytest.approx(15.0, rel=0.05), (
+            "Without clip_range, extreme normalized values must not be clamped"
+        )
+
+    def test_clip_range_clamps_extreme_values(self):
+        """Normalized values exceeding clip_range must be clamped to ±clip_range."""
+        clip = 5.0
+        norm = self._make_fitted_normalizer(3, clip_range=clip)
+        # Construct inputs that would normalize to ±15 σ
+        extreme_pos = norm.mean + 15.0 * norm.std
+        extreme_neg = norm.mean - 15.0 * norm.std
+        result_pos = norm.normalize(extreme_pos)
+        result_neg = norm.normalize(extreme_neg)
+        assert result_pos.max().item() == pytest.approx(clip, rel=1e-5), (
+            f"Positive outlier should be clamped to +{clip}"
+        )
+        assert result_neg.min().item() == pytest.approx(-clip, rel=1e-5), (
+            f"Negative outlier should be clamped to -{clip}"
+        )
+
+    def test_clip_range_preserves_in_distribution_values(self):
+        """Values within [-clip_range, clip_range] must not be affected by clamping."""
+        clip = 5.0
+        norm = self._make_fitted_normalizer(3, clip_range=clip)
+        # Inputs normalizing to ±2 σ (well inside clip window)
+        in_dist_pos = norm.mean + 2.0 * norm.std
+        in_dist_neg = norm.mean - 2.0 * norm.std
+        result_pos = norm.normalize(in_dist_pos)
+        result_neg = norm.normalize(in_dist_neg)
+        assert result_pos.max().item() == pytest.approx(2.0, rel=0.05), (
+            "In-distribution positive value must not be clipped"
+        )
+        assert result_neg.min().item() == pytest.approx(-2.0, rel=0.05), (
+            "In-distribution negative value must not be clipped"
+        )
+
+    def test_clip_range_dtype_preserved_after_clamping(self):
+        """clip_range clamping must preserve the input tensor dtype."""
+        for dtype in (torch.float32, torch.float64):
+            norm = mbrl.util.math.Normalizer(
+                2, torch.device(_DEVICE), dtype=dtype, clip_range=3.0
+            )
+            data = torch.randn(100, 2, dtype=dtype)
+            norm.update_stats(data)
+            extreme = norm.mean + 10.0 * norm.std
+            result = norm.normalize(extreme.to(dtype))
+            assert result.dtype == dtype, (
+                f"dtype must be preserved after clamping (expected {dtype}, got {result.dtype})"
+            )
+
+    @pytest.mark.parametrize("clip", [1.0, 3.0, 5.0, 10.0])
+    def test_clip_range_boundary_parametrized(self, clip: float):
+        """Normalized values must be bounded by ±clip for any clip value."""
+        norm = self._make_fitted_normalizer(4, clip_range=clip)
+        # Use a batch with both extreme positive and negative outliers
+        extreme = torch.cat(
+            [norm.mean + 20.0 * norm.std, norm.mean - 20.0 * norm.std], dim=0
+        )
+        result = norm.normalize(extreme)
+        assert result.max().item() <= clip + 1e-5, (
+            f"All normalized values must be ≤ {clip}"
+        )
+        assert result.min().item() >= -clip - 1e-5, (
+            f"All normalized values must be ≥ -{clip}"
+        )
