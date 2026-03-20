@@ -101,7 +101,7 @@ class OneDTransitionRewardModel(Model):
         self._act_dim = act_dim
 
         # Normalizer setup
-        self.input_normalizer: Optional[mbrl.util.math.Normalizer] = None
+        self.input_normalizer: Optional[mbrl.util.normalization.Normalizer] = None
         self.obs_normalizer: Optional[torch.nn.Module] = None
         self.act_normalizer: Optional[torch.nn.Module] = None
         norm_dtype = torch.double if normalize_double_precision else torch.float
@@ -110,7 +110,7 @@ class OneDTransitionRewardModel(Model):
         if normalize:
             if normalizer_type == "standard":
                 # Legacy behavior: single normalizer for concatenated [obs, act]
-                self.input_normalizer = mbrl.util.math.Normalizer(
+                self.input_normalizer = mbrl.util.normalization.Normalizer(
                     self.model.in_size,
                     self.model.device,
                     dtype=norm_dtype,
@@ -134,10 +134,10 @@ class OneDTransitionRewardModel(Model):
                         )
                 self._obs_dim = obs_dim
                 self._act_dim = act_dim
-                self.obs_normalizer = mbrl.util.math.create_normalizer(
+                self.obs_normalizer = mbrl.util.normalization.create_normalizer(
                     normalizer_type, obs_dim, self.model.device, dtype=norm_dtype, **norm_kwargs
                 )
-                self.act_normalizer = mbrl.util.math.create_normalizer(
+                self.act_normalizer = mbrl.util.normalization.create_normalizer(
                     normalizer_type, act_dim, self.model.device, dtype=norm_dtype, **norm_kwargs
                 )
 
