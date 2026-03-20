@@ -439,7 +439,7 @@ class TestQuantileGradient:
 class TestCreateNormalizer:
     def test_standard(self):
         norm = mbrl.util.normalization.create_normalizer("standard", 5, torch.device(_DEVICE))
-        assert isinstance(norm, mbrl.util.normalization.Normalizer)
+        assert isinstance(norm, mbrl.util.normalization.ZScoreNormalizer)
 
     def test_winsorized(self):
         norm = mbrl.util.normalization.create_normalizer("winsorized", 5, torch.device(_DEVICE))

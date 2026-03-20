@@ -8,7 +8,7 @@ robustness.  All share the same public API (``update_stats``, ``normalize``,
 
 **Quick comparison of normalizers:**
 
-- ``Normalizer`` — Standard running-mean z-score.  No outlier protection.
+- ``ZScoreNormalizer`` — Standard running-mean z-score.  No outlier protection.
   Differentiable, linearly invertible.  Cost: O(N).
 - ``WinsorizedNormalizer`` — Winsorized z-score + adaptive tanh soft-clip.
   Moderate outlier robustness.  Differentiable, closed-form invertible.
@@ -19,7 +19,7 @@ robustness.  All share the same public API (``update_stats``, ``normalize``,
 
 **Rule of thumb — choosing a normalizer:**
 
-- Use ``Normalizer`` when data is well-behaved (roughly Gaussian, no extreme
+- Use ``ZScoreNormalizer`` when data is well-behaved (roughly Gaussian, no extreme
   outliers) and you want the fastest, simplest option.
 - Use ``WinsorizedNormalizer`` when data has moderate outliers or heavy tails
   but the core distribution is roughly symmetric.  Good default choice for
@@ -30,7 +30,7 @@ robustness.  All share the same public API (``update_stats``, ``normalize``,
 
 **Rule of thumb — parameter configuration:**
 
-*Normalizer*
+*ZScoreNormalizer*
 
 - ``clip_range`` (default ``None``): Leave at ``None`` for well-behaved data.
   Set to ``5.0``–``10.0`` when occasional spikes can produce z-scores that
@@ -60,6 +60,7 @@ robustness.  All share the same public API (``update_stats``, ``normalize``,
   supported — it extrapolates beyond the observed range using the slope of
   the outermost bin.  Keep the default.
 """
+import abc
 import pathlib
 import warnings
 from typing import Optional, Union
@@ -89,11 +90,12 @@ def create_normalizer(
             (e.g. ``winsor_percentile``, ``soft_clip_iqr_mult``, ``n_bins``, ``tail_policy``).
 
     Returns:
-        A normalizer instance (``Normalizer``, ``WinsorizedNormalizer``, or ``QuantileNormalizer``).
+        A normalizer instance (``ZScoreNormalizer``, ``WinsorizedNormalizer``,
+        or ``QuantileNormalizer``).
     """
     if normalizer_type == "standard":
         clip_range = kwargs.get("clip_range", None)
-        return Normalizer(in_size, device, dtype=dtype, clip_range=clip_range)
+        return ZScoreNormalizer(in_size, device, dtype=dtype, clip_range=clip_range)
     elif normalizer_type == "winsorized":
         return WinsorizedNormalizer(
             in_size,
@@ -117,7 +119,62 @@ def create_normalizer(
         )
 
 
-class Normalizer(torch.nn.Module):
+class Normalizer(torch.nn.Module, abc.ABC):
+    """Abstract base class for all normalizers in this module.
+
+    Every concrete normalizer (``ZScoreNormalizer``, ``WinsorizedNormalizer``,
+    ``QuantileNormalizer``) inherits from this class and implements the
+    required interface: :meth:`update_stats`, :meth:`normalize`,
+    :meth:`denormalize`, :meth:`save`, and :meth:`load`.
+
+    Subclasses must also expose ``mean`` and ``std`` attributes (either
+    buffers or properties) and a ``device`` property so that downstream
+    code can inspect normalizer statistics uniformly.
+    """
+
+    # ------------------------------------------------------------------
+    # Abstract interface
+    # ------------------------------------------------------------------
+    @abc.abstractmethod
+    def update_stats(self, data: mbrl.types.TensorType):
+        """Compute and store normalization statistics from *data*.
+
+        Args:
+            data: shape ``(N, in_size)``.
+        """
+
+    @abc.abstractmethod
+    def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        """Normalize *val* according to stored statistics.
+
+        Args:
+            val: value(s) to normalize.
+
+        Returns:
+            Normalized tensor (same dtype as input).
+        """
+
+    @abc.abstractmethod
+    def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        """Invert the normalization applied by :meth:`normalize`.
+
+        Args:
+            val: normalized value(s) to de-normalize.
+
+        Returns:
+            De-normalized tensor (same dtype as input).
+        """
+
+    @abc.abstractmethod
+    def save(self, save_dir: Union[str, pathlib.Path]):
+        """Persist normalizer statistics to *save_dir*."""
+
+    @abc.abstractmethod
+    def load(self, load_dir: Union[str, pathlib.Path]):
+        """Restore normalizer statistics from *load_dir*."""
+
+
+class ZScoreNormalizer(Normalizer):
     """Standard running-mean z-score normalizer with optional hard clipping.
 
     **What it does:**
@@ -211,14 +268,14 @@ class Normalizer(torch.nn.Module):
 
         if data.shape[0] < 10:
             warnings.warn(
-                f"Normalizer.update_stats called with only {data.shape[0]} samples. "
+                f"ZScoreNormalizer.update_stats called with only {data.shape[0]} samples. "
                 "Statistics may be unreliable.",
                 RuntimeWarning,
             )
 
         if torch.isnan(data).any() or torch.isinf(data).any():
             warnings.warn(
-                "Normalizer.update_stats received data containing NaN or Inf. "
+                "ZScoreNormalizer.update_stats received data containing NaN or Inf. "
                 "These entries will be replaced with zeros.",
                 RuntimeWarning,
             )
@@ -265,7 +322,7 @@ class Normalizer(torch.nn.Module):
         if not torch.isfinite(result).all():
             non_finite_count = (~torch.isfinite(result)).sum().item()
             warnings.warn(
-                f"Normalizer produced {non_finite_count} non-finite values. "
+                f"ZScoreNormalizer produced {non_finite_count} non-finite values. "
                 "Clamping to finite data range. "
                 "Check input data and normalizer statistics.",
                 RuntimeWarning,
@@ -310,7 +367,7 @@ class Normalizer(torch.nn.Module):
         if not torch.isfinite(result).all():
             non_finite_count = (~torch.isfinite(result)).sum().item()
             warnings.warn(
-                f"Normalizer produced {non_finite_count} non-finite values. "
+                f"ZScoreNormalizer produced {non_finite_count} non-finite values. "
                 "Clamping to finite data range. "
                 "Check input data and normalizer statistics.",
                 RuntimeWarning,
@@ -364,7 +421,7 @@ class Normalizer(torch.nn.Module):
             )
 
 
-class WinsorizedNormalizer(torch.nn.Module):
+class WinsorizedNormalizer(Normalizer):
     """Robust normalizer using winsorized z-score with per-feature adaptive tanh soft-clipping.
 
     **What it does:**
@@ -664,7 +721,7 @@ class WinsorizedNormalizer(torch.nn.Module):
             self.soft_clip_iqr_mult = stats["soft_clip_iqr_mult"]
 
 
-class QuantileNormalizer(torch.nn.Module):
+class QuantileNormalizer(Normalizer):
     """Robust normalizer using empirical CDF mapping to standard normal (quantile normalization).
 
     **What it does:**
