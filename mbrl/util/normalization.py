@@ -72,51 +72,6 @@ import torch.compiler
 import torch.nn
 
 
-def create_normalizer(
-    normalizer_type: str,
-    in_size: int,
-    device: torch.device,
-    dtype=torch.float32,
-    **kwargs,
-) -> torch.nn.Module:
-    """Factory function to create a normalizer by type string.
-
-    Args:
-        normalizer_type: ``"standard"``, ``"winsorized"``, or ``"quantile"``.
-        in_size: feature dimension.
-        device: torch device.
-        dtype: torch dtype.
-        **kwargs: forwarded to the chosen normalizer constructor
-            (e.g. ``winsor_percentile``, ``soft_clip_iqr_mult``, ``n_bins``, ``tail_policy``).
-
-    Returns:
-        A normalizer instance (``ZScoreNormalizer``, ``WinsorizedNormalizer``,
-        or ``QuantileNormalizer``).
-    """
-    if normalizer_type == "standard":
-        clip_range = kwargs.get("clip_range", None)
-        return ZScoreNormalizer(in_size, device, dtype=dtype, clip_range=clip_range)
-    elif normalizer_type == "winsorized":
-        return WinsorizedNormalizer(
-            in_size,
-            device,
-            dtype=dtype,
-            winsor_percentile=kwargs.get("winsor_percentile", 0.05),
-            soft_clip_iqr_mult=kwargs.get("soft_clip_iqr_mult", 3.0),
-        )
-    elif normalizer_type == "quantile":
-        return QuantileNormalizer(
-            in_size,
-            device,
-            dtype=dtype,
-            n_bins=kwargs.get("n_bins", 1000),
-            tail_policy=kwargs.get("tail_policy", "linear"),
-        )
-    else:
-        raise ValueError(
-            f"Unknown normalizer_type '{normalizer_type}'. "
-            "Choose from 'standard', 'winsorized', 'quantile'."
-        )
 
 
 class Normalizer(torch.nn.Module, abc.ABC):
@@ -1031,3 +986,49 @@ class QuantileNormalizer(Normalizer):
             self.n_bins = stats["n_bins"]
         if "tail_policy" in stats:
             self.tail_policy = stats["tail_policy"]
+
+def create_normalizer(
+    normalizer_type: str,
+    in_size: int,
+    device: torch.device,
+    dtype=torch.float32,
+    **kwargs,
+) -> Normalizer:
+    """Factory function to create a normalizer by type string.
+
+    Args:
+        normalizer_type: ``"standard"``, ``"winsorized"``, or ``"quantile"``.
+        in_size: feature dimension.
+        device: torch device.
+        dtype: torch dtype.
+        **kwargs: forwarded to the chosen normalizer constructor
+            (e.g. ``winsor_percentile``, ``soft_clip_iqr_mult``, ``n_bins``, ``tail_policy``).
+
+    Returns:
+        A normalizer instance (``ZScoreNormalizer``, ``WinsorizedNormalizer``,
+        or ``QuantileNormalizer``).
+    """
+    if normalizer_type == "standard":
+        clip_range = kwargs.get("clip_range", None)
+        return ZScoreNormalizer(in_size, device, dtype=dtype, clip_range=clip_range)
+    elif normalizer_type == "winsorized":
+        return WinsorizedNormalizer(
+            in_size,
+            device,
+            dtype=dtype,
+            winsor_percentile=kwargs.get("winsor_percentile", 0.05),
+            soft_clip_iqr_mult=kwargs.get("soft_clip_iqr_mult", 3.0),
+        )
+    elif normalizer_type == "quantile":
+        return QuantileNormalizer(
+            in_size,
+            device,
+            dtype=dtype,
+            n_bins=kwargs.get("n_bins", 1000),
+            tail_policy=kwargs.get("tail_policy", "linear"),
+        )
+    else:
+        raise ValueError(
+            f"Unknown normalizer_type '{normalizer_type}'. "
+            "Choose from 'standard', 'winsorized', 'quantile'."
+        )

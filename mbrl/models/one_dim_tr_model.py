@@ -11,6 +11,7 @@ import torch
 import mbrl.models.util as model_util
 import mbrl.types
 import mbrl.util.math
+import mbrl.util.normalization
 
 from .model import Ensemble, Model
 
@@ -101,9 +102,9 @@ class OneDTransitionRewardModel(Model):
         self._act_dim = act_dim
 
         # Normalizer setup
-        self.input_normalizer: Optional[mbrl.util.normalization.ZScoreNormalizer] = None
-        self.obs_normalizer: Optional[torch.nn.Module] = None
-        self.act_normalizer: Optional[torch.nn.Module] = None
+        self.input_normalizer: Optional[mbrl.util.normalization.Normalizer] = None
+        self.obs_normalizer: Optional[mbrl.util.normalization.Normalizer] = None
+        self.act_normalizer: Optional[mbrl.util.normalization.Normalizer] = None
         norm_dtype = torch.double if normalize_double_precision else torch.float
         norm_kwargs = normalizer_kwargs or {}
 
