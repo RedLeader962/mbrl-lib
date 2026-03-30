@@ -6,7 +6,8 @@ robustness.  All share the same public API (``update_stats``, ``normalize``,
 ``denormalize``, ``save``/``load``) and can be instantiated through the
 :func:`create_normalizer` factory.
 
-**Quick comparison of normalizers:**
+Quick comparison of normalizers:
+--------------------------------
 
 - ``ZScoreNormalizer`` — Standard running-mean z-score.  No outlier protection.
   Differentiable, linearly invertible.  Cost: O(N).
@@ -17,7 +18,8 @@ robustness.  All share the same public API (``update_stats``, ``normalize``,
   Strong outlier robustness.  Differentiable, invertible via lookup +
   interpolation.  Cost: O(N log N).
 
-**Rule of thumb — choosing a normalizer:**
+Rule of thumb — choosing a normalizer:
+--------------------------------------
 
 - Use ``ZScoreNormalizer`` when data is well-behaved (roughly Gaussian, no extreme
   outliers) and you want the fastest, simplest option.
@@ -28,7 +30,8 @@ robustness.  All share the same public API (``update_stats``, ``normalize``,
   multi-modal, or when outlier robustness is critical and you can afford
   storing per-feature quantile boundaries.
 
-**Rule of thumb — parameter configuration:**
+Rule of thumb — parameter configuration:
+----------------------------------------
 
 *ZScoreNormalizer*
 
@@ -70,8 +73,6 @@ import numpy as np
 import torch
 import torch.compiler
 import torch.nn
-
-
 
 
 class Normalizer(torch.nn.Module, abc.ABC):
@@ -218,6 +219,7 @@ class ZScoreNormalizer(Normalizer):
         Args:
             data (np.ndarray or torch.Tensor): The data used to compute the statistics.
         """
+        # (CRITICAL) ToDo: assess support for model ensemble
         assert data.ndim == 2 and data.shape[1] == self.mean.shape[1]
         data = self._to_tensor(data)
 
@@ -488,6 +490,7 @@ class WinsorizedNormalizer(Normalizer):
         Args:
             data (np.ndarray or torch.Tensor): shape ``(N, in_size)``.
         """
+        # (CRITICAL) ToDo: assess support for model ensemble
         assert data.ndim == 2 and data.shape[1] == self.winsorized_mean.shape[1]
         data = self._to_tensor(data)
 
@@ -786,6 +789,7 @@ class QuantileNormalizer(Normalizer):
         Args:
             data (np.ndarray or torch.Tensor): shape ``(N, in_size)``.
         """
+        # (CRITICAL) ToDo: assess support for model ensemble
         in_size = self.quantile_boundaries.shape[1]
         assert data.ndim == 2 and data.shape[1] == in_size
         data = self._to_tensor(data)
