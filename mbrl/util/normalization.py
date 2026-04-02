@@ -11,7 +11,7 @@ Quick comparison of normalizers:
 
 - ``ZScoreNormalizer`` — Standard running-mean z-score.  No outlier protection.
   Differentiable, linearly invertible.  Cost: O(N).
-- ``WinsorizedNormalizer`` — Winsorized z-score + adaptive tanh soft-clip.
+- ``SoftWinsorizedNormalizer`` — Winsorized z-score + adaptive tanh soft-clip.
   Moderate outlier robustness.  Differentiable, closed-form invertible.
   Cost: O(N log N).
 - ``QuantileNormalizer`` — Empirical-CDF mapping to standard normal.
@@ -23,7 +23,7 @@ Rule of thumb — choosing a normalizer:
 
 - Use ``ZScoreNormalizer`` when data is well-behaved (roughly Gaussian, no extreme
   outliers) and you want the fastest, simplest option.
-- Use ``WinsorizedNormalizer`` when data has moderate outliers or heavy tails
+- Use ``SoftWinsorizedNormalizer`` when data has moderate outliers or heavy tails
   but the core distribution is roughly symmetric.  Good default choice for
   robotic state/action spaces.
 - Use ``QuantileNormalizer`` when the distribution is highly skewed,
@@ -40,7 +40,7 @@ Rule of thumb — parameter configuration:
   destabilize downstream layers.  A tighter range (e.g. ``3.0``) aggressively
   truncates tails and may discard useful signal.
 
-*WinsorizedNormalizer*
+*SoftWinsorizedNormalizer*
 
 - ``winsor_percentile`` (default ``0.05``): Fraction of each tail clamped
   before computing mean/std.  ``0.05`` (5 %) suits most robotic data.
@@ -78,7 +78,7 @@ import torch.nn
 class Normalizer(torch.nn.Module, abc.ABC):
     """Abstract base class for all normalizers in this module.
 
-    Every concrete normalizer (``ZScoreNormalizer``, ``WinsorizedNormalizer``,
+    Every concrete normalizer (``ZScoreNormalizer``, ``SoftWinsorizedNormalizer``,
     ``QuantileNormalizer``) inherits from this class and implements the
     required interface: :meth:`update_stats`, :meth:`normalize`,
     :meth:`denormalize`, :meth:`save`, and :meth:`load`.
@@ -91,8 +91,24 @@ class Normalizer(torch.nn.Module, abc.ABC):
     # ------------------------------------------------------------------
     # Abstract interface
     # ------------------------------------------------------------------
+
+    @property
     @abc.abstractmethod
-    def update_stats(self, data: mbrl.types.TensorType):
+    def device(self) -> torch.device:
+        """Device on which the normalizer operates."""
+
+    @property
+    @abc.abstractmethod
+    def mean(self) -> torch.Tensor:
+        """Alias for compatibility with code expecting a ``mean`` attribute."""
+
+    @property
+    @abc.abstractmethod
+    def std(self) -> torch.Tensor:
+        """Alias for compatibility with code expecting a ``std`` attribute."""
+
+    @abc.abstractmethod
+    def update_stats(self, data: mbrl.types.TensorType) -> None:
         """Compute and store normalization statistics from *data*.
 
         Args:
@@ -122,12 +138,22 @@ class Normalizer(torch.nn.Module, abc.ABC):
         """
 
     @abc.abstractmethod
-    def save(self, save_dir: Union[str, pathlib.Path]):
+    def save(self, save_dir: Union[str, pathlib.Path]) -> None:
         """Persist normalizer statistics to *save_dir*."""
 
     @abc.abstractmethod
-    def load(self, load_dir: Union[str, pathlib.Path]):
+    def load(self, load_dir: Union[str, pathlib.Path]) -> None:
         """Restore normalizer statistics from *load_dir*."""
+
+    def _to_tensor(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        """Convert input to a tensor on the correct device, handling MPS dtype."""
+        if isinstance(val, np.ndarray):
+            val = torch.from_numpy(val)
+        if not isinstance(val, torch.Tensor):
+            val = torch.tensor(val)
+        if self.device.type == "mps" and val.dtype == torch.float64:
+            val = val.float()
+        return val.to(self.device)
 
 
 class ZScoreNormalizer(Normalizer):
@@ -154,7 +180,7 @@ class ZScoreNormalizer(Normalizer):
     .. note::
        The standard deviation is floored at a small epsilon (``1e-5`` for
        ``float32``, ``1e-14`` for ``float64``) to prevent division by zero
-       for near-constant features.  Unlike :class:`WinsorizedNormalizer`,
+       for near-constant features.  Unlike :class:`SoftWinsorizedNormalizer`,
        there is no outlier-aware statistic — a single extreme value can
        inflate ``std`` and under-normalize the remaining data.
 
@@ -186,8 +212,8 @@ class ZScoreNormalizer(Normalizer):
         clip_range: Optional[float] = None,
     ):
         super().__init__()
-        self.register_buffer("mean", torch.zeros((1, in_size), dtype=dtype))
-        self.register_buffer("std", torch.ones((1, in_size), dtype=dtype))
+        self.register_buffer("_mean", torch.zeros((1, in_size), dtype=dtype))
+        self.register_buffer("_std", torch.ones((1, in_size), dtype=dtype))
         # Minimum std floor chosen relative to each dtype's machine epsilon:
         #   float32  machine eps ≈ 1.19e-7  →  eps = 1e-5  (~84× machine eps)
         #   float64  machine eps ≈ 2.22e-16 →  eps = 1e-14 (~45× machine eps)
@@ -199,19 +225,19 @@ class ZScoreNormalizer(Normalizer):
 
     @property
     def device(self):
-        return self.mean.device
+        return self._mean.device
 
-    def _to_tensor(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
-        """Convert input to a tensor on the correct device, handling MPS dtype."""
-        if isinstance(val, np.ndarray):
-            val = torch.from_numpy(val)
-        if not isinstance(val, torch.Tensor):
-            val = torch.tensor(val)
-        if self.device.type == "mps" and val.dtype == torch.float64:
-            val = val.float()
-        return val.to(self.device)
+    @property
+    def mean(self):
+        """Alias for compatibility with code expecting a ``mean`` attribute."""
+        return self._mean
 
-    def update_stats(self, data: mbrl.types.TensorType):
+    @property
+    def std(self):
+        """Alias for compatibility with code expecting a ``std`` attribute."""
+        return self._std
+
+    def update_stats(self, data: mbrl.types.TensorType) -> None:
         """Updates the stored statistics using the given data.
 
         Equivalent to ``self.mean = data.mean(0)`` and ``self.std = data.std(0)``.
@@ -220,7 +246,7 @@ class ZScoreNormalizer(Normalizer):
             data (np.ndarray or torch.Tensor): The data used to compute the statistics.
         """
         # (CRITICAL) ToDo: assess support for model ensemble
-        assert data.ndim == 2 and data.shape[1] == self.mean.shape[1]
+        assert data.ndim == 2 and data.shape[1] == self._mean.shape[1]
         data = self._to_tensor(data)
 
         if data.shape[0] < 10:
@@ -238,14 +264,16 @@ class ZScoreNormalizer(Normalizer):
             )
             data = torch.where(torch.isfinite(data), data, torch.zeros_like(data))
 
-        self.mean.copy_(data.mean(0, keepdim=True))
+        self._mean.copy_(data.mean(0, keepdim=True))
         if data.shape[0] > 1:
-            self.std.copy_(data.std(0, keepdim=True))
+            self._std.copy_(data.std(0, keepdim=True))
         else:
-            self.std.fill_(1.0)
+            self._std.fill_(1.0)
 
-        self.std.clamp_(min=self.eps.item())
-        self.std[torch.isnan(self.std)] = 1.0
+        self._std.clamp_(min=self.eps.item())
+        self._std[torch.isnan(self._std)] = 1.0
+
+        return None
 
     @torch.compiler.disable
     def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
@@ -270,10 +298,10 @@ class ZScoreNormalizer(Normalizer):
         input_dtype = val.dtype
         compute_dtype = (
             torch.float64
-            if val.dtype == torch.float64 or self.mean.dtype == torch.float64
-            else self.mean.dtype
+            if val.dtype == torch.float64 or self._mean.dtype == torch.float64
+            else self._mean.dtype
         )
-        result = (val.to(compute_dtype) - self.mean.to(compute_dtype)) / self.std.to(
+        result = (val.to(compute_dtype) - self._mean.to(compute_dtype)) / self._std.to(
             compute_dtype
         )
         if not torch.isfinite(result).all():
@@ -294,6 +322,7 @@ class ZScoreNormalizer(Normalizer):
                 result = torch.zeros_like(result)
         if self.clip_range is not None:
             result = result.clamp(-self.clip_range, self.clip_range)
+
         return result.to(input_dtype)
 
     @torch.compiler.disable
@@ -315,10 +344,10 @@ class ZScoreNormalizer(Normalizer):
         input_dtype = val.dtype
         compute_dtype = (
             torch.float64
-            if val.dtype == torch.float64 or self.mean.dtype == torch.float64
-            else self.mean.dtype
+            if val.dtype == torch.float64 or self._mean.dtype == torch.float64
+            else self._mean.dtype
         )
-        result = self.std.to(compute_dtype) * val.to(compute_dtype) + self.mean.to(
+        result = self._std.to(compute_dtype) * val.to(compute_dtype) + self._mean.to(
             compute_dtype
         )
         if not torch.isfinite(result).all():
@@ -337,17 +366,20 @@ class ZScoreNormalizer(Normalizer):
                 result = result.clamp(lo, hi)
             else:
                 result = torch.zeros_like(result)
+
         return result.to(input_dtype)
 
-    def save(self, save_dir: Union[str, pathlib.Path]):
+    def save(self, save_dir: Union[str, pathlib.Path]) -> None:
         """Saves statistics to a torch file."""
         save_dir = pathlib.Path(save_dir)
         torch.save(
-            {"mean": self.mean.cpu(), "std": self.std.cpu(), "eps": self.eps.cpu()},
+            {"mean": self._mean.cpu(), "std": self._std.cpu(), "eps": self.eps.cpu()},
             save_dir / self._STATS_FNAME,
         )
 
-    def load(self, load_dir: Union[str, pathlib.Path]):
+        return None
+
+    def load(self, load_dir: Union[str, pathlib.Path]) -> None:
         """Loads statistics from a torch file, with legacy pickle fallback."""
         load_dir = pathlib.Path(load_dir)
         pt_path = load_dir / self._STATS_FNAME
@@ -355,11 +387,12 @@ class ZScoreNormalizer(Normalizer):
 
         if pt_path.exists():
             stats = torch.load(pt_path, weights_only=True)
-            self.mean.copy_(stats["mean"].to(self.device))
-            self.std.copy_(stats["std"].to(self.device))
+            self._mean.copy_(stats["mean"].to(self.device))
+            self._std.copy_(stats["std"].to(self.device))
             if "eps" in stats:
                 self.eps.copy_(stats["eps"].to(self.device))
         elif pickle_path.exists():
+            # Support for mbrl-lib legacy pickle format
             warnings.warn(
                 f"Loading normalizer from legacy pickle format "
                 f"'{self._LEGACY_STATS_FNAME}'. Please re-save to migrate "
@@ -370,15 +403,17 @@ class ZScoreNormalizer(Normalizer):
 
             with open(pickle_path, "rb") as f:
                 stats = pickle.load(f)
-                self.mean.copy_(torch.from_numpy(stats["mean"]).to(self.device))
-                self.std.copy_(torch.from_numpy(stats["std"]).to(self.device))
+                self._mean.copy_(torch.from_numpy(stats["mean"]).to(self.device))
+                self._std.copy_(torch.from_numpy(stats["std"]).to(self.device))
         else:
             raise FileNotFoundError(
                 f"No normalizer stats found at '{pt_path}' or '{pickle_path}'."
             )
 
+        return None
 
-class WinsorizedNormalizer(Normalizer):
+
+class SoftWinsorizedNormalizer(Normalizer):
     """Robust normalizer using winsorized z-score with per-feature adaptive tanh soft-clipping.
 
     **What it does:**
@@ -437,7 +472,9 @@ class WinsorizedNormalizer(Normalizer):
         self.register_buffer("q_low", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("q_high", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("iqr", torch.ones((1, in_size), dtype=dtype))
-        self.register_buffer("clip_threshold", torch.full((1, in_size), soft_clip_iqr_mult, dtype=dtype))
+        self.register_buffer(
+            "clip_threshold", torch.full((1, in_size), soft_clip_iqr_mult, dtype=dtype)
+        )
         _eps_value = 1e-14 if dtype == torch.double else 1e-5
         self.register_buffer("eps", torch.tensor(_eps_value, dtype=dtype))
         self.winsor_percentile = winsor_percentile
@@ -475,16 +512,7 @@ class WinsorizedNormalizer(Normalizer):
         """Alias for compatibility with code expecting a ``std`` attribute."""
         return self.winsorized_std
 
-    def _to_tensor(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
-        if isinstance(val, np.ndarray):
-            val = torch.from_numpy(val)
-        if not isinstance(val, torch.Tensor):
-            val = torch.tensor(val)
-        if self.device.type == "mps" and val.dtype == torch.float64:
-            val = val.float()
-        return val.to(self.device)
-
-    def update_stats(self, data: mbrl.types.TensorType):
+    def update_stats(self, data: mbrl.types.TensorType) -> None:
         """Compute winsorized statistics and adaptive clip thresholds from *data*.
 
         Args:
@@ -496,14 +524,14 @@ class WinsorizedNormalizer(Normalizer):
 
         if data.shape[0] < 10:
             warnings.warn(
-                f"WinsorizedNormalizer.update_stats called with only {data.shape[0]} samples. "
+                f"SoftWinsorizedNormalizer.update_stats called with only {data.shape[0]} samples. "
                 "Statistics may be unreliable.",
                 RuntimeWarning,
             )
 
         if torch.isnan(data).any() or torch.isinf(data).any():
             warnings.warn(
-                "WinsorizedNormalizer.update_stats received data containing NaN or Inf. "
+                "SoftWinsorizedNormalizer.update_stats received data containing NaN or Inf. "
                 "These entries will be replaced with zeros.",
                 RuntimeWarning,
             )
@@ -522,26 +550,32 @@ class WinsorizedNormalizer(Normalizer):
         self.iqr.copy_(iqr)
 
         # Winsorize: clamp to [q_low, q_high]
-        clamped = data.clamp(min=q_low, max=q_high)
+        clamped_data = data.clamp(min=q_low, max=q_high)
 
         # Winsorized mean
-        w_mean = clamped.mean(0, keepdim=True)
+        w_mean = clamped_data.mean(0, keepdim=True)
         self.winsorized_mean.copy_(w_mean)
 
         # Winsorized std with Bessel's correction + epsilon
         if data.shape[0] > 1:
             w_std = torch.sqrt(
-                ((clamped - w_mean) ** 2).sum(0, keepdim=True) / (data.shape[0] - 1)
+                ((clamped_data - w_mean) ** 2).sum(0, keepdim=True)
+                / (data.shape[0] - 1)
                 + self.eps
             )
         else:
             w_std = torch.ones_like(w_mean)
+
         w_std.clamp_(min=self.eps.item())
+
+        # (CRITICAL) ToDo: validate setting NaN to arbitrary value i.e., 1.0
+        # ToDo: assess raising a warning when NaN is encountered and replaced
         w_std[torch.isnan(w_std)] = 1.0
         self.winsorized_std.copy_(w_std)
 
         # Per-feature adaptive soft-clip threshold: c_i = gamma * IQR_i / sigma_i
         clip_t = self.soft_clip_iqr_mult * iqr / w_std
+
         # Floor at 1.0 so the identity region always covers at least ±1 sigma.
         # Without this floor, near-constant features (IQR ≈ 0) or very low
         # soft_clip_iqr_mult values would cause the tanh soft-clip to compress
@@ -549,14 +583,16 @@ class WinsorizedNormalizer(Normalizer):
         clip_t = clip_t.clamp(min=1.0)
         self.clip_threshold.copy_(clip_t)
 
+        return None
+
     @staticmethod
     def _soft_clip(z: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
         """Per-feature adaptive tanh soft-clip."""
         abs_z = z.abs()
         within = abs_z <= threshold
         excess = abs_z - threshold
-        clipped = z.sign() * (threshold + torch.tanh(excess))
-        return torch.where(within, z, clipped)
+        soft_clipped = z.sign() * (threshold + torch.tanh(excess))
+        return torch.where(within, z, soft_clipped)
 
     @staticmethod
     def _soft_clip_inverse(y: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
@@ -564,8 +600,8 @@ class WinsorizedNormalizer(Normalizer):
         abs_y = y.abs()
         within = abs_y <= threshold
         excess = (abs_y - threshold).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-        unclipped = y.sign() * (threshold + torch.atanh(excess))
-        return torch.where(within, y, unclipped)
+        soft_unclipped = y.sign() * (threshold + torch.atanh(excess))
+        return torch.where(within, y, soft_unclipped)
 
     @torch.compiler.disable
     def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
@@ -584,12 +620,15 @@ class WinsorizedNormalizer(Normalizer):
             if val.dtype == torch.float64 or self.winsorized_mean.dtype == torch.float64
             else self.winsorized_mean.dtype
         )
-        z = (val.to(compute_dtype) - self.winsorized_mean.to(compute_dtype)) / self.winsorized_std.to(compute_dtype)
+
+        z = (
+            val.to(compute_dtype) - self.winsorized_mean.to(compute_dtype)
+        ) / self.winsorized_std.to(compute_dtype)
 
         if not torch.isfinite(z).all():
             non_finite_count = (~torch.isfinite(z)).sum().item()
             warnings.warn(
-                f"WinsorizedNormalizer produced {non_finite_count} non-finite values. "
+                f"SoftWinsorizedNormalizer produced {non_finite_count} non-finite values. "
                 "Clamping to finite data range.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -622,13 +661,18 @@ class WinsorizedNormalizer(Normalizer):
             if val.dtype == torch.float64 or self.winsorized_mean.dtype == torch.float64
             else self.winsorized_mean.dtype
         )
-        z = self._soft_clip_inverse(val.to(compute_dtype), self.clip_threshold.to(compute_dtype))
-        result = z * self.winsorized_std.to(compute_dtype) + self.winsorized_mean.to(compute_dtype)
+
+        z = self._soft_clip_inverse(
+            val.to(compute_dtype), self.clip_threshold.to(compute_dtype)
+        )
+        result = z * self.winsorized_std.to(compute_dtype) + self.winsorized_mean.to(
+            compute_dtype
+        )
 
         if not torch.isfinite(result).all():
             non_finite_count = (~torch.isfinite(result)).sum().item()
             warnings.warn(
-                f"WinsorizedNormalizer produced {non_finite_count} non-finite values. "
+                f"SoftWinsorizedNormalizer produced {non_finite_count} non-finite values. "
                 "Clamping to finite data range.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -640,9 +684,10 @@ class WinsorizedNormalizer(Normalizer):
                 result = result.clamp(lo, hi)
             else:
                 result = torch.zeros_like(result)
+
         return result.to(input_dtype)
 
-    def save(self, save_dir: Union[str, pathlib.Path]):
+    def save(self, save_dir: Union[str, pathlib.Path]) -> None:
         save_dir = pathlib.Path(save_dir)
         torch.save(
             {
@@ -658,12 +703,13 @@ class WinsorizedNormalizer(Normalizer):
             },
             save_dir / self._STATS_FNAME,
         )
+        return None
 
-    def load(self, load_dir: Union[str, pathlib.Path]):
+    def load(self, load_dir: Union[str, pathlib.Path]) -> None:
         load_dir = pathlib.Path(load_dir)
         path = load_dir / self._STATS_FNAME
         if not path.exists():
-            raise FileNotFoundError(f"No WinsorizedNormalizer stats found at '{path}'.")
+            raise FileNotFoundError(f"No SoftWinsorizedNormalizer stats found at '{path}'.")
         stats = torch.load(path, weights_only=True)
         self.winsorized_mean.copy_(stats["winsorized_mean"].to(self.device))
         self.winsorized_std.copy_(stats["winsorized_std"].to(self.device))
@@ -677,6 +723,7 @@ class WinsorizedNormalizer(Normalizer):
             self.winsor_percentile = stats["winsor_percentile"]
         if "soft_clip_iqr_mult" in stats:
             self.soft_clip_iqr_mult = stats["soft_clip_iqr_mult"]
+        return None
 
 
 class QuantileNormalizer(Normalizer):
@@ -749,7 +796,7 @@ class QuantileNormalizer(Normalizer):
         eps_clamp = 1e-7
         p = torch.linspace(0.0, 1.0, n_bins + 1, dtype=torch.float64)
         p_clamped = p.clamp(eps_clamp, 1.0 - eps_clamp)
-        targets = torch.erfinv(2.0 * p_clamped - 1.0) * (2.0 ** 0.5)
+        targets = torch.erfinv(2.0 * p_clamped - 1.0) * (2.0**0.5)
         self.register_buffer("target_quantiles", targets.to(dtype))
 
         # For mean/std compatibility aliases, compute after update_stats
@@ -773,15 +820,6 @@ class QuantileNormalizer(Normalizer):
     def std(self):
         """Alias: IQR-based scale estimate."""
         return self._std_cache
-
-    def _to_tensor(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
-        if isinstance(val, np.ndarray):
-            val = torch.from_numpy(val)
-        if not isinstance(val, torch.Tensor):
-            val = torch.tensor(val)
-        if self.device.type == "mps" and val.dtype == torch.float64:
-            val = val.float()
-        return val.to(self.device)
 
     def update_stats(self, data: mbrl.types.TensorType):
         """Compute empirical quantile boundaries per feature.
@@ -810,7 +848,9 @@ class QuantileNormalizer(Normalizer):
             data = torch.where(torch.isfinite(data), data, torch.zeros_like(data))
 
         # Probability grid
-        p = torch.linspace(0.0, 1.0, self.n_bins + 1, dtype=data.dtype, device=data.device)
+        p = torch.linspace(
+            0.0, 1.0, self.n_bins + 1, dtype=data.dtype, device=data.device
+        )
 
         # Per-feature quantile boundaries
         boundaries = torch.quantile(data, p, dim=0)  # (n_bins+1, in_size)
@@ -839,7 +879,8 @@ class QuantileNormalizer(Normalizer):
         input_dtype = val.dtype
         compute_dtype = (
             torch.float64
-            if val.dtype == torch.float64 or self.quantile_boundaries.dtype == torch.float64
+            if val.dtype == torch.float64
+            or self.quantile_boundaries.dtype == torch.float64
             else self.quantile_boundaries.dtype
         )
         val_c = val.to(compute_dtype)
@@ -879,11 +920,15 @@ class QuantileNormalizer(Normalizer):
         lower_mask = val_t < boundaries_t[:, :1]
         upper_mask = val_t > boundaries_t[:, -1:]
         if lower_mask.any():
-            slope_low = (targets[1] - targets[0]) / (boundaries_t[:, 1:2] - boundaries_t[:, 0:1]).clamp(min=1e-12)
+            slope_low = (targets[1] - targets[0]) / (
+                boundaries_t[:, 1:2] - boundaries_t[:, 0:1]
+            ).clamp(min=1e-12)
             extrap_low = targets[0] + slope_low * (val_t - boundaries_t[:, 0:1])
             result_t = torch.where(lower_mask, extrap_low, result_t)
         if upper_mask.any():
-            slope_high = (targets[-1] - targets[-2]) / (boundaries_t[:, -1:] - boundaries_t[:, -2:-1]).clamp(min=1e-12)
+            slope_high = (targets[-1] - targets[-2]) / (
+                boundaries_t[:, -1:] - boundaries_t[:, -2:-1]
+            ).clamp(min=1e-12)
             extrap_high = targets[-1] + slope_high * (val_t - boundaries_t[:, -1:])
             result_t = torch.where(upper_mask, extrap_high, result_t)
 
@@ -904,7 +949,8 @@ class QuantileNormalizer(Normalizer):
         input_dtype = val.dtype
         compute_dtype = (
             torch.float64
-            if val.dtype == torch.float64 or self.quantile_boundaries.dtype == torch.float64
+            if val.dtype == torch.float64
+            or self.quantile_boundaries.dtype == torch.float64
             else self.quantile_boundaries.dtype
         )
         val_c = val.to(compute_dtype)
@@ -946,11 +992,15 @@ class QuantileNormalizer(Normalizer):
         lower_mask = val_c < targets[0]
         upper_mask = val_c > targets[-1]
         if lower_mask.any():
-            slope_low = (boundaries[1] - boundaries[0]) / (targets[1] - targets[0]).clamp(min=1e-12)
+            slope_low = (boundaries[1] - boundaries[0]) / (
+                targets[1] - targets[0]
+            ).clamp(min=1e-12)
             extrap_low = boundaries[0] + slope_low * (val_c - targets[0])
             result = torch.where(lower_mask, extrap_low, result)
         if upper_mask.any():
-            slope_high = (boundaries[-1] - boundaries[-2]) / (targets[-1] - targets[-2]).clamp(min=1e-12)
+            slope_high = (boundaries[-1] - boundaries[-2]) / (
+                targets[-1] - targets[-2]
+            ).clamp(min=1e-12)
             extrap_high = boundaries[-1] + slope_high * (val_c - targets[-1])
             result = torch.where(upper_mask, extrap_high, result)
 
@@ -991,6 +1041,7 @@ class QuantileNormalizer(Normalizer):
         if "tail_policy" in stats:
             self.tail_policy = stats["tail_policy"]
 
+
 def create_normalizer(
     normalizer_type: str,
     in_size: int,
@@ -1009,14 +1060,14 @@ def create_normalizer(
             (e.g. ``winsor_percentile``, ``soft_clip_iqr_mult``, ``n_bins``, ``tail_policy``).
 
     Returns:
-        A normalizer instance (``ZScoreNormalizer``, ``WinsorizedNormalizer``,
+        A normalizer instance (``ZScoreNormalizer``, ``SoftWinsorizedNormalizer``,
         or ``QuantileNormalizer``).
     """
     if normalizer_type == "standard":
         clip_range = kwargs.get("clip_range", None)
         return ZScoreNormalizer(in_size, device, dtype=dtype, clip_range=clip_range)
     elif normalizer_type == "winsorized":
-        return WinsorizedNormalizer(
+        return SoftWinsorizedNormalizer(
             in_size,
             device,
             dtype=dtype,

@@ -2,7 +2,7 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-"""Tests for WinsorizedNormalizer, QuantileNormalizer, and create_normalizer factory."""
+"""Tests for SoftWinsorizedNormalizer, QuantileNormalizer, and create_normalizer factory."""
 import pathlib
 import tempfile
 import warnings
@@ -20,11 +20,11 @@ _DEVICE = "cpu"
 
 
 # ------------------------------------------------------------------ #
-#  WinsorizedNormalizer
+#  SoftWinsorizedNormalizer
 # ------------------------------------------------------------------ #
 class TestWinsorizedBasic:
     def test_init_default(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(5, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(5, torch.device(_DEVICE))
         assert norm.winsorized_mean.shape == (1, 5)
         assert norm.winsorized_std.shape == (1, 5)
         assert torch.allclose(norm.winsorized_mean, torch.zeros(1, 5))
@@ -33,7 +33,7 @@ class TestWinsorizedBasic:
         assert norm.soft_clip_iqr_mult == 3.0
 
     def test_init_double_precision(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(
             3, torch.device(_DEVICE), dtype=torch.double
         )
         assert norm.winsorized_mean.dtype == torch.double
@@ -41,12 +41,12 @@ class TestWinsorizedBasic:
         assert norm.eps.item() == pytest.approx(1e-14)
 
     def test_mean_std_aliases(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(3, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(3, torch.device(_DEVICE))
         assert norm.mean is norm.winsorized_mean
         assert norm.std is norm.winsorized_std
 
     def test_update_stats_basic(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         data = torch.randn(200, 2)
         norm.update_stats(data)
         assert torch.isfinite(norm.winsorized_mean).all()
@@ -54,7 +54,7 @@ class TestWinsorizedBasic:
         assert (norm.winsorized_std > 0).all()
 
     def test_normalize_basic(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         data = torch.randn(200, 2)
         norm.update_stats(data)
         normalized = norm.normalize(data)
@@ -66,7 +66,7 @@ class TestWinsorizedBasic:
 class TestWinsorizedRoundTrip:
     def test_round_trip_in_distribution(self):
         """denormalize(normalize(x)) ≈ x for values within the soft-clip linear region."""
-        norm = mbrl.util.normalization.WinsorizedNormalizer(3, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(3, torch.device(_DEVICE))
         data = torch.randn(500, 3)
         norm.update_stats(data)
         # Use values within ~2 sigma (well within clip threshold)
@@ -76,7 +76,7 @@ class TestWinsorizedRoundTrip:
 
     def test_round_trip_with_outliers(self):
         """Round-trip for extreme values (in the soft-clip region)."""
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         data = torch.randn(500, 2)
         norm.update_stats(data)
         # Values at ~5 sigma — may be in soft-clip region
@@ -88,8 +88,8 @@ class TestWinsorizedRoundTrip:
 class TestWinsorizedRobustness:
     def test_outlier_robustness(self):
         """Statistics should be stable when outliers are injected."""
-        norm_clean = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
-        norm_dirty = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm_clean = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm_dirty = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
 
         data = torch.randn(500, 2)
         norm_clean.update_stats(data)
@@ -108,7 +108,7 @@ class TestWinsorizedRobustness:
         )
 
     def test_nan_handling(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         data = torch.randn(50, 2)
         data[5, 0] = float("nan")
         with pytest.warns(RuntimeWarning, match="NaN or Inf"):
@@ -117,22 +117,22 @@ class TestWinsorizedRobustness:
         assert torch.isfinite(norm.winsorized_std).all()
 
     def test_constant_feature(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         data = torch.zeros(100, 2)
         data[:, 1] = torch.randn(100)
         norm.update_stats(data)
         assert norm.winsorized_std[0, 0].item() >= norm.eps.item()
 
     def test_small_sample_warning(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         data = torch.randn(5, 2)
         with pytest.warns(RuntimeWarning, match="only 5 samples"):
             norm.update_stats(data)
 
     def test_per_feature_independence(self):
         """Modifying one feature's data should not affect another feature's statistics."""
-        norm1 = mbrl.util.normalization.WinsorizedNormalizer(3, torch.device(_DEVICE))
-        norm2 = mbrl.util.normalization.WinsorizedNormalizer(3, torch.device(_DEVICE))
+        norm1 = mbrl.util.normalization.SoftWinsorizedNormalizer(3, torch.device(_DEVICE))
+        norm2 = mbrl.util.normalization.SoftWinsorizedNormalizer(3, torch.device(_DEVICE))
         data = torch.randn(200, 3)
         norm1.update_stats(data)
         data2 = data.clone()
@@ -146,7 +146,7 @@ class TestWinsorizedRobustness:
 class TestWinsorizedSoftClip:
     def test_soft_clip_bounded(self):
         """Output should be bounded to ±(c_i + 1)."""
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         data = torch.randn(500, 2)
         norm.update_stats(data)
         extreme = norm.winsorized_mean + 20.0 * norm.winsorized_std
@@ -158,7 +158,7 @@ class TestWinsorizedSoftClip:
         """The soft-clip function must be monotonic."""
         threshold = torch.tensor([[3.0, 4.0]])
         z = torch.linspace(-10, 10, 100).unsqueeze(1).expand(-1, 2)
-        clipped = mbrl.util.normalization.WinsorizedNormalizer._soft_clip(z, threshold)
+        clipped = mbrl.util.normalization.SoftWinsorizedNormalizer._soft_clip(z, threshold)
         # Check that differences are all non-negative (monotonically increasing)
         diffs = clipped[1:] - clipped[:-1]
         assert (diffs >= -1e-6).all()
@@ -167,28 +167,28 @@ class TestWinsorizedSoftClip:
         """_soft_clip_inverse should exactly invert _soft_clip for values in valid range."""
         threshold = torch.tensor([[3.0]])
         z = torch.linspace(-5, 5, 200).unsqueeze(1)
-        clipped = mbrl.util.normalization.WinsorizedNormalizer._soft_clip(z, threshold)
-        recovered = mbrl.util.normalization.WinsorizedNormalizer._soft_clip_inverse(clipped, threshold)
+        clipped = mbrl.util.normalization.SoftWinsorizedNormalizer._soft_clip(z, threshold)
+        recovered = mbrl.util.normalization.SoftWinsorizedNormalizer._soft_clip_inverse(clipped, threshold)
         assert torch.allclose(recovered, z, atol=1e-5)
 
 
 class TestWinsorizedDtype:
     def test_normalize_preserves_float32(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE), dtype=torch.float32)
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE), dtype=torch.float32)
         data = torch.randn(100, 2)
         norm.update_stats(data)
         result = norm.normalize(data[:10])
         assert result.dtype == torch.float32
 
     def test_normalize_preserves_float64(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE), dtype=torch.float64)
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE), dtype=torch.float64)
         data = torch.randn(100, 2, dtype=torch.float64)
         norm.update_stats(data)
         result = norm.normalize(data[:10])
         assert result.dtype == torch.float64
 
     def test_cross_dtype_float32_input_float64_normalizer(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE), dtype=torch.float64)
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE), dtype=torch.float64)
         data = torch.randn(100, 2, dtype=torch.float64)
         norm.update_stats(data)
         query = torch.randn(10, 2, dtype=torch.float32)
@@ -196,7 +196,7 @@ class TestWinsorizedDtype:
         assert result.dtype == torch.float32
 
     def test_denormalize_preserves_dtype(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE), dtype=torch.float64)
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE), dtype=torch.float64)
         data = torch.randn(100, 2, dtype=torch.float64)
         norm.update_stats(data)
         query = torch.randn(10, 2, dtype=torch.float32)
@@ -206,13 +206,13 @@ class TestWinsorizedDtype:
 
 class TestWinsorizedSaveLoad:
     def test_save_load_round_trip(self):
-        norm1 = mbrl.util.normalization.WinsorizedNormalizer(4, torch.device(_DEVICE))
+        norm1 = mbrl.util.normalization.SoftWinsorizedNormalizer(4, torch.device(_DEVICE))
         data = torch.randn(200, 4)
         norm1.update_stats(data)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             norm1.save(tmpdir)
-            norm2 = mbrl.util.normalization.WinsorizedNormalizer(4, torch.device(_DEVICE))
+            norm2 = mbrl.util.normalization.SoftWinsorizedNormalizer(4, torch.device(_DEVICE))
             norm2.load(tmpdir)
 
         assert torch.allclose(norm1.winsorized_mean, norm2.winsorized_mean)
@@ -222,16 +222,16 @@ class TestWinsorizedSaveLoad:
         assert norm1.soft_clip_iqr_mult == norm2.soft_clip_iqr_mult
 
     def test_load_missing_raises(self):
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(FileNotFoundError):
                 norm.load(tmpdir)
 
     def test_state_dict_round_trip(self):
-        norm1 = mbrl.util.normalization.WinsorizedNormalizer(3, torch.device(_DEVICE))
+        norm1 = mbrl.util.normalization.SoftWinsorizedNormalizer(3, torch.device(_DEVICE))
         data = torch.randn(100, 3)
         norm1.update_stats(data)
-        norm2 = mbrl.util.normalization.WinsorizedNormalizer(3, torch.device(_DEVICE))
+        norm2 = mbrl.util.normalization.SoftWinsorizedNormalizer(3, torch.device(_DEVICE))
         norm2.load_state_dict(norm1.state_dict())
         assert torch.allclose(norm1.winsorized_mean, norm2.winsorized_mean)
         assert torch.allclose(norm1.winsorized_std, norm2.winsorized_std)
@@ -240,7 +240,7 @@ class TestWinsorizedSaveLoad:
 class TestWinsorizedGradient:
     def test_gradient_flow(self):
         """Verify autograd propagates through normalize."""
-        norm = mbrl.util.normalization.WinsorizedNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         data = torch.randn(200, 2)
         norm.update_stats(data)
         x = torch.randn(5, 2, requires_grad=True)
@@ -443,7 +443,7 @@ class TestCreateNormalizer:
 
     def test_winsorized(self):
         norm = mbrl.util.normalization.create_normalizer("winsorized", 5, torch.device(_DEVICE))
-        assert isinstance(norm, mbrl.util.normalization.WinsorizedNormalizer)
+        assert isinstance(norm, mbrl.util.normalization.SoftWinsorizedNormalizer)
 
     def test_quantile(self):
         norm = mbrl.util.normalization.create_normalizer("quantile", 5, torch.device(_DEVICE))
@@ -461,7 +461,7 @@ class TestCreateNormalizer:
             "winsorized", 5, torch.device(_DEVICE),
             winsor_percentile=0.1, soft_clip_iqr_mult=2.0,
         )
-        assert isinstance(norm, mbrl.util.normalization.WinsorizedNormalizer)
+        assert isinstance(norm, mbrl.util.normalization.SoftWinsorizedNormalizer)
         assert norm.winsor_percentile == 0.1
         assert norm.soft_clip_iqr_mult == 2.0
 

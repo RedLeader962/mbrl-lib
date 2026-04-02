@@ -85,8 +85,8 @@ class TestBufferIntegrity:
         data = torch.randn(20, 4)
         norm.update_stats(data)
         sd = norm.state_dict()
-        assert "mean" in sd
-        assert "std" in sd
+        assert "_mean" in sd
+        assert "_std" in sd
         assert "eps" in sd
 
     def test_buffers_survive_update_stats(self):
@@ -96,9 +96,9 @@ class TestBufferIntegrity:
         norm.update_stats(data1)
         norm.update_stats(data2)
         sd = norm.state_dict()
-        assert "mean" in sd
-        assert "std" in sd
-        assert torch.allclose(sd["mean"], data2.mean(0, keepdim=True), atol=1e-5)
+        assert "_mean" in sd
+        assert "_std" in sd
+        assert torch.allclose(sd["_mean"], data2.mean(0, keepdim=True), atol=1e-5)
 
     def test_state_dict_round_trip(self):
         norm1 = mbrl.util.normalization.ZScoreNormalizer(3, torch.device(_DEVICE))
