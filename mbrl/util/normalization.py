@@ -515,12 +515,25 @@ class SoftWinsorizedNormalizer(Normalizer):
     def update_stats(self, data: mbrl.types.TensorType) -> None:
         """Compute winsorized statistics and adaptive clip thresholds from *data*.
 
+        Statistics (quantiles, IQR, mean, std, clip thresholds) are computed on
+        CPU via numpy regardless of the input device.  This avoids two issues:
+        (1) materialising 5-6 full-dataset copies on the GPU (OOM risk), and
+        (2) ``torch.quantile`` hard element-count limit (~16 M elements) which
+        raises "quantile() input tensor is too large" for large datasets
+        (e.g. 451 k timesteps × history_len 80 → 36 M rows).  numpy's
+        ``np.quantile`` has no such restriction.
+        The resulting statistics are transferred back to the target device via the
+        ``self.xxx.copy_()`` calls below, which handle cross-device copies
+        transparently.
+
         Args:
             data (np.ndarray or torch.Tensor): shape ``(N, in_size)``.
         """
         # (CRITICAL) ToDo: assess support for model ensemble
         assert data.ndim == 2 and data.shape[1] == self.winsorized_mean.shape[1]
-        data = self._to_tensor(data)
+        # Force CPU then numpy: torch.quantile is limited to ~16 M elements and
+        # requires multiple full-size sorted copies on GPU simultaneously (OOM).
+        data = self._to_tensor(data).cpu()
 
         if data.shape[0] < 10:
             warnings.warn(
@@ -538,11 +551,20 @@ class SoftWinsorizedNormalizer(Normalizer):
             data = torch.where(torch.isfinite(data), data, torch.zeros_like(data))
 
         alpha = self.winsor_percentile
-        # Compute quantiles per feature
-        q_low = torch.quantile(data, alpha, dim=0, keepdim=True)
-        q_high = torch.quantile(data, 1.0 - alpha, dim=0, keepdim=True)
-        q25 = torch.quantile(data, 0.25, dim=0, keepdim=True)
-        q75 = torch.quantile(data, 0.75, dim=0, keepdim=True)
+        # Use numpy for quantile computation: no element-count limit, no GPU memory pressure.
+        data_np = data.numpy()
+        q_low = torch.from_numpy(
+            np.quantile(data_np, alpha, axis=0, keepdims=True).astype(np.float64)
+        )
+        q_high = torch.from_numpy(
+            np.quantile(data_np, 1.0 - alpha, axis=0, keepdims=True).astype(np.float64)
+        )
+        q25 = torch.from_numpy(
+            np.quantile(data_np, 0.25, axis=0, keepdims=True).astype(np.float64)
+        )
+        q75 = torch.from_numpy(
+            np.quantile(data_np, 0.75, axis=0, keepdims=True).astype(np.float64)
+        )
 
         self.q_low.copy_(q_low)
         self.q_high.copy_(q_high)
@@ -561,7 +583,7 @@ class SoftWinsorizedNormalizer(Normalizer):
             w_std = torch.sqrt(
                 ((clamped_data - w_mean) ** 2).sum(0, keepdim=True)
                 / (data.shape[0] - 1)
-                + self.eps
+                + self.eps.item()
             )
         else:
             w_std = torch.ones_like(w_mean)
