@@ -26,7 +26,7 @@ from mbrl.util.torchrl_util import (
 )
 
 
-def _to_torch_dtype(dtype_spec) -> torch.dtype:
+def _to_torch_dtype(dtype_spec: Union[str, torch.dtype, np.dtype]) -> torch.dtype:
     """Convert a dtype specification (numpy or torch) to a torch.dtype.
 
     Handles np.float32, np.dtype('float32'), torch.float32, and string
@@ -474,9 +474,9 @@ class ReplayBuffer:
         capacity: int,
         obs_shape: Sequence[int],
         action_shape: Sequence[int],
-        obs_type: Type = np.float32,
-        action_type: Type = np.float32,
-        reward_type: Type = np.float32,
+        obs_type: Union[torch.dtype, np.dtype, str] = torch.float32,
+        action_type: Union[torch.dtype, np.dtype, str] = torch.float32,
+        reward_type: Union[torch.dtype, np.dtype, str] = torch.float32,
         rng: Optional[np.random.Generator] = None,
         max_trajectory_length: Optional[int] = None,
         output_torch: Optional[bool] = None,
