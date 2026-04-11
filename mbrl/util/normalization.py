@@ -531,9 +531,20 @@ class SoftWinsorizedNormalizer(Normalizer):
         """
         # (CRITICAL) ToDo: assess support for model ensemble
         assert data.ndim == 2 and data.shape[1] == self.winsorized_mean.shape[1]
+
         # Force CPU then numpy: torch.quantile is limited to ~16 M elements and
         # requires multiple full-size sorted copies on GPU simultaneously (OOM).
-        data = self._to_tensor(data).cpu()
+        # NOTE: Do NOT use self._to_tensor(data).cpu() here — _to_tensor moves data
+        # to self.device (GPU) first, then .cpu() pulls it back, unnecessarily
+        # allocating the entire dataset on GPU and causing GPU memory pressure / OOM
+        # for large datasets (e.g. 451k timesteps × history_len 80 → ~36M elements).
+        # Instead convert directly to a CPU tensor to avoid the GPU round-trip.
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data).cpu()
+        elif isinstance(data, torch.Tensor):
+            data = data.cpu()
+        else:
+            data = torch.tensor(data).cpu()
 
         if data.shape[0] < 10:
             warnings.warn(
