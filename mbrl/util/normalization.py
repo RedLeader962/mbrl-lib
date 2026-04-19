@@ -386,7 +386,9 @@ class ZScoreNormalizer(Normalizer):
         pickle_path = load_dir / self._LEGACY_STATS_FNAME
 
         if pt_path.exists():
-            stats = torch.load(pt_path, weights_only=True)
+            from mbrl.util.common import resolve_load_map_location
+
+            stats = torch.load(pt_path, weights_only=True, map_location=resolve_load_map_location())
             self._mean.copy_(stats["mean"].to(self.device))
             self._std.copy_(stats["std"].to(self.device))
             if "eps" in stats:
@@ -743,7 +745,9 @@ class SoftWinsorizedNormalizer(Normalizer):
         path = load_dir / self._STATS_FNAME
         if not path.exists():
             raise FileNotFoundError(f"No SoftWinsorizedNormalizer stats found at '{path}'.")
-        stats = torch.load(path, weights_only=True)
+        from mbrl.util.common import resolve_load_map_location
+
+        stats = torch.load(path, weights_only=True, map_location=resolve_load_map_location())
         self.winsorized_mean.copy_(stats["winsorized_mean"].to(self.device))
         self.winsorized_std.copy_(stats["winsorized_std"].to(self.device))
         self.q_low.copy_(stats["q_low"].to(self.device))
@@ -1060,7 +1064,9 @@ class QuantileNormalizer(Normalizer):
         path = load_dir / self._STATS_FNAME
         if not path.exists():
             raise FileNotFoundError(f"No QuantileNormalizer stats found at '{path}'.")
-        stats = torch.load(path, weights_only=True)
+        from mbrl.util.common import resolve_load_map_location
+
+        stats = torch.load(path, weights_only=True, map_location=resolve_load_map_location())
         self.quantile_boundaries.copy_(stats["quantile_boundaries"].to(self.device))
         self.target_quantiles.copy_(stats["target_quantiles"].to(self.device))
         if "_mean_cache" in stats:

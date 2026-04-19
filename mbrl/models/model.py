@@ -313,8 +313,14 @@ class Model(pl.LightningModule, abc.ABC):
 
     def load(self, load_dir: Union[str, pathlib.Path]):
         """Loads the model from the given path."""
+        from mbrl.util.common import resolve_load_map_location
+
         self.load_state_dict(
-            torch.load(pathlib.Path(load_dir) / self._MODEL_FNAME, weights_only=True)
+            torch.load(
+                pathlib.Path(load_dir) / self._MODEL_FNAME,
+                weights_only=True,
+                map_location=resolve_load_map_location(),
+            )
         )
 
 

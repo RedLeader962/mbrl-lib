@@ -9,6 +9,7 @@ import gymnasium as gym
 import hydra
 import numpy as np
 import omegaconf
+import torch
 
 import mbrl.models
 import mbrl.planning
@@ -610,3 +611,40 @@ def step_env_and_add_to_buffer(
     if callback:
         callback((obs, action, next_obs, reward, terminated, truncated))
     return next_obs, reward, terminated, truncated, info
+
+
+def resolve_load_map_location(
+    target_device: Optional[Union[torch.device, str]] = None,
+) -> torch.device:
+    """Determine the appropriate map_location for torch.load().
+
+    Resolves the best available device for loading saved tensors, ensuring
+    cross-platform portability across CUDA, MPS, and CPU environments.
+
+    Priority:
+        1. If target_device is explicitly provided and available, use it.
+        2. If CUDA is available, use "cuda:0" (safe default for multi-GPU).
+        3. If MPS is available (Apple Silicon), use "cpu"
+           (load to CPU first, then move to MPS after dtype fixes).
+        4. Fall back to "cpu".
+
+    Args:
+        target_device: Optional explicit device to map to. If None, auto-detect.
+
+    Returns:
+        A torch.device suitable for use as torch.load(map_location=...).
+    """
+    if target_device is not None:
+        target_device = torch.device(target_device)
+        if target_device.type == "cuda" and not torch.cuda.is_available():
+            return torch.device("cpu")
+        if target_device.type == "mps" and not torch.backends.mps.is_available():
+            return torch.device("cpu")
+        return target_device
+
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    # For MPS: load to CPU first to allow dtype fixes (float64→float32)
+    # before moving to MPS. The model's forward pass already handles
+    # the .to(self.device) migration.
+    return torch.device("cpu")

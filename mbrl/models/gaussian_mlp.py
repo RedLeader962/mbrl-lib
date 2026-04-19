@@ -396,8 +396,12 @@ class GaussianMLP(Ensemble):
 
     def load(self, load_dir: Union[str, pathlib.Path]):
         """Loads the model from the given path."""
+        from mbrl.util.common import resolve_load_map_location
+
         model_dict = torch.load(
-            pathlib.Path(load_dir) / self._MODEL_FNAME, weights_only=False
+            pathlib.Path(load_dir) / self._MODEL_FNAME,
+            weights_only=False,
+            map_location=resolve_load_map_location(),
         )
         self.load_state_dict(model_dict["state_dict"])
         self.elite_models = model_dict["elite_models"]
