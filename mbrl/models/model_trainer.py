@@ -291,6 +291,10 @@ class ModelTrainer:
         optim_eps: float = 1e-8,
         logger: Optional[Logger] = None,
         use_preallocated_best_weights_buffer: bool = False,
+        dataloader_num_workers: int = 0,
+        dataloader_pin_memory: bool = False,
+        dataloader_persistent_workers: bool = False,
+        dataloader_prefetch_factor: Optional[int] = None,
     ):
         """
         ``use_preallocated_best_weights_buffer`` (opt-in, default False):
@@ -305,6 +309,20 @@ class ModelTrainer:
             Introduced by the RLRC Training Speed & Efficiency plan
             (stage 1, Batch 2 — action B0-bis). Default False keeps
             the legacy ``copy.deepcopy`` path bit-exact.
+
+        ``dataloader_num_workers`` / ``dataloader_pin_memory`` /
+        ``dataloader_persistent_workers`` / ``dataloader_prefetch_factor``
+        (opt-in, default legacy: ``0 / False / False / None``):
+            Wiring for :class:`torch.utils.data.DataLoader` knobs on the
+            train and validation loaders built inside :meth:`train`.
+            Introduced by the RLRC Training Speed & Efficiency stage-1
+            follow-up plan (action F-C2). ``pin_memory`` is auto-gated
+            on CUDA only — it is silently forced to False on CPU / MPS
+            devices. ``persistent_workers`` and ``prefetch_factor`` are
+            only passed through when ``num_workers > 0`` (PyTorch
+            raises otherwise). Legacy defaults preserve the historical
+            behaviour bit-exact (single-process data loading, no
+            pinned host memory, no prefetch).
         """
         self.model = model
         self._train_iteration = 0
@@ -318,6 +336,22 @@ class ModelTrainer:
         # is True. ``None`` both in the legacy path and before the
         # first improvement in the new path.
         self._best_weights_buffer: Optional[Dict[str, torch.Tensor]] = None
+        # Training Speed & Efficiency stage-1 follow-up plan (F-C2):
+        # opt-in DataLoader knobs. Stored on the instance so
+        # :meth:`train` can thread them into both DataLoader ctors
+        # without re-reading the cfg. ``pin_memory`` is auto-gated on
+        # CUDA at :meth:`train` time (model device may not be set at
+        # ``__init__`` time for lazily-built models).
+        self._dataloader_num_workers: int = int(dataloader_num_workers)
+        self._dataloader_pin_memory: bool = bool(dataloader_pin_memory)
+        self._dataloader_persistent_workers: bool = bool(
+            dataloader_persistent_workers
+        )
+        self._dataloader_prefetch_factor: Optional[int] = (
+            int(dataloader_prefetch_factor)
+            if dataloader_prefetch_factor is not None
+            else None
+        )
 
         self.logger = logger
         if self.logger:
@@ -473,15 +507,39 @@ class ModelTrainer:
         # its validation loop, and creating a new Trainer does not restore it.
         self.model.train()
 
-        # Bridge TransitionIterator to Lightning DataLoader
+        # Bridge TransitionIterator to Lightning DataLoader.
+        # F-C2 (stage-1 follow-up): resolve DataLoader knobs with the
+        # legacy defaults preserved bit-exact when the flags are left
+        # at their defaults. ``pin_memory`` auto-downgrades on any
+        # non-CUDA device (CPU / MPS) so a cfg flag accidentally left
+        # on does not crash or warn on those runners.
+        _num_workers = self._dataloader_num_workers
+        _pin_memory = (
+            self._dataloader_pin_memory
+            and self.model.device.type == "cuda"
+        )
+        _dl_kwargs = {
+            "batch_size": None,
+            "num_workers": _num_workers,
+            "pin_memory": _pin_memory,
+        }
+        if _num_workers > 0:
+            # ``persistent_workers`` / ``prefetch_factor`` are only
+            # valid when ``num_workers > 0``; PyTorch raises otherwise.
+            if self._dataloader_persistent_workers:
+                _dl_kwargs["persistent_workers"] = True
+            if self._dataloader_prefetch_factor is not None:
+                _dl_kwargs["prefetch_factor"] = (
+                    self._dataloader_prefetch_factor
+                )
         train_loader = DataLoader(
-            _IteratorDataset(dataset_train), batch_size=None, num_workers=0
+            _IteratorDataset(dataset_train), **_dl_kwargs
         )
         val_loader = None
         if evaluate:
             eval_dataset = dataset_train if dataset_val is None else dataset_val
             val_loader = DataLoader(
-                _IteratorDataset(eval_dataset), batch_size=None, num_workers=0
+                _IteratorDataset(eval_dataset), **_dl_kwargs
             )
 
         # Lightning Callbacks
