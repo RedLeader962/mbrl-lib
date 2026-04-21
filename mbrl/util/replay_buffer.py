@@ -13,6 +13,7 @@ from torchrl.data import (
     ListStorage,
     RandomSampler,
     ReplayBuffer as TorchRLReplayBuffer,
+    SamplerWithoutReplacement,
     SliceSampler,
     TensorDictReplayBuffer,
     TensorStorage,
@@ -527,9 +528,20 @@ class ReplayBuffer:
                 batch_size=[capacity + (max_trajectory_length or 0)],
             )
         )
+        # NOTE (F-C0-sampler): use ``SamplerWithoutReplacement`` to match
+        # pre-refactor mbrl-lib upstream semantics
+        # (``np.random.choice(..., replace=False)``). In ``torchrl >= 0.11``,
+        # ``RandomSampler`` is hardcoded *with* replacement and takes no
+        # ``replacement`` kwarg; the correct drop-in for unique-draw sampling
+        # is ``SamplerWithoutReplacement`` (see
+        # ``torchrl.data.replay_buffers.samplers``). Introduced by action
+        # ``F-C0-sampler`` (stage 1) of the RLRC Training Speed & Efficiency
+        # stage-1 follow-up ``.junie`` plan
+        # (``performance_training_speed_efficiency_stage1_followup_plan_20260421.md``);
+        # see also ``report_randomsampler_replacement_landmine_20260421.md``.
         self._torchrl_rb = TensorDictReplayBuffer(
             storage=self._storage,
-            sampler=RandomSampler(),
+            sampler=SamplerWithoutReplacement(drop_last=False, shuffle=True),
         )
 
         self._start_last_trajectory = 0
