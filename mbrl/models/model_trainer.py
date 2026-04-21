@@ -290,9 +290,34 @@ class ModelTrainer:
         weight_decay: float = 1e-5,
         optim_eps: float = 1e-8,
         logger: Optional[Logger] = None,
+        use_preallocated_best_weights_buffer: bool = False,
     ):
+        """
+        ``use_preallocated_best_weights_buffer`` (opt-in, default False):
+            When True, :meth:`maybe_get_best_weights` stops doing
+            ``copy.deepcopy(self.model.state_dict())`` on every improved
+            inner epoch and instead keeps a single preallocated buffer
+            (a clone of the model's ``state_dict`` on first improvement)
+            that is updated in place via
+            ``tensor.copy_(..., non_blocking=True)``. The buffer is
+            returned by reference so the downstream ``load_state_dict``
+            call path is unchanged.
+            Introduced by the RLRC Training Speed & Efficiency plan
+            (stage 1, Batch 2 — action B0-bis). Default False keeps
+            the legacy ``copy.deepcopy`` path bit-exact.
+        """
         self.model = model
         self._train_iteration = 0
+        # Training Speed & Efficiency plan (B0-bis): opt-in
+        # preallocated best-weights buffer. Legacy default False →
+        # ``copy.deepcopy(state_dict)`` behaviour unchanged.
+        self._use_preallocated_best_weights_buffer = bool(
+            use_preallocated_best_weights_buffer
+        )
+        # Lazily populated on first improvement when the opt-in flag
+        # is True. ``None`` both in the legacy path and before the
+        # first improvement in the new path.
+        self._best_weights_buffer: Optional[Dict[str, torch.Tensor]] = None
 
         self.logger = logger
         if self.logger:
@@ -600,7 +625,42 @@ class ModelTrainer:
         """
         improvement = (best_val_score - val_score) / torch.abs(best_val_score)
         improved = (improvement > threshold).any().item()
-        return copy.deepcopy(self.model.state_dict()) if improved else None
+        if not improved:
+            return None
+
+        # Legacy path (default; bit-exact with pre-B0-bis behaviour):
+        # a brand-new deepcopy of the full state_dict is returned on
+        # every improved inner epoch. This is O(parameters) allocations
+        # + D→H copies on CUDA and is the hot-spot the B0-bis opt-in
+        # removes when turned on explicitly.
+        if not self._use_preallocated_best_weights_buffer:
+            return copy.deepcopy(self.model.state_dict())
+
+        # Opt-in path (Training Speed & Efficiency plan — B0-bis):
+        # keep a single preallocated clone of ``state_dict`` and
+        # update it in place via ``tensor.copy_(...)``. Bit-exact by
+        # construction since ``tensor.copy_`` is a value-for-value
+        # assignment and ``load_state_dict`` downstream still sees the
+        # same numeric values. The dict object is stable across calls
+        # so the callback's ``best_weights = maybe_best`` semantics
+        # remain unchanged.
+        current_state_dict = self.model.state_dict()
+        if self._best_weights_buffer is None:
+            # First improvement: clone once so the buffer is
+            # independent from the live model parameters. ``detach``
+            # avoids any autograd history leakage.
+            self._best_weights_buffer = {
+                k: v.detach().clone() for k, v in current_state_dict.items()
+            }
+        else:
+            # Subsequent improvements: overwrite the buffer in place.
+            # ``non_blocking=True`` is a no-op on CPU but lets CUDA
+            # D↔D copies overlap with the next inner-epoch forward
+            # when the buffer lives on-device.
+            for name, src_tensor in current_state_dict.items():
+                dst_tensor = self._best_weights_buffer[name]
+                dst_tensor.copy_(src_tensor, non_blocking=True)
+        return self._best_weights_buffer
 
     def _maybe_set_best_weights_and_elite(
         self, best_weights: Optional[Dict], best_val_score: Optional[torch.Tensor]
