@@ -481,7 +481,20 @@ class ReplayBuffer:
         rng: Optional[np.random.Generator] = None,
         max_trajectory_length: Optional[int] = None,
         output_torch: Optional[bool] = None,
+        device: Optional[Union[torch.device, str]] = None,
     ):
+        # NOTE (C1 + F-C1b): ``device`` keeps the ReplayBuffer storage on the
+        # provided torch device. When ``None`` (default), storage is allocated
+        # on CPU — bit-exact with the pre-patch code path. When set to a CUDA
+        # device, every underlying ``torch.zeros(...)`` (and the resulting
+        # ``TensorDict`` / ``TensorStorage``) is created directly on-device,
+        # so batch gathers performed by the iterator stay on the GPU and the
+        # synchronous H→D copy that used to happen on every training batch
+        # disappears. Introduced by actions ``C1`` of the RLRC Training Speed
+        # & Efficiency ``.junie`` plan and ``F-C1b`` of the stage-1 follow-up
+        # ``.junie`` plan (merged into a single submodule patch — see reports
+        # ``report_tensordict_torchrl_replaybuffer_perf_20260421.md`` and the
+        # S2-3 execution report).
         self.capacity = capacity
         self.obs_shape = obs_shape
         self.action_shape = action_shape
@@ -490,6 +503,9 @@ class ReplayBuffer:
         self.reward_type = reward_type
         self._rng = rng if rng else np.random.default_rng()
         self.max_trajectory_length = max_trajectory_length
+        self.device: Optional[torch.device] = (
+            torch.device(device) if device is not None else None
+        )
 
         # Output format control
         self._output_torch = output_torch if output_torch is not None else True
@@ -513,19 +529,27 @@ class ReplayBuffer:
         # Internal TorchRL ReplayBuffer
         # We use a TensorStorage to allow for advanced indexing and in-place updates
         # which matches the legacy behavior better.
+        # NOTE (C1 + F-C1b): when ``self.device`` is not ``None`` we allocate
+        # every tensor directly on that device by passing ``device=`` to the
+        # ``torch.zeros(...)`` calls and the enclosing ``TensorDict``. When
+        # ``self.device`` is ``None`` the ``device=None`` kwarg matches the
+        # pre-patch implicit CPU allocation — bit-exact.
+        _dev = self.device
+        _total = capacity + (max_trajectory_length or 0)
         self._storage = TensorStorage(
             storage=TensorDict(
                 {
-                    "observation": torch.zeros((capacity + (max_trajectory_length or 0), *obs_shape), dtype=_to_torch_dtype(obs_type)),
-                    "action": torch.zeros((capacity + (max_trajectory_length or 0), *action_shape), dtype=_to_torch_dtype(action_type)),
+                    "observation": torch.zeros((_total, *obs_shape), dtype=_to_torch_dtype(obs_type), device=_dev),
+                    "action": torch.zeros((_total, *action_shape), dtype=_to_torch_dtype(action_type), device=_dev),
                     "next": {
-                        "observation": torch.zeros((capacity + (max_trajectory_length or 0), *obs_shape), dtype=_to_torch_dtype(obs_type)),
-                        "reward": torch.zeros((capacity + (max_trajectory_length or 0), 1), dtype=_to_torch_dtype(reward_type)),
-                        "terminated": torch.zeros((capacity + (max_trajectory_length or 0), 1), dtype=torch.bool),
-                        "truncated": torch.zeros((capacity + (max_trajectory_length or 0), 1), dtype=torch.bool),
+                        "observation": torch.zeros((_total, *obs_shape), dtype=_to_torch_dtype(obs_type), device=_dev),
+                        "reward": torch.zeros((_total, 1), dtype=_to_torch_dtype(reward_type), device=_dev),
+                        "terminated": torch.zeros((_total, 1), dtype=torch.bool, device=_dev),
+                        "truncated": torch.zeros((_total, 1), dtype=torch.bool, device=_dev),
                     },
                 },
-                batch_size=[capacity + (max_trajectory_length or 0)],
+                batch_size=[_total],
+                device=_dev,
             )
         )
         # NOTE (F-C0-sampler): use ``SamplerWithoutReplacement`` to match
@@ -661,11 +685,14 @@ class ReplayBuffer:
     ):
         """Adds a transition to the replay buffer.
 
-        Accepts both numpy arrays and torch tensors.
+        Accepts both numpy arrays and torch tensors (including CUDA
+        tensors — mirrors the `add_batch(...)` tensor-type guard so the
+        C1/F-C1b device-resident storage path does not trip on
+        `np.asarray(<cuda tensor>)`).
         """
-        obs = torch.as_tensor(np.asarray(obs))
-        action = torch.as_tensor(np.asarray(action))
-        next_obs = torch.as_tensor(np.asarray(next_obs))
+        obs = obs if isinstance(obs, torch.Tensor) else torch.as_tensor(np.asarray(obs))
+        action = action if isinstance(action, torch.Tensor) else torch.as_tensor(np.asarray(action))
+        next_obs = next_obs if isinstance(next_obs, torch.Tensor) else torch.as_tensor(np.asarray(next_obs))
         reward_t = torch.tensor([reward], dtype=_to_torch_dtype(self.reward_type))
         terminated_t = torch.tensor([terminated], dtype=torch.bool)
         truncated_t = torch.tensor([truncated], dtype=torch.bool)
@@ -683,6 +710,11 @@ class ReplayBuffer:
             },
             batch_size=[1],
         )
+        # C1/F-C1b: align source TensorDict with storage device so the
+        # per-sample `__setitem__` below does not silently fall back to
+        # a CPU copy path.
+        if self.device is not None:
+            td = td.to(self.device)
         self._storage[int(self.cur_idx)] = td[0]
         if self.stores_trajectories:
             self._trajectory_bookkeeping(bool(terminated or truncated))
