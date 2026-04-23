@@ -7,14 +7,14 @@
 
 # MBRL-Lib (RedLeader962 fork)
 
+> Fork improvements include support for Tensordict and TorchRL replay-buffer, PyTorch-Lightning, latest hydra versions and more.
+> 
 ``mbrl`` is a toolbox for facilitating development of 
 Model-Based Reinforcement Learning algorithms. It provides easily interchangeable 
 modeling and planning components, and a set of utility functions that allow writing
 model-based RL algorithms with only a few lines of code. 
 
-Fork improvements include support for Tensordict and TorchRL replay-buffer, PyTorch-Lightning, latest hydra versions and more.
-
-See also our companion [paper](https://arxiv.org/abs/2104.10159). 
+See also the original companion [paper](https://arxiv.org/abs/2104.10159). 
 
 ## Getting Started
 
@@ -67,7 +67,7 @@ default configurations with the best hyperparameter values we have found so far
 for each combination of algorithm and environment. You can run training
 by passing the desired override option via command line. 
 For example, to run MBPO on the [Gymnasium](https://github.com/Farama-Foundation/Gymnasium/) version of HalfCheetah, you should call
-```python
+```shell
 python -m mbrl.examples.main algorithm=mbpo overrides=mbpo_halfcheetah 
 ```
 By default, all algorithms will save results in a csv file called `results.csv`,
@@ -166,7 +166,7 @@ a trajectory optimizer agent on the true environment using Python's
   ![Control Half-Cheetah True Dynamics](http://raw.githubusercontent.com/facebookresearch/mbrl-lib/main/docs/resources/halfcheetah-break.gif)
   <br>
   <br>
-* [``TrainingBrowser``](training_browser.py): This script launches a lightweight
+* [``TrainingBrowser``](mbrl/diagnostics/training_browser.py): This script launches a lightweight
 training browser for plotting rewards obtained after training runs 
   (as long as the runs use our logger). 
   The browser allows aggregating multiple runs and displaying mean/std, 
@@ -178,7 +178,7 @@ training browser for plotting rewards obtained after training runs
 
 Note that, except for the training browser, all the tools above require Mujoco 
 installation and are specific to models of type 
-[``OneDimTransitionRewardModel``](../models/one_dim_tr_model.py).
+[``OneDimTransitionRewardModel``](mbrl/models/one_dim_tr_model.py).
 We are planning to extend this in the future; if you have useful suggestions
 don't hesitate to raise an issue or submit a pull request!
 
