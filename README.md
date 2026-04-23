@@ -5,7 +5,8 @@
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
  
 
-# MBRL-Lib (RedLeader962 fork)
+# Modernized-MBRL-Lib (M2BRL-Lib)
+A fork of the original Facebook Research MBRL-Lib
 
 > Fork improvements include support for Tensordict and TorchRL replay-buffer, PyTorch-Lightning, latest hydra versions and more.
 > 
