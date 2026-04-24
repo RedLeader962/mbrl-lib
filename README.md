@@ -1,6 +1,6 @@
 [//]: # ([![PyPi Version]&#40;https://img.shields.io/pypi/v/mbrl&#41;]&#40;https://pypi.org/project/mbrl/&#41;)
-[![Main](https://github.com/facebookresearch/mbrl-lib/workflows/CI/badge.svg)](https://github.com/facebookresearch/mbrl-lib/actions?query=workflow%3ACI)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/facebookresearch/mbrl-lib/tree/main/LICENSE)
+[![Main](https://github.com/RedLeader962/mbrl-lib/workflows/CI/badge.svg)](https://github.com/RedLeader962/mbrl-lib/actions?query=workflow%3ACI)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/RedLeader962/mbrl-lib/tree/main/LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/release/python-360/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
  
@@ -47,7 +47,7 @@ And test it by running the following from the root folder of the repository
 
 
 ### Basic example
-As a starting point, check out our [tutorial notebook](https://github.com/facebookresearch/mbrl-lib/tree/main/notebooks/pets_example.ipynb) 
+As a starting point, check out our [tutorial notebook](https://github.com/RedLeader962/mbrl-lib/tree/main/notebooks/pets_example.ipynb) 
 on how to write the PETS algorithm 
 ([Chua et al., NeurIPS 2018](https://arxiv.org/pdf/1805.12114.pdf)) 
 using our toolbox, and running it on a continuous version of the cartpole 
@@ -56,17 +56,17 @@ environment.
 ## Provided algorithm implementations
 MBRL-Lib provides implementations of popular MBRL algorithms 
 as examples of how to use this library. You can find them in the 
-[mbrl/algorithms](https://github.com/facebookresearch/mbrl-lib/tree/main/mbrl/algorithms) folder. Currently, we have implemented
-[PETS](https://github.com/facebookresearch/mbrl-lib/tree/main/mbrl/algorithms/pets.py),
-[MBPO](https://github.com/facebookresearch/mbrl-lib/tree/main/mbrl/algorithms/mbpo.py),
-[PlaNet](https://github.com/facebookresearch/mbrl-lib/tree/main/mbrl/algorithms/planet.py), 
+[mbrl/algorithms](https://github.com/RedLeader962/mbrl-lib/tree/main/mbrl/algorithms) folder. Currently, we have implemented
+[PETS](https://github.com/RedLeader962/mbrl-lib/tree/main/mbrl/algorithms/pets.py),
+[MBPO](https://github.com/RedLeader962/mbrl-lib/tree/main/mbrl/algorithms/mbpo.py),
+[PlaNet](https://github.com/RedLeader962/mbrl-lib/tree/main/mbrl/algorithms/planet.py), 
 we plan to keep increasing this list in the future.
 
 The implementations rely on [Hydra](https://github.com/facebookresearch/hydra) 
 to handle configuration. You can see the configuration files in 
-[this](https://github.com/facebookresearch/mbrl-lib/tree/main/mbrl/examples/conf) 
+[this](https://github.com/RedLeader962/mbrl-lib/tree/main/mbrl/examples/conf) 
 folder. 
-The [overrides](https://github.com/facebookresearch/mbrl-lib/tree/main/mbrl/examples/conf/overrides) 
+The [overrides](https://github.com/RedLeader962/mbrl-lib/tree/main/mbrl/examples/conf/overrides) 
 subfolder contains
 environment specific configurations for each environment, overriding the 
 default configurations with the best hyperparameter values we have found so far 
@@ -89,15 +89,15 @@ such as the type of dynamics model
 (e.g., `dynamics_model=basic_ensemble`), or the number of models in the ensemble via configuration override 
 (e.g., `++dynamics_model.model.ensemble_size=some-number`). To learn more about
 all the available options, take a look at the provided 
-[configuration files](https://github.com/facebookresearch/mbrl-lib/tree/main/mbrl/examples/conf). 
+[configuration files](https://github.com/RedLeader962/mbrl-lib/tree/main/mbrl/examples/conf). 
 
 ## Supported environments
 Our example configurations are largely based on [Mujoco](https://mujoco.org/), but
 our library components (and algorithms) are compatible with any environment that follows
 the standard [Gymnasium](https://github.com/Farama-Foundation/Gymnasium/) syntax. You can try our utilities in other environments 
 by creating your own entry script and Hydra configuration, using our default entry 
-[`main.py`](https://github.com/facebookresearch/mbrl-lib/blob/main/mbrl/examples/main.py) as guiding template. 
-See also the example [override](https://github.com/facebookresearch/mbrl-lib/tree/main/mbrl/examples/conf/overrides)
+[`main.py`](https://github.com/RedLeader962/mbrl-lib/blob/main/mbrl/examples/main.py) as guiding template. 
+See also the example [override](https://github.com/RedLeader962/mbrl-lib/tree/main/mbrl/examples/conf/overrides)
 configurations. 
 
 Without any modifications, our provided `main.py` can be used to launch experiments with the following environments:
@@ -113,7 +113,7 @@ You can test your Mujoco and PyBullet installations by running
 
 To specify the environment to use for `main.py`, there are two possibilities:
 
-  * **Preferred way**: Use a Hydra dictionary to specify arguments for your env constructor. See [example](https://github.com/facebookresearch/mbrl-lib/blob/main/mbrl/examples/conf/overrides/planet_cartpole_balance.yaml#L4).
+  * **Preferred way**: Use a Hydra dictionary to specify arguments for your env constructor. See [example](https://github.com/RedLeader962/mbrl-lib/blob/main/mbrl/examples/conf/overrides/planet_cartpole_balance.yaml#L4).
   * Less flexible alternative: A single string with the following syntax:
       - `mujoco-gym`: `"gym___<env-name>"`, where `env-name` is the name of the environment in Gymnasium (e.g., "HalfCheetah-v2").
       - `dm_control`: `"dmcontrol___<domain>--<task>`, where domain/task are defined as in DMControl (e.g., "cheetah--run").
@@ -121,7 +121,7 @@ To specify the environment to use for `main.py`, there are two possibilities:
 
 ## Visualization and diagnostics tools
 Our library also contains a set of 
-[diagnostics](https://github.com/facebookresearch/mbrl-lib/tree/main/mbrl/diagnostics) tools, meant to facilitate 
+[diagnostics](https://github.com/RedLeader962/mbrl-lib/tree/main/mbrl/diagnostics) tools, meant to facilitate 
 development and debugging of models and controllers. With the exception of the CPU-controller, which also supports 
 PyBullet, these currently require a Mujoco installation, but we are planning to add support for other environments 
 and extensions in the future. Currently, the following tools are provided:
@@ -140,7 +140,7 @@ assess model predictions over a rolling horizon. Specifically, it runs a
   of pre-trained MBPO policy on Inverted Pendulum environment.
   \
   \
-  ![Example of Visualizer](http://raw.githubusercontent.com/facebookresearch/mbrl-lib/main/docs/resources/inv_pendulum_mbpo_vis.gif)
+  ![Example of Visualizer](http://raw.githubusercontent.com/RedLeader962/mbrl-lib/main/docs/resources/inv_pendulum_mbpo_vis.gif)
   <br>
   <br>
 * ``DatasetEvaluator``: Loads a pre-trained model and a dataset (can be loaded from separate directories), 
@@ -150,7 +150,7 @@ assess model predictions over a rolling horizon. Specifically, it runs a
   mean prediction as well as the individual predictions of each ensemble member.
   \
   \
-  ![Example of DatasetEvaluator](http://raw.githubusercontent.com/facebookresearch/mbrl-lib/main/docs/resources/dataset_evaluator.png)
+  ![Example of DatasetEvaluator](http://raw.githubusercontent.com/RedLeader962/mbrl-lib/main/docs/resources/dataset_evaluator.png)
   <br>
   <br>
 * ``FineTuner``: Can be used to train a model on a dataset produced by a given agent/controller. 
@@ -166,10 +166,10 @@ a trajectory optimizer agent on the true environment using Python's
   a video if the ``render`` argument is passed. Below is an example on 
   HalfCheetah-v2 using CEM for trajectory optimization. To specify the environment,
   follow the single string syntax described 
-  [here](https://github.com/facebookresearch/mbrl-lib/blob/main/README.md#supported-environments).
+  [here](https://github.com/RedLeader962/mbrl-lib/blob/main/README.md#supported-environments).
   \
   \
-  ![Control Half-Cheetah True Dynamics](http://raw.githubusercontent.com/facebookresearch/mbrl-lib/main/docs/resources/halfcheetah-break.gif)
+  ![Control Half-Cheetah True Dynamics](http://raw.githubusercontent.com/RedLeader962/mbrl-lib/main/docs/resources/halfcheetah-break.gif)
   <br>
   <br>
 * [``TrainingBrowser``](mbrl/diagnostics/training_browser.py): This script launches a lightweight
@@ -180,7 +180,7 @@ training browser for plotting rewards obtained after training runs
   can be edited in the pane at the bottom left. Requires installing `PyQt5`. 
   Thanks to [a3ahmad](https://github.com/a3ahmad) for the contribution!
 
-  ![Training Browser Example](http://raw.githubusercontent.com/facebookresearch/mbrl-lib/main/docs/resources/training-browser-example.png)
+  ![Training Browser Example](http://raw.githubusercontent.com/RedLeader962/mbrl-lib/main/docs/resources/training-browser-example.png)
 
 Note that, except for the training browser, all the tools above require Mujoco 
 installation and are specific to models of type 
@@ -196,7 +196,7 @@ Below are some community-contributed examples:
 * Using HuggingFace Hub Integration for saving and loading models: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1Awp4sSGFgz8nARyfonBGsLrgRWrbqChx?usp=sharing#scrollTo=SX1JYR_bJNWf)
 
 ## Documentation 
-Please check out our **[documentation](https://facebookresearch.github.io/mbrl-lib/)** 
+Please check out the original **[documentation](https://facebookresearch.github.io/mbrl-lib/)** 
 and don't hesitate to raise issues or contribute if anything is unclear!
 
 ## License
@@ -206,7 +206,7 @@ additional details about it. See also our
 [Privacy Policy](https://opensource.facebook.com/legal/privacy).
 
 ## Citing
-If you use this project in your research, please cite the our repository i.e. `https://github.com/RedLeader962/mbrl-lib` and dont forget the original paper:
+If you use this project in your research, please cite our repository i.e. `https://github.com/RedLeader962/mbrl-lib` and don't forget to cite the original paper:
 
 ```BibTeX
 @Article{Pineda2021MBRL,

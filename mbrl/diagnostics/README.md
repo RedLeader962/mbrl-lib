@@ -17,7 +17,7 @@ assess model predictions over a rolling horizon. Specifically, it runs a
   of pre-trained MBPO policy on Inverted Pendulum environment.
   \
   \
-  ![Example of Visualizer](http://raw.githubusercontent.com/facebookresearch/mbrl-lib/main/docs/resources/inv_pendulum_mbpo_vis.gif)
+  ![Example of Visualizer](http://raw.githubusercontent.com/RedLeader962/mbrl-lib/main/docs/resources/inv_pendulum_mbpo_vis.gif)
   <br>
   <br>
 * ``DatasetEvaluator``: Loads a pre-trained model and a dataset (can be loaded from separate directories), 
@@ -27,7 +27,7 @@ assess model predictions over a rolling horizon. Specifically, it runs a
   mean prediction as well as the individual predictions of each ensemble member.
   \
   \
-  ![Example of DatasetEvaluator](http://raw.githubusercontent.com/facebookresearch/mbrl-lib/main/docs/resources/dataset_evaluator.png)
+  ![Example of DatasetEvaluator](http://raw.githubusercontent.com/RedLeader962/mbrl-lib/main/docs/resources/dataset_evaluator.png)
   <br>
   <br>
 * ``FineTuner``: Can be used to train a model on a dataset produced by a given agent/controller. 
@@ -43,10 +43,10 @@ a trajectory optimizer agent on the true environment using Python's
   a video if the ``render`` argument is passed. Below is an example on 
   HalfCheetah-v2 using CEM for trajectory optimization. To specify the environment,
   follow the single string syntax described 
-  [here](https://github.com/facebookresearch/mbrl-lib/blob/main/README.md#supported-environments).
+  [here](https://github.com/RedLeader962/mbrl-lib/blob/main/README.md#supported-environments).
   \
   \
-  ![Control Half-Cheetah True Dynamics](http://raw.githubusercontent.com/facebookresearch/mbrl-lib/main/docs/resources/halfcheetah-break.gif)
+  ![Control Half-Cheetah True Dynamics](http://raw.githubusercontent.com/RedLeader962/mbrl-lib/main/docs/resources/halfcheetah-break.gif)
   <br>
   <br>
 * [``TrainingBrowser``](training_browser.py): This script launches a lightweight
@@ -58,7 +58,7 @@ training browser for plotting rewards obtained after training runs
   Thanks to [a3ahmad](https://github.com/a3ahmad) for the contribution.
   \
   \
-  ![Training Browser Example](http://raw.githubusercontent.com/facebookresearch/mbrl-lib/main/docs/resources/training-browser-example.png)
+  ![Training Browser Example](http://raw.githubusercontent.com/RedLeader962/mbrl-lib/main/docs/resources/training-browser-example.png)
 
 Note that, except for the training browser and the CPU-controller, all the tools above require Mujoco 
 installation and are specific to models of type 

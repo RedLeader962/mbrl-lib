@@ -1,8 +1,8 @@
 The `mbrl.examples` package can be used to train models using our example MBRL algorithm
 implementations. We currently have examples for 
-[PETS](https://github.com/facebookresearch/mbrl-lib/blob/main/mbrl/algorithms/pets.py), 
-[MBPO](https://github.com/facebookresearch/mbrl-lib/blob/main/mbrl/algorithms/mbpo.py), 
-and [PlaNet](https://github.com/facebookresearch/mbrl-lib/blob/main/mbrl/algorithms/planet.py).
+[PETS](https://github.com/RedLeader962/mbrl-lib/blob/main/mbrl/algorithms/pets.py), 
+[MBPO](https://github.com/RedLeader962/mbrl-lib/blob/main/mbrl/algorithms/mbpo.py), 
+and [PlaNet](https://github.com/RedLeader962/mbrl-lib/blob/main/mbrl/algorithms/planet.py).
 
 The examples can be run by typing
 
@@ -13,7 +13,7 @@ python -m mbrl.examples.main ${hydra_options}
 where `${hydra_options}` is any set of 
 [Hydra](https://hydra.cc/docs/tutorials/basic/your_first_app/simple_cli) overrides. To see the
 available overrides, take a look at our 
-[configuration files](https://github.com/facebookresearch/mbrl-lib/tree/main/mbrl/examples/conf).
+[configuration files](https://github.com/RedLeader962/mbrl-lib/tree/main/mbrl/examples/conf).
 The config files are generally structured in 4 groups:
 * `algorithm`: includes options specific to each algorithm that typically don't 
   vary across experiments.
@@ -25,7 +25,7 @@ The config files are generally structured in 4 groups:
 like MBPO, ignore this.
   
 For example, to run MBPO on `gym`'s cartpole environment using the standard ensemble version of
-[GaussianMLP](https://github.com/facebookresearch/mbrl-lib/blob/main/mbrl/models/gaussian_mlp.py),
+[GaussianMLP](https://github.com/RedLeader962/mbrl-lib/blob/main/mbrl/models/gaussian_mlp.py),
 you can type
 
 ```bash
