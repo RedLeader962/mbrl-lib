@@ -6,10 +6,15 @@
  
 
 # Modernized-MBRL-Lib (M2BRL-Lib)
-A fork of the original Facebook Research MBRL-Lib
 
-> Fork improvements include support for Tensordict and TorchRL replay-buffer, PyTorch-Lightning, latest hydra versions and more.
-> 
+---
+
+**A fork of the original Facebook Research MBRL-Libn**
+
+Fork improvements include support for Tensordict and TorchRL replay-buffer, PyTorch-Lightning, latest hydra versions and more.
+
+---
+
 ``mbrl`` is a toolbox for facilitating development of 
 Model-Based Reinforcement Learning algorithms. It provides easily interchangeable 
 modeling and planning components, and a set of utility functions that allow writing
@@ -32,7 +37,7 @@ To install the latest stable version, run
 If you are interested in modifying the library, clone the repository and set up 
 a development environment as follows
 
-    git clone https://github.com/facebookresearch/mbrl-lib.git
+    git clone https://github.com/RedLeader962/mbrl-lib.git
     pip install -e ".[dev]"
 
 And test it by running the following from the root folder of the repository
@@ -201,7 +206,7 @@ additional details about it. See also our
 [Privacy Policy](https://opensource.facebook.com/legal/privacy).
 
 ## Citing
-If you use this project in your research, please cite:
+If you use this project in your research, please cite the our repository i.e. `https://github.com/RedLeader962/mbrl-lib` and dont forget the original paper:
 
 ```BibTeX
 @Article{Pineda2021MBRL,
