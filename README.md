@@ -9,7 +9,7 @@
 
 ---
 
-**A fork of the original Facebook Research MBRL-Libn**
+**A fork of the original Facebook Research MBRL-Lib**
 
 Fork improvements include support for Tensordict and TorchRL replay-buffer, PyTorch-Lightning, latest hydra versions and more.
 
