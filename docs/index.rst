@@ -25,7 +25,7 @@ and set up a development environment, as follows
 
 .. code-block:: bash
 
-    git clone https://github.com/facebookresearch/mbrl-lib.git
+    git clone https://github.com/RedLeader962/mbrl-lib.git
     cd mbrl-lib
     pip install -e ".[dev]"
 
@@ -40,7 +40,7 @@ And test it by running
 Basic Example
 -------------
 As a starting point, check out our
-`tutorial notebook <https://github.com/facebookresearch/mbrl-lib/blob/main/notebooks/pets_example.ipynb>`_
+`tutorial notebook <https://github.com/RedLeader962/mbrl-lib/blob/main/notebooks/pets_example.ipynb>`_
 on how to write the PETS algorithm
 `(Chua et al., NeurIPS 2018) <https://arxiv.org/pdf/1805.12114.pdf>`_
 using our toolbox, and running it on a continuous version of the cartpole

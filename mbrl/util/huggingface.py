@@ -140,7 +140,7 @@ def _generate_model_card(
             # **{model_name}** Agent playing **{env_id}**
             This is a trained model of a **{model_name}** agent
             playing **{env_id}**
-            using [MBRL-Lib](https://github.com/facebookresearch/mbrl-lib).
+            using [MBRL-Lib](https://github.com/RedLeader962/mbrl-lib).
 
             ## Usage (with MBRL-Lib)
             TODO: Add your code
@@ -273,7 +273,7 @@ def save_video(
             )
             print(
                 "Please open an issue at "
-                "https://github.com/facebookresearch/mbrl-lib/issues"
+                "https://github.com/RedLeader962/mbrl-lib/issues"
             )
     return mean_reward, std_reward
 
