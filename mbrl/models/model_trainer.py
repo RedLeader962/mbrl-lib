@@ -49,7 +49,7 @@ class _LegacyCallback(pl.Callback):
     """Bridge between Lightning training events and the legacy callback system.
 
     This callback collects per-epoch training losses and validation scores,
-    invokes the user-provided ``legacy_callback`` and ``batch_callback`` at the
+    invokes the user-provided ``legacy_callback`` and ``legacy_batch_callback`` at the
     appropriate times, and logs metrics via the mbrl :class:`Logger`.
 
     It also implements the legacy best-weight tracking logic using
@@ -70,7 +70,7 @@ class _LegacyCallback(pl.Callback):
     ):
         self.model_trainer = model_trainer
         self.legacy_callback = legacy_callback
-        self.batch_callback = batch_callback
+        self.legacy_batch_callback = batch_callback
         self.logger = logger
         self.evaluate = evaluate
         self.improvement_threshold = improvement_threshold
@@ -92,10 +92,16 @@ class _LegacyCallback(pl.Callback):
         # Toggle bootstrap off for validation, matching legacy evaluate() behavior
         val_dl = trainer.val_dataloaders
         if val_dl is not None:
-            ds = val_dl.dataset if hasattr(val_dl, 'dataset') else None
-            if ds is not None and hasattr(ds, 'it') and isinstance(ds.it, BootstrapIterator):
+            ds = val_dl.dataset if hasattr(val_dl, "dataset") else None
+            if (
+                ds is not None
+                and hasattr(ds, "it")
+                and isinstance(ds.it, BootstrapIterator)
+            ):
                 ds.it.toggle_bootstrap()
                 self._bootstrap_was_toggled = True
+
+        return None
 
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
@@ -105,33 +111,37 @@ class _LegacyCallback(pl.Callback):
         if isinstance(outputs, dict):
             val_score = outputs.get("val_score")
 
-        if self.batch_callback:
+        if self.legacy_batch_callback:
             score = outputs
             meta = {}
             if isinstance(outputs, dict):
                 score = outputs.get("score", outputs)
                 meta = {
-                    k: v
-                    for k, v in outputs.items()
-                    if k not in ["score", "val_score"]
+                    k: v for k, v in outputs.items() if k not in ["score", "val_score"]
                 }
 
             if isinstance(score, torch.Tensor):
                 score = score.detach().cpu().numpy()
 
             meta["score"] = score
-            self.batch_callback(trainer.current_epoch, score, meta, "eval")
+            self.legacy_batch_callback(trainer.current_epoch, score, meta, "eval")
 
         if val_score is not None:
             self._epoch_val_scores.append(val_score.detach().cpu())
+
+        return None
 
     def on_validation_epoch_end(self, trainer, pl_module):
         # Always restore bootstrap if it was toggled, regardless of scores
         if self._bootstrap_was_toggled:
             val_dl = trainer.val_dataloaders
             if val_dl is not None:
-                ds = val_dl.dataset if hasattr(val_dl, 'dataset') else None
-                if ds is not None and hasattr(ds, 'it') and isinstance(ds.it, BootstrapIterator):
+                ds = val_dl.dataset if hasattr(val_dl, "dataset") else None
+                if (
+                    ds is not None
+                    and hasattr(ds, "it")
+                    and isinstance(ds.it, BootstrapIterator)
+                ):
                     ds.it.toggle_bootstrap()
             self._bootstrap_was_toggled = False
 
@@ -145,7 +155,9 @@ class _LegacyCallback(pl.Callback):
             epoch_avg_scores = all_scores.mean(dim=(1, 2))
         elif first.ndim == 2:  # Non-ensemble (B, Od)
             all_scores = torch.cat(self._epoch_val_scores, dim=0)
-            epoch_avg_scores = all_scores.mean(dim=0 if all_scores.ndim == 1 else (0, 1)).unsqueeze(0)
+            epoch_avg_scores = all_scores.mean(
+                dim=0 if all_scores.ndim == 1 else (0, 1)
+            ).unsqueeze(0)
         else:
             epoch_avg_scores = torch.stack(self._epoch_val_scores).mean().unsqueeze(0)
 
@@ -164,11 +176,13 @@ class _LegacyCallback(pl.Callback):
         self.current_epoch_val_score = epoch_avg_scores
         self._epoch_val_scores = []
 
+        return None
+
     # ------------------------------------------------------------------ #
     #  Training batch callback
     # ------------------------------------------------------------------ #
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if self.batch_callback:
+        if self.legacy_batch_callback:
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs
             meta = (
                 {k: v for k, v in outputs.items() if k != "loss"}
@@ -180,7 +194,9 @@ class _LegacyCallback(pl.Callback):
                 loss = loss.detach().cpu().item()
 
             meta["loss"] = loss
-            self.batch_callback(trainer.current_epoch, loss, meta, "train")
+            self.legacy_batch_callback(trainer.current_epoch, loss, meta, "train")
+
+        return None
 
     # ------------------------------------------------------------------ #
     #  Gradient snapshot – capture before Lightning zeros them
@@ -203,6 +219,8 @@ class _LegacyCallback(pl.Callback):
                 else:
                     param._last_grad = param.grad.clone()  # First-time allocation only
 
+        return None
+
     # ------------------------------------------------------------------ #
     #  End-of-epoch logging and legacy callback
     # ------------------------------------------------------------------ #
@@ -223,7 +241,11 @@ class _LegacyCallback(pl.Callback):
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
 
-        eval_score = self.current_epoch_val_score if self.current_epoch_val_score is not None else self.best_val_score
+        eval_score = (
+            self.current_epoch_val_score
+            if self.current_epoch_val_score is not None
+            else self.best_val_score
+        )
         best_val_score = self.best_val_score
 
         if self.legacy_callback:
@@ -241,14 +263,18 @@ class _LegacyCallback(pl.Callback):
                 "train_iteration": self.model_trainer._train_iteration,
                 "epoch": trainer.current_epoch,
                 "train_dataset_size": len(trainer.train_dataloader.dataset.it),
-                "val_dataset_size": len(trainer.val_dataloaders.dataset.it)
-                if trainer.val_dataloaders
-                else 0,
+                "val_dataset_size": (
+                    len(trainer.val_dataloaders.dataset.it)
+                    if trainer.val_dataloaders
+                    else 0
+                ),
                 "model_loss": train_loss,
                 "model_val_score": val_loss,
-                "model_best_val_score": best_val_score.mean().item()
-                if best_val_score is not None
-                else val_loss,
+                "model_best_val_score": (
+                    best_val_score.mean().item()
+                    if best_val_score is not None
+                    else val_loss
+                ),
             }
 
             for k, v in metrics.items():
@@ -261,13 +287,19 @@ class _LegacyCallback(pl.Callback):
             self.logger._dump("model_train")
 
         # Safety net: force-restore bootstrap if validation didn't clean up
-        if hasattr(self, '_bootstrap_was_toggled') and self._bootstrap_was_toggled:
+        if hasattr(self, "_bootstrap_was_toggled") and self._bootstrap_was_toggled:
             val_dl = trainer.val_dataloaders
             if val_dl is not None:
-                ds = val_dl.dataset if hasattr(val_dl, 'dataset') else None
-                if ds is not None and hasattr(ds, 'it') and isinstance(ds.it, BootstrapIterator):
+                ds = val_dl.dataset if hasattr(val_dl, "dataset") else None
+                if (
+                    ds is not None
+                    and hasattr(ds, "it")
+                    and isinstance(ds.it, BootstrapIterator)
+                ):
                     ds.it.toggle_bootstrap()
             self._bootstrap_was_toggled = False
+
+        return None
 
 
 class ModelTrainer:
@@ -344,9 +376,7 @@ class ModelTrainer:
         # ``__init__`` time for lazily-built models).
         self._dataloader_num_workers: int = int(dataloader_num_workers)
         self._dataloader_pin_memory: bool = bool(dataloader_pin_memory)
-        self._dataloader_persistent_workers: bool = bool(
-            dataloader_persistent_workers
-        )
+        self._dataloader_persistent_workers: bool = bool(dataloader_persistent_workers)
         self._dataloader_prefetch_factor: Optional[int] = (
             int(dataloader_prefetch_factor)
             if dataloader_prefetch_factor is not None
@@ -410,11 +440,11 @@ class ModelTrainer:
         if not self._model_summary_printed:
             model = self.model
             # print(model)
-            if hasattr(model, 'model'):
+            if hasattr(model, "model"):
                 # Show the model that learns something instead of the OneDTransitionRewardModel wrapper
                 model = self.model.model
 
-            if hasattr(model, 'description'):
+            if hasattr(model, "description"):
                 print(model.description)
 
             summary = pl_summarize(model, max_depth=1)
@@ -514,10 +544,7 @@ class ModelTrainer:
         # non-CUDA device (CPU / MPS) so a cfg flag accidentally left
         # on does not crash or warn on those runners.
         _num_workers = self._dataloader_num_workers
-        _pin_memory = (
-            self._dataloader_pin_memory
-            and self.model.device.type == "cuda"
-        )
+        _pin_memory = self._dataloader_pin_memory and self.model.device.type == "cuda"
         _dl_kwargs = {
             "batch_size": None,
             "num_workers": _num_workers,
@@ -529,18 +556,12 @@ class ModelTrainer:
             if self._dataloader_persistent_workers:
                 _dl_kwargs["persistent_workers"] = True
             if self._dataloader_prefetch_factor is not None:
-                _dl_kwargs["prefetch_factor"] = (
-                    self._dataloader_prefetch_factor
-                )
-        train_loader = DataLoader(
-            _IteratorDataset(dataset_train), **_dl_kwargs
-        )
+                _dl_kwargs["prefetch_factor"] = self._dataloader_prefetch_factor
+        train_loader = DataLoader(_IteratorDataset(dataset_train), **_dl_kwargs)
         val_loader = None
         if evaluate:
             eval_dataset = dataset_train if dataset_val is None else dataset_val
-            val_loader = DataLoader(
-                _IteratorDataset(eval_dataset), **_dl_kwargs
-            )
+            val_loader = DataLoader(_IteratorDataset(eval_dataset), **_dl_kwargs)
 
         # Lightning Callbacks
         callbacks = []
@@ -568,15 +589,9 @@ class ModelTrainer:
         max_epochs = num_epochs if num_epochs is not None else 1000
 
         with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", ".*GPU available but not used.*"
-            )
-            warnings.filterwarnings(
-                "ignore", ".*does not have many workers.*"
-            )
-            warnings.filterwarnings(
-                "ignore", ".*IterableDataset.*__len__.*"
-            )
+            warnings.filterwarnings("ignore", ".*GPU available but not used.*")
+            warnings.filterwarnings("ignore", ".*does not have many workers.*")
+            warnings.filterwarnings("ignore", ".*IterableDataset.*__len__.*")
 
             # Suppress Lightning's "Trainer.fit stopped: max_epochs=N
             # reached." info message that clutters ERLL progress output.
@@ -610,6 +625,7 @@ class ModelTrainer:
     def evaluate(
         self, dataset: TransitionIterator, batch_callback: Optional[Callable] = None
     ) -> torch.Tensor:
+        # (CRITICAL) ToDo: assess deprecating >> the validate method is not used anymore.
         """Evaluates the model on the validation dataset.
 
         Iterates over the dataset, one batch at a time, and calls
@@ -638,6 +654,7 @@ class ModelTrainer:
             batch_score, meta = self.model.eval_score(batch)
             batch_scores_list.append(batch_score)
             if batch_callback:
+                # (CRITICAL) ToDo: validate it is suppose to be called with four argument. Missing `epoch_index`!
                 batch_callback(batch_score.mean(), meta, "eval")
         try:
             batch_scores = torch.cat(
@@ -735,9 +752,7 @@ class ModelTrainer:
             self.model.load_state_dict(best_weights)
         if best_val_score is not None and len(best_val_score) > 1:
             num_elites = getattr(self.model, "num_elites", None)
-            if num_elites is None and isinstance(
-                self.model, OneDTransitionRewardModel
-            ):
+            if num_elites is None and isinstance(self.model, OneDTransitionRewardModel):
                 num_elites = getattr(self.model.model, "num_elites", None)
             if num_elites is not None:
                 sorted_indices = np.argsort(best_val_score.tolist())
