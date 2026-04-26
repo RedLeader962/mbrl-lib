@@ -229,6 +229,7 @@ class _LegacyCallback(pl.Callback):
         # ``param.grad`` (e.g. for gradient monitoring / histograms).
         for param in pl_module.parameters():
             if param.requires_grad and hasattr(param, "_last_grad"):
+                # (CRITICAL) ToDo: RLRP-606 fix: validate tensor are zeroed back at the end of the mbrl-lib legacy callback
                 param.grad = param._last_grad
         metrics = trainer.callback_metrics
         train_loss = metrics.get(
@@ -257,6 +258,9 @@ class _LegacyCallback(pl.Callback):
                 eval_score,
                 best_val_score,
             )
+
+        # (CRITICAL) ToDo: RLRP-606 fix: validate tensor are zeroed back at the end of the mbrl-lib legacy callback
+        self.model_trainer.optimizer.zero_grad()
 
         if self.logger:
             log_dict = {
