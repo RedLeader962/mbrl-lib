@@ -229,7 +229,6 @@ class _LegacyCallback(pl.Callback):
         # ``param.grad`` (e.g. for gradient monitoring / histograms).
         for param in pl_module.parameters():
             if param.requires_grad and hasattr(param, "_last_grad"):
-                # (CRITICAL) ToDo: RLRP-606 fix: validate tensor are zeroed back at the end of the mbrl-lib legacy callback
                 param.grad = param._last_grad
         metrics = trainer.callback_metrics
         train_loss = metrics.get(
@@ -259,7 +258,10 @@ class _LegacyCallback(pl.Callback):
                 best_val_score,
             )
 
-        # (CRITICAL) ToDo: RLRP-606 fix: validate tensor are zeroed back at the end of the mbrl-lib legacy callback
+        # RLRP-606: zero out the gradients restored above so no stale tensors
+        # survive past this hook. Lightning's own ``optimizer.zero_grad()`` is
+        # only invoked between training steps; without this call the gradients
+        # restored for the legacy callback would persist on ``param.grad``.
         self.model_trainer.optimizer.zero_grad()
 
         if self.logger:
