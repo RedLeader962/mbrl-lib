@@ -434,6 +434,77 @@ class TestQuantileGradient:
 
 
 # ------------------------------------------------------------------ #
+#  SoftWinsorizedNormalizer with soft-clip disabled (classic Winsorized)
+# ------------------------------------------------------------------ #
+class TestWinsorizedSoftClipDisabled:
+    """When ``soft_clip_iqr_mult=None`` the normalizer recovers the classic
+    ``WinsorizedNormalizer`` behavior (pure winsorized z-score, no tanh
+    compression)."""
+
+    def test_init_disabled(self):
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            4, torch.device(_DEVICE), soft_clip_iqr_mult=None
+        )
+        assert norm.soft_clip_iqr_mult is None
+
+    def test_init_disabled_no_low_value_warning(self):
+        # The low-value warning must NOT fire when soft-clip is fully disabled.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            mbrl.util.normalization.SoftWinsorizedNormalizer(
+                3, torch.device(_DEVICE), soft_clip_iqr_mult=None
+            )
+
+    def test_normalize_is_pure_winsorized_zscore(self):
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            2, torch.device(_DEVICE), soft_clip_iqr_mult=None
+        )
+        data = torch.randn(500, 2)
+        norm.update_stats(data)
+
+        query = torch.randn(20, 2) * 5.0  # include values well past any clip threshold
+        out = norm.normalize(query)
+        expected = (query - norm.winsorized_mean) / norm.winsorized_std
+        assert torch.allclose(out, expected, atol=1e-6)
+
+    def test_round_trip_extreme_values_exact(self):
+        """With soft-clip disabled the transform is exactly linear/invertible
+        even for extreme values, unlike the soft-clipped variant."""
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            3, torch.device(_DEVICE), soft_clip_iqr_mult=None
+        )
+        data = torch.randn(500, 3)
+        norm.update_stats(data)
+        extreme = norm.winsorized_mean + 50.0 * norm.winsorized_std
+        reconstructed = norm.denormalize(norm.normalize(extreme))
+        assert torch.allclose(reconstructed, extreme, atol=1e-4)
+
+    def test_clip_threshold_zeroed_when_disabled(self):
+        norm = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            3, torch.device(_DEVICE), soft_clip_iqr_mult=None
+        )
+        data = torch.randn(200, 3)
+        norm.update_stats(data)
+        assert torch.allclose(norm.clip_threshold, torch.zeros_like(norm.clip_threshold))
+
+    def test_save_load_disabled(self):
+        norm1 = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            3, torch.device(_DEVICE), soft_clip_iqr_mult=None
+        )
+        data = torch.randn(300, 3)
+        norm1.update_stats(data)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            norm1.save(pathlib.Path(tmpdir))
+            norm2 = mbrl.util.normalization.SoftWinsorizedNormalizer(
+                3, torch.device(_DEVICE), soft_clip_iqr_mult=None
+            )
+            norm2.load(pathlib.Path(tmpdir))
+        assert norm2.soft_clip_iqr_mult is None
+        query = torch.randn(10, 3)
+        assert torch.allclose(norm1.normalize(query), norm2.normalize(query), atol=1e-6)
+
+
+# ------------------------------------------------------------------ #
 #  create_normalizer factory
 # ------------------------------------------------------------------ #
 class TestCreateNormalizer:
@@ -464,6 +535,13 @@ class TestCreateNormalizer:
         assert isinstance(norm, mbrl.util.normalization.SoftWinsorizedNormalizer)
         assert norm.winsor_percentile == 0.1
         assert norm.soft_clip_iqr_mult == 2.0
+
+    def test_winsorized_soft_clip_disabled_via_factory(self):
+        norm = mbrl.util.normalization.create_normalizer(
+            "winsorized", 4, torch.device(_DEVICE), soft_clip_iqr_mult=None,
+        )
+        assert isinstance(norm, mbrl.util.normalization.SoftWinsorizedNormalizer)
+        assert norm.soft_clip_iqr_mult is None
 
     def test_unknown_type_raises(self):
         with pytest.raises(ValueError, match="Unknown normalizer_type"):

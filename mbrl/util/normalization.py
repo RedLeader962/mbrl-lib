@@ -51,6 +51,9 @@ Rule of thumb — parameter configuration:
   data).  ``3.0`` keeps ≈ ±4 σ in the identity region — a safe default.
   Reduce to ``1.5``–``2.0`` for aggressive tail compression; values below
   ``0.75`` hit the internal floor of 1.0 and trigger a warning.
+  Set to ``None`` to **disable** the tanh soft-clip stage entirely and
+  recover the classic ``WinsorizedNormalizer`` behavior (pure winsorized
+  z-score, no soft-clipping).
 
 *QuantileNormalizer*
 
@@ -446,16 +449,25 @@ class SoftWinsorizedNormalizer(Normalizer):
        time because the floor will silently override the requested
        aggressiveness.
 
+    .. note::
+       Setting ``soft_clip_iqr_mult=None`` disables the tanh soft-clip stage
+       entirely, recovering the classic ``WinsorizedNormalizer`` behavior:
+       ``normalize`` then returns the pure winsorized z-score
+       ``(x - winsorized_mean) / winsorized_std`` and ``denormalize`` is its
+       exact linear inverse.
+
     Args:
         in_size (int): the size of the data that will be normalized.
         device (torch.device): the device in which the data will reside.
         dtype (torch.dtype): the data type to use for the normalizer.
         winsor_percentile (float): the percentile for winsorization (default 0.05).
-        soft_clip_iqr_mult (float): IQR multiplier for the adaptive clip threshold
+        soft_clip_iqr_mult (float, optional): IQR multiplier for the adaptive clip threshold
             (default 3.0).  For Gaussian data the resulting threshold is approximately
             ``soft_clip_iqr_mult * 1.35`` standard deviations.  Values below ~0.75 will
             cause the internal floor of 1.0 to dominate, effectively ignoring the
             requested multiplier.
+            Pass ``None`` to **disable** the tanh soft-clip stage entirely and recover
+            the classic ``WinsorizedNormalizer`` behavior (pure winsorized z-score).
     """
 
     _STATS_FNAME = "winsorized_stats.pt"
@@ -466,7 +478,7 @@ class SoftWinsorizedNormalizer(Normalizer):
         device: torch.device,
         dtype=torch.float32,
         winsor_percentile: float = 0.05,
-        soft_clip_iqr_mult: float = 3.0,
+        soft_clip_iqr_mult: Optional[float] = 3.0,
     ):
         super().__init__()
         self.register_buffer("winsorized_mean", torch.zeros((1, in_size), dtype=dtype))
@@ -474,20 +486,24 @@ class SoftWinsorizedNormalizer(Normalizer):
         self.register_buffer("q_low", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("q_high", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("iqr", torch.ones((1, in_size), dtype=dtype))
+        # When soft-clipping is disabled (``soft_clip_iqr_mult is None``),
+        # the ``clip_threshold`` buffer is kept for save/load compatibility
+        # but is not used by ``normalize``/``denormalize``.
+        _clip_init = 0.0 if soft_clip_iqr_mult is None else soft_clip_iqr_mult
         self.register_buffer(
-            "clip_threshold", torch.full((1, in_size), soft_clip_iqr_mult, dtype=dtype)
+            "clip_threshold", torch.full((1, in_size), _clip_init, dtype=dtype)
         )
         _eps_value = 1e-14 if dtype == torch.double else 1e-5
         self.register_buffer("eps", torch.tensor(_eps_value, dtype=dtype))
         self.winsor_percentile = winsor_percentile
-        self.soft_clip_iqr_mult = soft_clip_iqr_mult
+        self.soft_clip_iqr_mult: Optional[float] = soft_clip_iqr_mult
 
         # Warn when the multiplier is so low that the internal floor (1.0)
         # will override the user's setting for Gaussian-like features.
         # For a Gaussian, IQR / sigma ≈ 1.35, so clip_t ≈ mult * 1.35.
         # The floor kicks in when mult * 1.35 < 1.0, i.e. mult < ~0.74.
         _FLOOR_WARNING_THRESHOLD = 0.75
-        if soft_clip_iqr_mult < _FLOOR_WARNING_THRESHOLD:
+        if soft_clip_iqr_mult is not None and soft_clip_iqr_mult < _FLOOR_WARNING_THRESHOLD:
             warnings.warn(
                 f"soft_clip_iqr_mult={soft_clip_iqr_mult} is very low. "
                 f"For Gaussian-like features the per-feature clip threshold "
@@ -609,14 +625,20 @@ class SoftWinsorizedNormalizer(Normalizer):
         self.winsorized_std.copy_(w_std)
 
         # Per-feature adaptive soft-clip threshold: c_i = gamma * IQR_i / sigma_i
-        clip_t = self.soft_clip_iqr_mult * iqr / w_std
+        # When ``soft_clip_iqr_mult is None`` the soft-clip stage is disabled and
+        # this normalizer behaves as a classic ``WinsorizedNormalizer`` (pure
+        # winsorized z-score, no tanh compression).
+        if self.soft_clip_iqr_mult is None:
+            self.clip_threshold.zero_()
+        else:
+            clip_t = self.soft_clip_iqr_mult * iqr / w_std
 
-        # Floor at 1.0 so the identity region always covers at least ±1 sigma.
-        # Without this floor, near-constant features (IQR ≈ 0) or very low
-        # soft_clip_iqr_mult values would cause the tanh soft-clip to compress
-        # even the core of the distribution, distorting well-behaved data.
-        clip_t = clip_t.clamp(min=1.0)
-        self.clip_threshold.copy_(clip_t)
+            # Floor at 1.0 so the identity region always covers at least ±1 sigma.
+            # Without this floor, near-constant features (IQR ≈ 0) or very low
+            # soft_clip_iqr_mult values would cause the tanh soft-clip to compress
+            # even the core of the distribution, distorting well-behaved data.
+            clip_t = clip_t.clamp(min=1.0)
+            self.clip_threshold.copy_(clip_t)
 
         return None
 
@@ -676,7 +698,10 @@ class SoftWinsorizedNormalizer(Normalizer):
             else:
                 z = torch.zeros_like(z)
 
-        result = self._soft_clip(z, self.clip_threshold.to(compute_dtype))
+        if self.soft_clip_iqr_mult is None:
+            result = z
+        else:
+            result = self._soft_clip(z, self.clip_threshold.to(compute_dtype))
         return result.to(input_dtype)
 
     @torch.compiler.disable
@@ -697,9 +722,12 @@ class SoftWinsorizedNormalizer(Normalizer):
             else self.winsorized_mean.dtype
         )
 
-        z = self._soft_clip_inverse(
-            val.to(compute_dtype), self.clip_threshold.to(compute_dtype)
-        )
+        if self.soft_clip_iqr_mult is None:
+            z = val.to(compute_dtype)
+        else:
+            z = self._soft_clip_inverse(
+                val.to(compute_dtype), self.clip_threshold.to(compute_dtype)
+            )
         result = z * self.winsorized_std.to(compute_dtype) + self.winsorized_mean.to(
             compute_dtype
         )
