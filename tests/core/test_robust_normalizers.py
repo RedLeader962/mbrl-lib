@@ -1290,3 +1290,73 @@ class TestOneDTRModelPerFeatureDimWiring:
         normed = one_d._normalize_composed_obs(batch.obs)
         recon = one_d._denormalize_composed_obs(normed)
         assert torch.allclose(recon, batch.obs, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestSoftWinsorizedCudaDevice:
+    """Regression tests for the cross-device bug reproduced on
+    JetsonAGX-Orin / Valeria HPC nodes.
+
+    Original stacktrace::
+
+        File ".../mbrl/util/normalization.py", line 961, in update_stats
+            clip_t = soft_k * iqr.to(soft_k.dtype) / w_std.to(soft_k.dtype)
+        RuntimeError: Expected all tensors to be on the same device,
+                       but found at least two devices, cuda:0 and cpu!
+
+    `update_stats` computes quantiles via ``np.quantile`` on CPU, so the
+    arithmetic that builds ``clip_threshold`` must also live on CPU even
+    when the registered buffers themselves are CUDA tensors.
+    """
+
+    def test_update_stats_on_cuda_does_not_raise_device_mismatch(self):
+        device = torch.device("cuda:0")
+        in_size = 4
+        normalizer = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            in_size=in_size,
+            device=device,
+            winsor_percentile=0.01,
+            soft_clip_iqr_mult=3.0,
+        )
+        data = torch.randn(2048, in_size, device=device)
+        # Must not raise "Expected all tensors to be on the same device".
+        normalizer.update_stats(data)
+        assert normalizer.clip_threshold.device.type == "cuda"
+        assert torch.isfinite(normalizer.clip_threshold).all()
+
+    def test_normalize_denormalize_round_trip_on_cuda(self):
+        device = torch.device("cuda:0")
+        in_size = 5
+        normalizer = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            in_size=in_size,
+            device=device,
+            winsor_percentile=0.01,
+            soft_clip_iqr_mult=3.0,
+        )
+        data = torch.randn(4096, in_size, device=device)
+        normalizer.update_stats(data)
+        normed = normalizer.normalize(data)
+        recon = normalizer.denormalize(normed)
+        assert recon.device.type == "cuda"
+        assert torch.allclose(recon, data, atol=1e-4)
+
+    def test_update_stats_on_cuda_per_feature_dim_dict(self):
+        """Mixed per-`feature_dim` config (some dims disabled) on CUDA."""
+        device = torch.device("cuda:0")
+        names = ["a", "b", "c", "d"]
+        normalizer = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            in_size=4,
+            device=device,
+            winsor_percentile={"a": 0.01, "b": 0.005, "c": 0.01, "d": 0.02},
+            soft_clip_iqr_mult={"a": 3.0, "b": None, "c": 5.0, "d": None},
+            feature_dim_names=names,
+        )
+        data = torch.randn(2048, 4, device=device)
+        normalizer.update_stats(data)
+        assert normalizer.clip_threshold.device.type == "cuda"
+        # Disabled dims must have zero threshold.
+        assert normalizer.clip_threshold[0, 1].item() == 0.0
+        assert normalizer.clip_threshold[0, 3].item() == 0.0
+        # Enabled dims have positive (>= 1.0 due to the floor) threshold.
+        assert normalizer.clip_threshold[0, 0].item() >= 1.0
+        assert normalizer.clip_threshold[0, 2].item() >= 1.0

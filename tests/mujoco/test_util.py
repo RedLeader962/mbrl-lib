@@ -58,13 +58,18 @@ def _transfer_state(env_name):
     env2.reset()
     handler.set_env_state(state, env2)
 
-def test_freeze():
+@pytest.mark.flaky(reruns=5, reruns_delay=35)
+def test_freeze_very_flaky():
     # TODO(Rohan138): These four mujoco envs are very flaky.
-    # _freeze_mujoco_gym_env("gym___Ant-v4")
-    # _freeze_mujoco_gym_env("ant_truncated_obs")
-    # _freeze_mujoco_gym_env("gym___HalfCheetah-v4")
-    # _freeze_mujoco_gym_env("gym___HumanoidStandup-v4")
-    _freeze_mujoco_gym_env("gym___Hopper-v4")
+    _freeze_mujoco_gym_env("gym___Ant-v4")                 
+    _freeze_mujoco_gym_env("ant_truncated_obs")            
+    _freeze_mujoco_gym_env("gym___Hopper-v4")              
+
+@pytest.mark.skip(reason="Those environments are extra flaky. Will require investigation.")
+@pytest.mark.flaky(reruns=5, reruns_delay=35)
+def test_freeze_extra_flaky():
+    _freeze_mujoco_gym_env("gym___HalfCheetah-v4")
+    _freeze_mujoco_gym_env("gym___HumanoidStandup-v4")
     _freeze_mujoco_gym_env("gym___Humanoid-v4")
 
 

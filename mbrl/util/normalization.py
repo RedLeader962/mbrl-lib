@@ -955,16 +955,31 @@ class SoftWinsorizedNormalizer(Normalizer):
         # the soft-clip stage is disabled on that dim and the corresponding
         # ``clip_threshold`` entry is left at 0 (consumed only inside the
         # masked branch; see ``normalize`` for the branchless hot path).
-        mask = self._soft_clip_active_mask.to(self.clip_threshold.device)
+        # NOTE (device safety): all upstream quantile/mean/std tensors
+        # (`iqr`, `w_std`) live on CPU because the quantile path uses
+        # ``np.quantile`` (see top-of-method rationale).  We must therefore
+        # build ``clip_t`` on CPU as well — pulling ``_soft_clip_iqr_mult_per_dim``
+        # and ``_soft_clip_active_mask`` to CPU here — otherwise the
+        # multiplication mixes CUDA and CPU tensors and raises
+        # ``RuntimeError: Expected all tensors to be on the same device``
+        # on GPU runs (observed on JetsonAGX-Orin and Valeria HPC nodes).
+        # The final ``self.clip_threshold.copy_(...)`` handles the
+        # cross-device transfer back to the registered-buffer device.
+        mask_cpu = self._soft_clip_active_mask.detach().cpu()
         # (1, in_size) — broadcast safe.
-        soft_k = self._soft_clip_iqr_mult_per_dim.to(self.clip_threshold.dtype).view(1, -1)
+        soft_k = (
+            self._soft_clip_iqr_mult_per_dim.detach()
+            .cpu()
+            .to(self.clip_threshold.dtype)
+            .view(1, -1)
+        )
         clip_t = soft_k * iqr.to(soft_k.dtype) / w_std.to(soft_k.dtype)
         # Floor at 1.0 so the identity region always covers at least ±1
         # sigma — unchanged semantics from the pre-per-dim API.
         clip_t = clip_t.clamp(min=1.0)
         # Replace NaN (disabled dims) with 0 so denormalize/normalize are
         # well-defined even when the masked branch reads the buffer.
-        clip_t = torch.where(mask.view(1, -1), clip_t, torch.zeros_like(clip_t))
+        clip_t = torch.where(mask_cpu.view(1, -1), clip_t, torch.zeros_like(clip_t))
         self.clip_threshold.copy_(clip_t.to(self.clip_threshold.dtype))
 
         return None
