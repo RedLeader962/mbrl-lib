@@ -868,3 +868,425 @@ class TestComposedObsNormalization:
         expected_dim = self.Do * self.H + self.Da * self.H
         assert model_in.shape == (self.N, expected_dim)
         assert torch.isfinite(model_in).all()
+
+
+# ------------------------------------------------------------------ #
+#  Per-`feature_dim` configuration (RLRP-658)
+# ------------------------------------------------------------------ #
+_QUAD_FEATURE_DIM_NAMES = [
+    "linear_vels.x",
+    "linear_vels.y",
+    "linear_vels.z",
+    "attitude.w",
+    "attitude.x",
+    "attitude.y",
+    "attitude.z",
+    "angular_vels.x",
+    "angular_vels.y",
+    "angular_vels.z",
+    "motor.m1",
+    "motor.m2",
+    "motor.m3",
+    "motor.m4",
+    "timestamps.delta_stamps",
+]
+
+
+class TestSoftWinsorizedPerFeatureDim:
+    """Per-`feature_dim` ``winsor_percentile`` / ``soft_clip_iqr_mult``."""
+
+    # -------------- Construction (dict form) -------------- #
+    def test_dict_form_requires_feature_dim_names(self):
+        with pytest.raises(ValueError, match="feature_dim_names"):
+            mbrl.util.normalization.SoftWinsorizedNormalizer(
+                3,
+                torch.device(_DEVICE),
+                winsor_percentile={"a": 0.01, "b": 0.01, "c": 0.01},
+            )
+
+    def test_dict_form_missing_key_raises(self):
+        names = ["a", "b", "c"]
+        with pytest.raises(ValueError, match="Missing keys"):
+            mbrl.util.normalization.SoftWinsorizedNormalizer(
+                3,
+                torch.device(_DEVICE),
+                winsor_percentile={"a": 0.01, "b": 0.01},  # missing 'c'
+                feature_dim_names=names,
+            )
+
+    def test_dict_form_extra_key_raises_with_suggestion(self):
+        names = ["linear_vels.x", "linear_vels.y", "linear_vels.z"]
+        with pytest.raises(ValueError) as exc:
+            mbrl.util.normalization.SoftWinsorizedNormalizer(
+                3,
+                torch.device(_DEVICE),
+                winsor_percentile={
+                    "linear_vels.x": 0.01,
+                    "linear_vels.y": 0.01,
+                    "liner_vels.z": 0.01,  # typo
+                },
+                feature_dim_names=names,
+            )
+        msg = str(exc.value)
+        assert "Extra/unknown keys" in msg
+        assert "linear_vels.z" in msg  # suggestion appears
+
+    def test_dict_form_order_independent(self):
+        names = list(_QUAD_FEATURE_DIM_NAMES)
+        cfg_a = {n: 0.01 + 0.001 * i for i, n in enumerate(names)}
+        cfg_b = dict(reversed(list(cfg_a.items())))
+        n_a = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            len(names), torch.device(_DEVICE),
+            winsor_percentile=cfg_a, feature_dim_names=names,
+        )
+        n_b = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            len(names), torch.device(_DEVICE),
+            winsor_percentile=cfg_b, feature_dim_names=names,
+        )
+        assert torch.allclose(
+            n_a._winsor_percentile_per_dim, n_b._winsor_percentile_per_dim
+        )
+
+    def test_dict_with_none_value_disables_soft_clip_on_that_dim(self):
+        names = ["a", "b", "c"]
+        cfg = {"a": 3.0, "b": None, "c": 3.0}
+        n = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            3, torch.device(_DEVICE),
+            winsor_percentile=0.05,
+            soft_clip_iqr_mult=cfg,
+            feature_dim_names=names,
+        )
+        mask = n._soft_clip_active_mask.reshape(-1).cpu().tolist()
+        assert mask == [True, False, True]
+        assert not n._soft_clip_all_disabled
+        assert not n._soft_clip_all_enabled
+
+    def test_mixed_scalar_and_dict(self):
+        names = ["a", "b", "c"]
+        cfg = {"a": 3.0, "b": 5.0, "c": None}
+        n = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            3, torch.device(_DEVICE),
+            winsor_percentile=0.02,           # scalar form
+            soft_clip_iqr_mult=cfg,           # dict form
+            feature_dim_names=names,
+        )
+        assert n.winsor_percentile == 0.02
+        # ``soft_clip_iqr_mult`` echo is the user-input dict.
+        assert n.soft_clip_iqr_mult == {"a": 3.0, "b": 5.0, "c": None}
+
+    def test_dictconfig_keys_with_dots_preserved(self):
+        # OmegaConf serialises mappings as DictConfig; top-level keys
+        # containing dots are opaque strings and must round-trip.
+        from omegaconf import OmegaConf
+
+        cfg = OmegaConf.create(
+            {
+                "soft_clip_iqr_mult": {
+                    "linear_vels.x": 3.0,
+                    "linear_vels.y": None,
+                    "motor.m1": 5.0,
+                }
+            }
+        )
+        # Casting to plain dict (what the factory does) must preserve the
+        # dotted keys verbatim.
+        d = dict(cfg["soft_clip_iqr_mult"])
+        assert set(d) == {"linear_vels.x", "linear_vels.y", "motor.m1"}
+
+    # -------------- Math equivalence (scalar ⇔ uniform-dict) -------------- #
+    def test_scalar_vs_uniform_dict_equivalence(self):
+        names = list(_QUAD_FEATURE_DIM_NAMES)
+        in_size = len(names)
+        torch.manual_seed(0)
+        data = torch.randn(2000, in_size)
+
+        n_scalar = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            in_size, torch.device(_DEVICE),
+            winsor_percentile=0.05, soft_clip_iqr_mult=3.0,
+        )
+        n_dict = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            in_size, torch.device(_DEVICE),
+            winsor_percentile={n: 0.05 for n in names},
+            soft_clip_iqr_mult={n: 3.0 for n in names},
+            feature_dim_names=names,
+        )
+        n_scalar.update_stats(data)
+        n_dict.update_stats(data)
+
+        query = data[:128]
+        out_scalar = n_scalar.normalize(query)
+        out_dict = n_dict.normalize(query)
+        assert torch.allclose(out_scalar, out_dict, atol=1e-6)
+
+    def test_per_dim_none_matches_classic_winsorized_on_that_dim(self):
+        names = ["a", "b"]
+        torch.manual_seed(1)
+        data = torch.randn(1500, 2) * torch.tensor([1.0, 5.0]) + torch.tensor([0.0, 2.0])
+
+        # 'b' disabled => classic winsorized z-score on dim 1.
+        n_mix = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            2, torch.device(_DEVICE),
+            winsor_percentile=0.05,
+            soft_clip_iqr_mult={"a": 3.0, "b": None},
+            feature_dim_names=names,
+        )
+        # Reference: pure classic (soft_clip=None on every dim).
+        n_classic = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            2, torch.device(_DEVICE),
+            winsor_percentile=0.05,
+            soft_clip_iqr_mult=None,
+        )
+        n_mix.update_stats(data)
+        n_classic.update_stats(data)
+
+        # Stress: feed extreme values to dim 1 — both must match.
+        q = data.clone()
+        q[:5, 1] = 50.0
+        out_mix = n_mix.normalize(q)
+        out_classic = n_classic.normalize(q)
+        # On dim 1 the two outputs must be identical (pure z-score on both).
+        assert torch.allclose(out_mix[:, 1], out_classic[:, 1], atol=1e-6)
+
+    # -------------- Round-trip -------------- #
+    def test_round_trip_per_dim_mixed(self):
+        names = ["a", "b", "c"]
+        torch.manual_seed(2)
+        data = torch.randn(1000, 3)
+        n = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            3, torch.device(_DEVICE),
+            winsor_percentile=0.05,
+            soft_clip_iqr_mult={"a": 3.0, "b": None, "c": 5.0},
+            feature_dim_names=names,
+        )
+        n.update_stats(data)
+        query = data[:50]
+        recon = n.denormalize(n.normalize(query))
+        assert torch.allclose(recon, query, atol=1e-4)
+
+    # -------------- update_stats invariants -------------- #
+    def test_clip_threshold_zero_on_disabled_dims(self):
+        names = ["a", "b", "c"]
+        torch.manual_seed(3)
+        data = torch.randn(800, 3)
+        n = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            3, torch.device(_DEVICE),
+            winsor_percentile=0.05,
+            soft_clip_iqr_mult={"a": 3.0, "b": None, "c": 5.0},
+            feature_dim_names=names,
+        )
+        n.update_stats(data)
+        ct = n.clip_threshold.reshape(-1).cpu().numpy()
+        assert ct[0] > 0.0
+        assert ct[1] == 0.0
+        assert ct[2] > 0.0
+
+    def test_update_stats_handles_large_dataset_above_torch_quantile_limit(self):
+        """Regression: ``torch.quantile`` has a ~16 M-element hard ceiling;
+        the implementation must keep using ``np.quantile`` so we can handle
+        the full ``neurobem_adverse`` dataset (~27 M elements)."""
+        # 20 M rows × 2 dims = 40 M elements (would break torch.quantile).
+        # Use float32 to keep memory ~320 MB.  Seed for reproducibility.
+        rng = np.random.default_rng(0)
+        N = 20_000_000
+        data = rng.standard_normal((N, 2)).astype(np.float32)
+        n = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            2, torch.device(_DEVICE),
+            winsor_percentile=0.01, soft_clip_iqr_mult=3.0,
+        )
+        n.update_stats(torch.from_numpy(data))
+        # Sanity: stats close to N(0, 1) and finite.
+        assert torch.isfinite(n.winsorized_mean).all()
+        assert torch.isfinite(n.winsorized_std).all()
+        assert n.winsorized_mean.abs().max().item() < 0.05
+        assert (n.winsorized_std - 1.0).abs().max().item() < 0.05
+
+    # -------------- Save / load -------------- #
+    def test_save_load_per_dim_round_trip(self, tmp_path):
+        names = ["a", "b", "c"]
+        torch.manual_seed(4)
+        data = torch.randn(500, 3)
+        n = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            3, torch.device(_DEVICE),
+            winsor_percentile=0.05,
+            soft_clip_iqr_mult={"a": 3.0, "b": None, "c": 5.0},
+            feature_dim_names=names,
+        )
+        n.update_stats(data)
+        n.save(tmp_path)
+
+        n2 = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            3, torch.device(_DEVICE),
+            winsor_percentile=0.05,
+            soft_clip_iqr_mult={"a": 3.0, "b": None, "c": 5.0},
+            feature_dim_names=names,
+        )
+        n2.load(tmp_path)
+        assert torch.allclose(
+            n._winsor_percentile_per_dim, n2._winsor_percentile_per_dim
+        )
+        assert torch.equal(n._soft_clip_active_mask, n2._soft_clip_active_mask)
+        # NaN-aware compare for ``soft_clip_iqr_mult`` buffer.
+        a = n._soft_clip_iqr_mult_per_dim.cpu().numpy()
+        b = n2._soft_clip_iqr_mult_per_dim.cpu().numpy()
+        assert np.array_equal(a, b, equal_nan=True)
+        # End-to-end normalize must match.
+        q = data[:32]
+        assert torch.allclose(n.normalize(q), n2.normalize(q), atol=1e-6)
+
+    # -------------- Fast path -------------- #
+    def test_uniform_dict_triggers_scalar_fast_path(self):
+        names = list(_QUAD_FEATURE_DIM_NAMES)
+        n_uniform_dict = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            len(names), torch.device(_DEVICE),
+            winsor_percentile={n: 0.05 for n in names},
+            soft_clip_iqr_mult={n: 3.0 for n in names},
+            feature_dim_names=names,
+        )
+        n_mixed = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            len(names), torch.device(_DEVICE),
+            winsor_percentile={n: 0.05 for n in names},
+            soft_clip_iqr_mult={**{n: 3.0 for n in names}, names[0]: None},
+            feature_dim_names=names,
+        )
+        assert n_uniform_dict._scalar_fast_path is True
+        assert n_mixed._scalar_fast_path is False
+        # Uniform-dict path is functionally identical to the scalar path
+        # (which is exactly the point of the fast-path optimisation).
+        assert n_uniform_dict._soft_clip_all_enabled is True
+        assert n_uniform_dict._soft_clip_all_disabled is False
+        # Mixed config has both flags False.
+        assert n_mixed._soft_clip_all_enabled is False
+        assert n_mixed._soft_clip_all_disabled is False
+
+    # -------------- Factory -------------- #
+    def test_factory_forwards_feature_dim_names(self):
+        names = ["a", "b", "c"]
+        n = mbrl.util.normalization.create_normalizer(
+            "winsorized", 3, torch.device(_DEVICE),
+            soft_clip_iqr_mult={"a": 3.0, "b": None, "c": 5.0},
+            feature_dim_names=names,
+        )
+        assert isinstance(n, mbrl.util.normalization.SoftWinsorizedNormalizer)
+        assert n._feature_dim_names == names
+
+
+class TestOneDTRModelPerFeatureDimWiring:
+    """Verify ``OneDTransitionRewardModel`` correctly splits per-`feature_dim`
+    kwargs into obs- and act-specific subsets (RLRP-658)."""
+
+    def test_split_normalizer_kwargs_dict_form(self):
+        names_obs = ["linear_vels.x", "linear_vels.y", "linear_vels.z"]
+        names_act = ["motor.m1", "motor.m2"]
+        combined = names_obs + names_act
+        norm_kwargs = {
+            "winsor_percentile": 0.05,
+            "soft_clip_iqr_mult": {
+                "linear_vels.x": 3.0,
+                "linear_vels.y": 3.0,
+                "linear_vels.z": None,
+                "motor.m1": 5.0,
+                "motor.m2": None,
+            },
+            "feature_dim_names": combined,
+        }
+        obs_kw, act_kw = (
+            mbrl.models.OneDTransitionRewardModel._split_normalizer_kwargs(
+                norm_kwargs, obs_dim=3, act_dim=2
+            )
+        )
+        assert obs_kw["winsor_percentile"] == 0.05
+        assert obs_kw["soft_clip_iqr_mult"] == {
+            "linear_vels.x": 3.0, "linear_vels.y": 3.0, "linear_vels.z": None,
+        }
+        assert obs_kw["feature_dim_names"] == names_obs
+        assert act_kw["soft_clip_iqr_mult"] == {"motor.m1": 5.0, "motor.m2": None}
+        assert act_kw["feature_dim_names"] == names_act
+
+    def test_split_normalizer_kwargs_scalar_form_unchanged(self):
+        norm_kwargs = {"winsor_percentile": 0.05, "soft_clip_iqr_mult": 3.0}
+        obs_kw, act_kw = (
+            mbrl.models.OneDTransitionRewardModel._split_normalizer_kwargs(
+                norm_kwargs, obs_dim=3, act_dim=2
+            )
+        )
+        assert obs_kw == {"winsor_percentile": 0.05, "soft_clip_iqr_mult": 3.0}
+        assert act_kw == obs_kw
+
+    def test_split_normalizer_kwargs_mismatched_combined_length_raises(self):
+        norm_kwargs = {"feature_dim_names": ["a", "b", "c"]}
+        with pytest.raises(ValueError, match="obs_dim \\+ act_dim"):
+            mbrl.models.OneDTransitionRewardModel._split_normalizer_kwargs(
+                norm_kwargs, obs_dim=3, act_dim=2
+            )
+
+    def test_split_normalizer_kwargs_omegaconf_dictconfig(self):
+        """OmegaConf DictConfig inputs (as produced by Hydra YAML loading)
+        must round-trip through the splitter with dotted feature_dim keys."""
+        from omegaconf import OmegaConf
+
+        names_obs = ["linear_vels.x", "linear_vels.y"]
+        names_act = ["motor.m1"]
+        cfg = OmegaConf.create(
+            {
+                "winsor_percentile": 0.05,
+                "soft_clip_iqr_mult": {
+                    "linear_vels.x": 3.0,
+                    "linear_vels.y": None,
+                    "motor.m1": 5.0,
+                },
+                "feature_dim_names": names_obs + names_act,
+            }
+        )
+        obs_kw, act_kw = (
+            mbrl.models.OneDTransitionRewardModel._split_normalizer_kwargs(
+                dict(cfg), obs_dim=2, act_dim=1
+            )
+        )
+        assert obs_kw["soft_clip_iqr_mult"] == {
+            "linear_vels.x": 3.0, "linear_vels.y": None,
+        }
+        assert act_kw["soft_clip_iqr_mult"] == {"motor.m1": 5.0}
+        assert obs_kw["feature_dim_names"] == names_obs
+
+    def test_end_to_end_one_d_tr_model_with_dict_kwargs(self):
+        """Instantiating the wrapper with dict-form normalizer kwargs must
+        produce obs / act normalizers configured per `feature_dim` and run
+        normalize/denormalize round-trip cleanly."""
+        Do, Da, H = 3, 2, 4
+        N = 200
+        obs_names = ["linear_vels.x", "linear_vels.y", "linear_vels.z"]
+        act_names = ["motor.m1", "motor.m2"]
+        norm_kwargs = {
+            "winsor_percentile": 0.05,
+            "soft_clip_iqr_mult": {
+                "linear_vels.x": 3.0,
+                "linear_vels.y": 3.0,
+                "linear_vels.z": None,    # disabled on this dim
+                "motor.m1": 5.0,
+                "motor.m2": None,
+            },
+            "feature_dim_names": obs_names + act_names,
+        }
+        model = _MockMultiStepModel(Do, Da, H)
+        one_d = mbrl.models.OneDTransitionRewardModel(
+            model=model,
+            normalize=True,
+            normalizer_type="winsorized",
+            obs_dim=Do, act_dim=Da,
+            target_is_delta=False,
+            learned_rewards=False,
+            normalizer_kwargs=norm_kwargs,
+        )
+        # Per-`feature_dim` config landed where expected.
+        assert one_d.obs_normalizer._feature_dim_names == obs_names
+        assert one_d.act_normalizer._feature_dim_names == act_names
+        assert one_d.obs_normalizer._soft_clip_all_disabled is False
+        assert one_d.obs_normalizer._soft_clip_all_enabled is False
+        assert one_d.act_normalizer._soft_clip_all_disabled is False
+        assert one_d.act_normalizer._soft_clip_all_enabled is False
+
+        batch = _make_batch(N, Do, Da, H)
+        one_d.update_normalizer(batch)
+        normed = one_d._normalize_composed_obs(batch.obs)
+        recon = one_d._denormalize_composed_obs(normed)
+        assert torch.allclose(recon, batch.obs, atol=1e-4)

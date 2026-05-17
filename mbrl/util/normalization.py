@@ -67,15 +67,23 @@ Rule of thumb — parameter configuration:
   the outermost bin.  Keep the default.
 """
 import abc
+import difflib
 import pathlib
 import warnings
-from typing import Optional, Union
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import mbrl.types
 import numpy as np
 import torch
 import torch.compiler
 import torch.nn
+
+# Type aliases for the per-`feature_dim` configuration API of
+# :class:`SoftWinsorizedNormalizer` (see its docstring for details).
+WinsorPercentileConfig = Union[float, Mapping[str, float], Sequence[float]]
+SoftClipIqrMultConfig = Union[
+    float, None, Mapping[str, Optional[float]], Sequence[Optional[float]]
+]
 
 
 class Normalizer(torch.nn.Module, abc.ABC):
@@ -419,7 +427,8 @@ class ZScoreNormalizer(Normalizer):
 
 
 class SoftWinsorizedNormalizer(Normalizer):
-    """Robust normalizer using winsorized z-score with per-feature adaptive tanh soft-clipping.
+    """Robust normalizer using winsorized z-score with per-`feature_dim`
+    adaptive tanh soft-clipping.
 
     **What it does:**
 
@@ -427,94 +436,397 @@ class SoftWinsorizedNormalizer(Normalizer):
     outlier-contaminated feature distributions commonly encountered in robotic
     sensory data (e.g. angular-velocity spikes, contact-force transients).
 
-    1. **Winsorized z-score** — Clamps each feature to its ``[q_alpha, q_{1-alpha}]``
-       quantile range before computing mean and standard deviation, then standardizes.
-       This prevents extreme outliers from inflating the statistics.
-    2. **Per-feature adaptive tanh soft-clip** — Derives an automatic clip threshold
-       per feature from the interquartile range (IQR) as
-       ``c_i = soft_clip_iqr_mult * IQR_i / sigma_i``, then smoothly compresses
-       z-scores that exceed ``c_i`` via ``tanh``.  Values inside ``[-c_i, c_i]``
-       pass through untouched (identity region).
+    1. **Winsorized z-score** — Clamps each ``feature_dim`` to its
+       ``[q_alpha, q_{1-alpha}]`` quantile range before computing mean and
+       standard deviation, then standardizes.  This prevents extreme outliers
+       from inflating the statistics.
+    2. **Per-`feature_dim` adaptive tanh soft-clip** — Derives an automatic
+       clip threshold per ``feature_dim`` from the interquartile range (IQR) as
+       ``c_i = soft_clip_iqr_mult_i * IQR_i / sigma_i``, then smoothly
+       compresses z-scores that exceed ``c_i`` via ``tanh``.  Values inside
+       ``[-c_i, c_i]`` pass through untouched (identity region).
 
     The transform is differentiable everywhere, monotonic, and has an exact
     closed-form inverse (see :meth:`denormalize`).
 
-    .. note::
-       The per-feature clip threshold ``c_i`` is floored at ``1.0`` during
-       :meth:`update_stats` to guarantee that at least ±1 standard deviation
-       of the z-score passes through the identity region.  If your
-       ``soft_clip_iqr_mult`` is low enough that the computed ``c_i`` would
-       fall below 1.0 for Gaussian-like features (roughly when
-       ``soft_clip_iqr_mult < 0.75``), a warning is emitted at construction
-       time because the floor will silently override the requested
-       aggressiveness.
+    **Per-``feature_dim`` configuration.**  Both ``winsor_percentile`` and
+    ``soft_clip_iqr_mult`` accept either:
+
+    - a Python scalar (broadcast to every ``feature_dim`` — back-compatible
+      default behaviour); ``None`` is additionally accepted for
+      ``soft_clip_iqr_mult`` and disables the tanh stage on every dim,
+      recovering the classic ``WinsorizedNormalizer``.
+    - a :class:`~typing.Mapping` keyed by ``feature_dim`` names (as listed in
+      ``feature_dim_names``), with strict set-equality validation; a ``None``
+      value disables soft-clip on that single ``feature_dim``.  Requires
+      ``feature_dim_names`` to be provided.
+    - a :class:`~typing.Sequence` of length ``in_size`` (internal/test surface,
+      not exposed in YAML).
+
+    Mixing forms across the two arguments is allowed (e.g. scalar
+    ``winsor_percentile`` + dict ``soft_clip_iqr_mult``).
 
     .. note::
-       Setting ``soft_clip_iqr_mult=None`` disables the tanh soft-clip stage
-       entirely, recovering the classic ``WinsorizedNormalizer`` behavior:
-       ``normalize`` then returns the pure winsorized z-score
-       ``(x - winsorized_mean) / winsorized_std`` and ``denormalize`` is its
-       exact linear inverse.
+       The per-``feature_dim`` clip threshold ``c_i`` is floored at ``1.0``
+       during :meth:`update_stats` to guarantee that at least ±1 standard
+       deviation of the z-score passes through the identity region.
+
+    .. note::
+       When every ``feature_dim`` has the same setting, an internal *uniform
+       fast path* dispatches to the original scalar code path — zero
+       runtime overhead vs. the pre-per-dim API.
+
+    **Deviations from the Soft-Winsorization math formula.**
+
+    The implementation faithfully follows the math of the specification
+    (clamp at ``[Q_alpha, Q_{1-alpha}]`` → winsorized mean/std on the clamped
+    data → z-score on the **raw** input → adaptive tanh soft-clip with
+    ``c_i = tau · IQR_i / sigma_i`` where ``IQR_i = Q_{0.75} - Q_{0.25}``).
+    Two intentional numerical-safety deviations are applied:
+
+    1. ``eps`` is added inside the square root of the winsorized standard
+       deviation (and ``sigma_i`` is then clamped to a minimum of ``eps``)
+       to protect against zero-variance ``feature_dim`` columns (e.g.
+       near-constant ``timestamps.delta_stamps``).  The impact on
+       well-behaved channels is ``O(eps)``.
+    2. The adaptive clip threshold ``c_i`` is floored at ``1.0`` so that
+       the identity region of the soft-clip always covers at least ±1
+       standard deviation.  This deviates from the bare formula
+       ``c_i = tau · IQR_i / sigma_i`` only when ``tau · IQR_i < sigma_i``
+       (i.e. very tight-body / heavy-tail ``feature_dim``).
+
+    **Integration caveat — ``target_is_delta``.**
+
+    This normalizer is designed for the *input/output normalization* setting
+    described in the paper rationale: ``input -> normalize -> model ->
+    denormalize -> output``.  Soft-clip composition is preserved exactly on
+    the round-trip ``denormalize(normalize(x)) == x`` (within numerical
+    precision).  However, when the downstream transition model uses
+    ``target_is_delta=True`` and computes its regression target as
+    ``normalize(next_obs) - normalize(obs)``, the bounded-target
+    interpretation does **not** carry over: the difference of two soft-clipped
+    z-scores is neither itself a soft-clipped z-score nor equal to
+    ``normalize(next_obs - obs)``.  Training remains self-consistent (because
+    prediction uses the same definition), but the per-``feature_dim``
+    "bounded NLL" property documented above is no longer guaranteed for the
+    delta target.  See :class:`mbrl.models.OneDTransitionRewardModelV2`
+    which emits a :class:`RuntimeWarning` when both options are combined.
 
     Args:
-        in_size (int): the size of the data that will be normalized.
-        device (torch.device): the device in which the data will reside.
-        dtype (torch.dtype): the data type to use for the normalizer.
-        winsor_percentile (float): the percentile for winsorization (default 0.05).
-        soft_clip_iqr_mult (float, optional): IQR multiplier for the adaptive clip threshold
-            (default 3.0).  For Gaussian data the resulting threshold is approximately
-            ``soft_clip_iqr_mult * 1.35`` standard deviations.  Values below ~0.75 will
-            cause the internal floor of 1.0 to dominate, effectively ignoring the
-            requested multiplier.
-            Pass ``None`` to **disable** the tanh soft-clip stage entirely and recover
-            the classic ``WinsorizedNormalizer`` behavior (pure winsorized z-score).
+        in_size: the size of the data that will be normalized.
+        device: the device on which the data will reside.
+        dtype: the data type to use for the normalizer.
+        winsor_percentile: scalar fraction in ``(0, 0.5)`` or a per-``feature_dim``
+            mapping / sequence (default ``0.05``).
+        soft_clip_iqr_mult: scalar in ``(0, +inf)``, ``None`` to disable, or a
+            per-``feature_dim`` mapping / sequence (default ``3.0``).
+        feature_dim_names: ordered list of ``feature_dim`` names of length
+            ``in_size``.  **Required** whenever a :class:`Mapping` is passed.
     """
 
     _STATS_FNAME = "winsorized_stats.pt"
+    _NORMALIZER_FORMAT_VERSION = 2
 
     def __init__(
         self,
         in_size: int,
         device: torch.device,
         dtype=torch.float32,
-        winsor_percentile: float = 0.05,
-        soft_clip_iqr_mult: Optional[float] = 3.0,
+        winsor_percentile: WinsorPercentileConfig = 0.05,
+        soft_clip_iqr_mult: SoftClipIqrMultConfig = 3.0,
+        feature_dim_names: Optional[Sequence[str]] = None,
     ):
         super().__init__()
+        self._in_size = in_size
+        self._dtype = dtype
+        self._feature_dim_names: Optional[List[str]] = (
+            list(feature_dim_names) if feature_dim_names is not None else None
+        )
+        if self._feature_dim_names is not None and len(self._feature_dim_names) != in_size:
+            raise ValueError(
+                f"feature_dim_names has length {len(self._feature_dim_names)} "
+                f"but in_size={in_size}."
+            )
+
+        # Resolve possibly-dict/sequence configs to per-dim float arrays
+        # (NaN encodes 'disabled' for ``soft_clip_iqr_mult``).
+        winsor_per_dim, winsor_is_scalar, winsor_scalar_val = self._resolve_winsor_percentile(
+            winsor_percentile, in_size, self._feature_dim_names
+        )
+        soft_per_dim, soft_is_scalar, soft_scalar_val = self._resolve_soft_clip_iqr_mult(
+            soft_clip_iqr_mult, in_size, self._feature_dim_names
+        )
+
         self.register_buffer("winsorized_mean", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("winsorized_std", torch.ones((1, in_size), dtype=dtype))
         self.register_buffer("q_low", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("q_high", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("iqr", torch.ones((1, in_size), dtype=dtype))
-        # When soft-clipping is disabled (``soft_clip_iqr_mult is None``),
-        # the ``clip_threshold`` buffer is kept for save/load compatibility
-        # but is not used by ``normalize``/``denormalize``.
-        _clip_init = 0.0 if soft_clip_iqr_mult is None else soft_clip_iqr_mult
+
+        # Per-`feature_dim` config buffers (shape (1, in_size)).  Buffers
+        # auto-migrate to ``device`` via ``self.to(device)`` and are
+        # included in ``state_dict``.
         self.register_buffer(
-            "clip_threshold", torch.full((1, in_size), _clip_init, dtype=dtype)
+            "_winsor_percentile_per_dim",
+            torch.from_numpy(winsor_per_dim).to(dtype=dtype),
+        )
+        # NaN in this buffer => soft-clip disabled on that dim.
+        self.register_buffer(
+            "_soft_clip_iqr_mult_per_dim",
+            torch.from_numpy(soft_per_dim).to(dtype=dtype),
+        )
+        self.register_buffer(
+            "_soft_clip_active_mask",
+            ~torch.isnan(torch.from_numpy(soft_per_dim).to(dtype=dtype)),
+        )
+        # When a dim is disabled the ``clip_threshold`` entry stays at 0.
+        self.register_buffer(
+            "clip_threshold", torch.zeros((1, in_size), dtype=dtype)
         )
         _eps_value = 1e-14 if dtype == torch.double else 1e-5
         self.register_buffer("eps", torch.tensor(_eps_value, dtype=dtype))
-        self.winsor_percentile = winsor_percentile
-        self.soft_clip_iqr_mult: Optional[float] = soft_clip_iqr_mult
+        self.register_buffer(
+            "_normalizer_format_version",
+            torch.tensor(self._NORMALIZER_FORMAT_VERSION, dtype=torch.int64),
+        )
 
-        # Warn when the multiplier is so low that the internal floor (1.0)
-        # will override the user's setting for Gaussian-like features.
-        # For a Gaussian, IQR / sigma ≈ 1.35, so clip_t ≈ mult * 1.35.
-        # The floor kicks in when mult * 1.35 < 1.0, i.e. mult < ~0.74.
-        _FLOOR_WARNING_THRESHOLD = 0.75
-        if soft_clip_iqr_mult is not None and soft_clip_iqr_mult < _FLOOR_WARNING_THRESHOLD:
-            warnings.warn(
-                f"soft_clip_iqr_mult={soft_clip_iqr_mult} is very low. "
-                f"For Gaussian-like features the per-feature clip threshold "
-                f"(≈ {soft_clip_iqr_mult} × IQR/σ ≈ {soft_clip_iqr_mult * 1.35:.2f}) "
-                f"falls below the internal floor of 1.0, so the floor will "
-                f"silently dominate. Consider using a value ≥ 0.75.",
-                UserWarning,
-                stacklevel=2,
+        # User-facing echoes of the original inputs (back-compat — existing
+        # tests assert ``norm.winsor_percentile == 0.05`` etc.).  For dict /
+        # sequence input these become the resolved Python value rather than
+        # a scalar.
+        self.winsor_percentile: Union[float, Dict[str, float], List[float]] = (
+            winsor_scalar_val
+            if winsor_is_scalar
+            else self._echo_user_input(winsor_percentile, in_size, self._feature_dim_names)
+        )
+        self.soft_clip_iqr_mult: Union[
+            float, None, Dict[str, Optional[float]], List[Optional[float]]
+        ] = (
+            soft_scalar_val
+            if soft_is_scalar
+            else self._echo_user_input(soft_clip_iqr_mult, in_size, self._feature_dim_names)
+        )
+
+        # Fast-path flags (computed once, used in hot path).
+        active_mask_np = ~np.isnan(soft_per_dim)
+        self._soft_clip_all_disabled: bool = bool(not active_mask_np.any())
+        self._soft_clip_all_enabled: bool = bool(active_mask_np.all())
+        self._winsor_is_uniform: bool = bool(np.unique(winsor_per_dim).size == 1)
+        # Uniform fast path = same scalar code path as today on the hot path.
+        self._scalar_fast_path: bool = (
+            self._winsor_is_uniform
+            and (self._soft_clip_all_disabled or self._soft_clip_all_enabled)
+            and (
+                self._soft_clip_all_disabled
+                or bool(np.unique(soft_per_dim[active_mask_np]).size == 1)
             )
+        )
+
+        # Floor warning — iterate per dim so the message quotes the
+        # offending ``feature_dim`` name when available.
+        _FLOOR_WARNING_THRESHOLD = 0.75
+        for i in range(in_size):
+            k = soft_per_dim[i]
+            if not np.isnan(k) and k < _FLOOR_WARNING_THRESHOLD:
+                name = (
+                    self._feature_dim_names[i]
+                    if self._feature_dim_names is not None
+                    else f"dim[{i}]"
+                )
+                warnings.warn(
+                    f"soft_clip_iqr_mult={k} for '{name}' is very low. "
+                    f"For Gaussian-like features the per-`feature_dim` clip "
+                    f"threshold (≈ {k} × IQR/σ ≈ {k * 1.35:.2f}) falls below "
+                    f"the internal floor of 1.0, so the floor will silently "
+                    f"dominate. Consider using a value ≥ 0.75.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         self.to(device)
+
+    # ------------------------------------------------------------------ #
+    #  Per-`feature_dim` configuration resolution helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _resolve_winsor_percentile(
+        value: WinsorPercentileConfig,
+        in_size: int,
+        feature_dim_names: Optional[List[str]],
+    ) -> Tuple[np.ndarray, bool, float]:
+        """Resolve ``winsor_percentile`` to a per-dim ``float64`` array.
+
+        Returns ``(per_dim_array, is_scalar_input, scalar_value_or_nan)``.
+        Validates bounds and (when dict) set-equality with
+        ``feature_dim_names``.
+        """
+        if value is None:
+            raise ValueError(
+                "winsor_percentile=None is not supported (winsorization is "
+                "always on); use a positive fraction in (0, 0.5)."
+            )
+        if isinstance(value, Mapping):
+            arr = SoftWinsorizedNormalizer._mapping_to_array(
+                dict(value),
+                in_size,
+                feature_dim_names,
+                arg_name="winsor_percentile",
+                allow_none_value=False,
+            )
+            is_scalar = False
+            scalar_val = float("nan")
+        elif isinstance(value, (list, tuple)):
+            if len(value) != in_size:
+                raise ValueError(
+                    f"winsor_percentile sequence has length {len(value)} "
+                    f"but in_size={in_size}."
+                )
+            arr = np.asarray([float(v) for v in value], dtype=np.float64)
+            is_scalar = False
+            scalar_val = float("nan")
+        else:
+            v = float(value)
+            arr = np.full((in_size,), v, dtype=np.float64)
+            is_scalar = True
+            scalar_val = v
+
+        if np.any(arr <= 0.0) or np.any(arr >= 0.5) or np.any(np.isnan(arr)):
+            bad = np.where((arr <= 0.0) | (arr >= 0.5) | np.isnan(arr))[0]
+            names = (
+                [feature_dim_names[i] for i in bad]
+                if feature_dim_names is not None
+                else [f"dim[{i}]" for i in bad]
+            )
+            raise ValueError(
+                f"winsor_percentile values must be in (0, 0.5); "
+                f"offending entries: {dict(zip(names, arr[bad].tolist()))}"
+            )
+        return arr, is_scalar, scalar_val
+
+    @staticmethod
+    def _resolve_soft_clip_iqr_mult(
+        value: SoftClipIqrMultConfig,
+        in_size: int,
+        feature_dim_names: Optional[List[str]],
+    ) -> Tuple[np.ndarray, bool, Optional[float]]:
+        """Resolve ``soft_clip_iqr_mult`` to a per-dim ``float64`` array.
+
+        ``NaN`` encodes 'disabled' (recovers classic ``WinsorizedNormalizer``
+        behaviour on that dim).  Returns
+        ``(per_dim_array, is_scalar_input, scalar_value_or_None)``.
+        """
+        if value is None:
+            arr = np.full((in_size,), np.nan, dtype=np.float64)
+            return arr, True, None
+        if isinstance(value, Mapping):
+            arr = SoftWinsorizedNormalizer._mapping_to_array(
+                dict(value),
+                in_size,
+                feature_dim_names,
+                arg_name="soft_clip_iqr_mult",
+                allow_none_value=True,
+            )
+            is_scalar = False
+            scalar_val: Optional[float] = None
+        elif isinstance(value, (list, tuple)):
+            if len(value) != in_size:
+                raise ValueError(
+                    f"soft_clip_iqr_mult sequence has length {len(value)} "
+                    f"but in_size={in_size}."
+                )
+            arr = np.asarray(
+                [np.nan if v is None else float(v) for v in value], dtype=np.float64
+            )
+            is_scalar = False
+            scalar_val = None
+        else:
+            v = float(value)
+            arr = np.full((in_size,), v, dtype=np.float64)
+            is_scalar = True
+            scalar_val = v
+
+        # Validate: every non-NaN entry must be > 0.
+        active = ~np.isnan(arr)
+        if np.any(active & (arr <= 0.0)):
+            bad = np.where(active & (arr <= 0.0))[0]
+            names = (
+                [feature_dim_names[i] for i in bad]
+                if feature_dim_names is not None
+                else [f"dim[{i}]" for i in bad]
+            )
+            raise ValueError(
+                f"soft_clip_iqr_mult values must be > 0 (or None to disable); "
+                f"offending entries: {dict(zip(names, arr[bad].tolist()))}"
+            )
+        return arr, is_scalar, scalar_val
+
+    @staticmethod
+    def _mapping_to_array(
+        mapping: Dict[str, Optional[float]],
+        in_size: int,
+        feature_dim_names: Optional[List[str]],
+        arg_name: str,
+        allow_none_value: bool,
+    ) -> np.ndarray:
+        """Resolve a ``feature_dim``-keyed mapping to a per-dim ``float64`` array.
+
+        Strict set-equality validation with ``feature_dim_names`` (no missing
+        keys, no extra keys); ``difflib`` typo suggestions on extras.
+        """
+        if feature_dim_names is None:
+            raise ValueError(
+                f"{arg_name} is a Mapping but `feature_dim_names` was not "
+                f"provided to SoftWinsorizedNormalizer; pass the ordered "
+                f"obs_dims + act_dims list from your simulator config."
+            )
+        if len(feature_dim_names) != in_size:
+            raise ValueError(
+                f"feature_dim_names has length {len(feature_dim_names)} but "
+                f"in_size={in_size}."
+            )
+        expected = set(feature_dim_names)
+        provided = set(mapping.keys())
+        missing = sorted(expected - provided)
+        extras = sorted(provided - expected)
+        if missing or extras:
+            parts = [f"{arg_name} mapping does not match feature_dim_names."]
+            if missing:
+                parts.append(f"  Missing keys: {missing}")
+            if extras:
+                suggestions = {
+                    k: difflib.get_close_matches(k, feature_dim_names, n=1)
+                    for k in extras
+                }
+                parts.append(
+                    f"  Extra/unknown keys (with closest-match suggestions): "
+                    f"{suggestions}"
+                )
+            raise ValueError("\n".join(parts))
+
+        arr = np.empty((in_size,), dtype=np.float64)
+        for i, name in enumerate(feature_dim_names):
+            v = mapping[name]
+            if v is None:
+                if not allow_none_value:
+                    raise ValueError(
+                        f"{arg_name}['{name}'] is None, which is not allowed "
+                        f"(only soft_clip_iqr_mult supports None per dim)."
+                    )
+                arr[i] = np.nan
+            else:
+                arr[i] = float(v)
+        return arr
+
+    @staticmethod
+    def _echo_user_input(
+        value, in_size: int, feature_dim_names: Optional[List[str]]
+    ):
+        """Return a plain-Python echo of the user's per-dim input (for repr/save)."""
+        if isinstance(value, Mapping):
+            return {str(k): (None if v is None else float(v)) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [None if v is None else float(v) for v in value]
+        return value
 
     @property
     def device(self):
@@ -579,21 +891,34 @@ class SoftWinsorizedNormalizer(Normalizer):
             )
             data = torch.where(torch.isfinite(data), data, torch.zeros_like(data))
 
-        alpha = self.winsor_percentile
-        # Use numpy for quantile computation: no element-count limit, no GPU memory pressure.
+        # Per-`feature_dim` alpha — use numpy for quantile computation:
+        # no element-count limit (avoids torch.quantile's ~16 M-element
+        # hard ceiling), no GPU memory pressure.  When every dim shares
+        # the same alpha (uniform fast path) this collapses to a single
+        # np.quantile call per tail, matching the pre-per-dim numerical
+        # behaviour exactly.
         data_np = data.numpy()
-        q_low = torch.from_numpy(
-            np.quantile(data_np, alpha, axis=0, keepdims=True).astype(np.float64)
-        )
-        q_high = torch.from_numpy(
-            np.quantile(data_np, 1.0 - alpha, axis=0, keepdims=True).astype(np.float64)
-        )
-        q25 = torch.from_numpy(
-            np.quantile(data_np, 0.25, axis=0, keepdims=True).astype(np.float64)
-        )
-        q75 = torch.from_numpy(
-            np.quantile(data_np, 0.75, axis=0, keepdims=True).astype(np.float64)
-        )
+        alpha_per_dim = self._winsor_percentile_per_dim.detach().cpu().numpy().reshape(-1)
+        in_size = data_np.shape[1]
+
+        q_low_np = np.empty((1, in_size), dtype=np.float64)
+        q_high_np = np.empty((1, in_size), dtype=np.float64)
+        unique_alphas, inv = np.unique(alpha_per_dim, return_inverse=True)
+        for u_idx, a in enumerate(unique_alphas):
+            cols = np.where(inv == u_idx)[0]
+            sub = data_np[:, cols]
+            q_low_np[0, cols] = np.quantile(sub, float(a), axis=0)
+            q_high_np[0, cols] = np.quantile(sub, 1.0 - float(a), axis=0)
+        # ``q25`` and ``q75`` are independent of ``winsor_percentile``;
+        # one ``np.quantile`` call suffices for each, regardless of per-dim
+        # configuration.
+        q25_np = np.quantile(data_np, 0.25, axis=0, keepdims=True).astype(np.float64)
+        q75_np = np.quantile(data_np, 0.75, axis=0, keepdims=True).astype(np.float64)
+
+        q_low = torch.from_numpy(q_low_np)
+        q_high = torch.from_numpy(q_high_np)
+        q25 = torch.from_numpy(q25_np)
+        q75 = torch.from_numpy(q75_np)
 
         self.q_low.copy_(q_low)
         self.q_high.copy_(q_high)
@@ -624,21 +949,23 @@ class SoftWinsorizedNormalizer(Normalizer):
         w_std[torch.isnan(w_std)] = 1.0
         self.winsorized_std.copy_(w_std)
 
-        # Per-feature adaptive soft-clip threshold: c_i = gamma * IQR_i / sigma_i
-        # When ``soft_clip_iqr_mult is None`` the soft-clip stage is disabled and
-        # this normalizer behaves as a classic ``WinsorizedNormalizer`` (pure
-        # winsorized z-score, no tanh compression).
-        if self.soft_clip_iqr_mult is None:
-            self.clip_threshold.zero_()
-        else:
-            clip_t = self.soft_clip_iqr_mult * iqr / w_std
-
-            # Floor at 1.0 so the identity region always covers at least ±1 sigma.
-            # Without this floor, near-constant features (IQR ≈ 0) or very low
-            # soft_clip_iqr_mult values would cause the tanh soft-clip to compress
-            # even the core of the distribution, distorting well-behaved data.
-            clip_t = clip_t.clamp(min=1.0)
-            self.clip_threshold.copy_(clip_t)
+        # Per-`feature_dim` adaptive soft-clip threshold:
+        #   c_i = soft_clip_iqr_mult_i * IQR_i / sigma_i
+        # When ``soft_clip_iqr_mult_i is None`` (encoded as NaN in the buffer)
+        # the soft-clip stage is disabled on that dim and the corresponding
+        # ``clip_threshold`` entry is left at 0 (consumed only inside the
+        # masked branch; see ``normalize`` for the branchless hot path).
+        mask = self._soft_clip_active_mask.to(self.clip_threshold.device)
+        # (1, in_size) — broadcast safe.
+        soft_k = self._soft_clip_iqr_mult_per_dim.to(self.clip_threshold.dtype).view(1, -1)
+        clip_t = soft_k * iqr.to(soft_k.dtype) / w_std.to(soft_k.dtype)
+        # Floor at 1.0 so the identity region always covers at least ±1
+        # sigma — unchanged semantics from the pre-per-dim API.
+        clip_t = clip_t.clamp(min=1.0)
+        # Replace NaN (disabled dims) with 0 so denormalize/normalize are
+        # well-defined even when the masked branch reads the buffer.
+        clip_t = torch.where(mask.view(1, -1), clip_t, torch.zeros_like(clip_t))
+        self.clip_threshold.copy_(clip_t.to(self.clip_threshold.dtype))
 
         return None
 
@@ -698,10 +1025,19 @@ class SoftWinsorizedNormalizer(Normalizer):
             else:
                 z = torch.zeros_like(z)
 
-        if self.soft_clip_iqr_mult is None:
+        if self._soft_clip_all_disabled:
             result = z
-        else:
+        elif self._soft_clip_all_enabled:
             result = self._soft_clip(z, self.clip_threshold.to(compute_dtype))
+        else:
+            # Mixed config: compute the soft-clipped tensor, then keep the
+            # raw z-score on disabled dims via a single branchless
+            # ``torch.where``.  The disabled-dim ``clip_threshold`` entries
+            # are zero but their soft-clipped output is discarded by the
+            # mask, so no NaN ever propagates.
+            z_soft = self._soft_clip(z, self.clip_threshold.to(compute_dtype))
+            mask = self._soft_clip_active_mask.to(z.device)
+            result = torch.where(mask, z_soft, z)
         return result.to(input_dtype)
 
     @torch.compiler.disable
@@ -722,12 +1058,20 @@ class SoftWinsorizedNormalizer(Normalizer):
             else self.winsorized_mean.dtype
         )
 
-        if self.soft_clip_iqr_mult is None:
+        if self._soft_clip_all_disabled:
             z = val.to(compute_dtype)
-        else:
+        elif self._soft_clip_all_enabled:
             z = self._soft_clip_inverse(
                 val.to(compute_dtype), self.clip_threshold.to(compute_dtype)
             )
+        else:
+            # Mixed config — branchless mask-select per dim.
+            v_c = val.to(compute_dtype)
+            z_inv = self._soft_clip_inverse(
+                v_c, self.clip_threshold.to(compute_dtype)
+            )
+            mask = self._soft_clip_active_mask.to(v_c.device)
+            z = torch.where(mask, z_inv, v_c)
         result = z * self.winsorized_std.to(compute_dtype) + self.winsorized_mean.to(
             compute_dtype
         )
@@ -761,6 +1105,13 @@ class SoftWinsorizedNormalizer(Normalizer):
                 "iqr": self.iqr.cpu(),
                 "clip_threshold": self.clip_threshold.cpu(),
                 "eps": self.eps.cpu(),
+                # Per-`feature_dim` config (format version 2).
+                "_winsor_percentile_per_dim": self._winsor_percentile_per_dim.cpu(),
+                "_soft_clip_iqr_mult_per_dim": self._soft_clip_iqr_mult_per_dim.cpu(),
+                "_soft_clip_active_mask": self._soft_clip_active_mask.cpu(),
+                "_normalizer_format_version": int(self._NORMALIZER_FORMAT_VERSION),
+                "feature_dim_names": self._feature_dim_names,
+                # User-facing echoes (legacy + v2).
                 "winsor_percentile": self.winsor_percentile,
                 "soft_clip_iqr_mult": self.soft_clip_iqr_mult,
             },
@@ -775,7 +1126,14 @@ class SoftWinsorizedNormalizer(Normalizer):
             raise FileNotFoundError(f"No SoftWinsorizedNormalizer stats found at '{path}'.")
         from mbrl.util.common import resolve_load_map_location
 
-        stats = torch.load(path, weights_only=True, map_location=resolve_load_map_location())
+        # ``weights_only=False`` is required because v2 checkpoints contain
+        # plain Python objects (the user-facing ``winsor_percentile`` echo
+        # may be a ``dict`` or ``list``; ``feature_dim_names`` is a list).
+        # The file is produced by this codebase and is never user-supplied
+        # at load time.
+        stats = torch.load(
+            path, weights_only=False, map_location=resolve_load_map_location()
+        )
         self.winsorized_mean.copy_(stats["winsorized_mean"].to(self.device))
         self.winsorized_std.copy_(stats["winsorized_std"].to(self.device))
         self.q_low.copy_(stats["q_low"].to(self.device))
@@ -784,10 +1142,72 @@ class SoftWinsorizedNormalizer(Normalizer):
         self.clip_threshold.copy_(stats["clip_threshold"].to(self.device))
         if "eps" in stats:
             self.eps.copy_(stats["eps"].to(self.device))
+
+        # ---- Per-`feature_dim` config migration ----
+        in_size = self.winsorized_mean.shape[1]
+        if "_winsor_percentile_per_dim" in stats:
+            # v2 checkpoint — load buffers directly.
+            self._winsor_percentile_per_dim.copy_(
+                stats["_winsor_percentile_per_dim"].to(self.device)
+            )
+            self._soft_clip_iqr_mult_per_dim.copy_(
+                stats["_soft_clip_iqr_mult_per_dim"].to(self.device)
+            )
+            self._soft_clip_active_mask.copy_(
+                stats["_soft_clip_active_mask"].to(self.device)
+            )
+        else:
+            # Legacy (v1, 0-D scalars) — broadcast to (in_size,) per-dim
+            # buffers and emit a ``DeprecationWarning``.
+            warnings.warn(
+                "Loading legacy SoftWinsorizedNormalizer checkpoint without "
+                "per-`feature_dim` config buffers; broadcasting scalar "
+                "winsor_percentile / soft_clip_iqr_mult to all dims.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            legacy_w = stats.get("winsor_percentile", 0.05)
+            legacy_s = stats.get("soft_clip_iqr_mult", 3.0)
+            w_dtype = self._winsor_percentile_per_dim.dtype
+            self._winsor_percentile_per_dim.copy_(
+                torch.full((in_size,), float(legacy_w), dtype=w_dtype).to(self.device)
+            )
+            if legacy_s is None:
+                self._soft_clip_iqr_mult_per_dim.copy_(
+                    torch.full((in_size,), float("nan"), dtype=w_dtype).to(self.device)
+                )
+                self._soft_clip_active_mask.copy_(
+                    torch.zeros((in_size,), dtype=torch.bool).to(self.device)
+                )
+            else:
+                self._soft_clip_iqr_mult_per_dim.copy_(
+                    torch.full((in_size,), float(legacy_s), dtype=w_dtype).to(self.device)
+                )
+                self._soft_clip_active_mask.copy_(
+                    torch.ones((in_size,), dtype=torch.bool).to(self.device)
+                )
+
         if "winsor_percentile" in stats:
             self.winsor_percentile = stats["winsor_percentile"]
         if "soft_clip_iqr_mult" in stats:
             self.soft_clip_iqr_mult = stats["soft_clip_iqr_mult"]
+
+        # Recompute fast-path flags from the loaded buffers so the hot path
+        # reflects the loaded configuration.
+        active_np = self._soft_clip_active_mask.detach().cpu().numpy().reshape(-1)
+        soft_np = self._soft_clip_iqr_mult_per_dim.detach().cpu().numpy().reshape(-1)
+        winsor_np = self._winsor_percentile_per_dim.detach().cpu().numpy().reshape(-1)
+        self._soft_clip_all_disabled = bool(not active_np.any())
+        self._soft_clip_all_enabled = bool(active_np.all())
+        self._winsor_is_uniform = bool(np.unique(winsor_np).size == 1)
+        self._scalar_fast_path = (
+            self._winsor_is_uniform
+            and (self._soft_clip_all_disabled or self._soft_clip_all_enabled)
+            and (
+                self._soft_clip_all_disabled
+                or bool(np.unique(soft_np[active_np]).size == 1)
+            )
+        )
         return None
 
 
@@ -1140,6 +1560,7 @@ def create_normalizer(
             dtype=dtype,
             winsor_percentile=kwargs.get("winsor_percentile", 0.05),
             soft_clip_iqr_mult=kwargs.get("soft_clip_iqr_mult", 3.0),
+            feature_dim_names=kwargs.get("feature_dim_names", None),
         )
     elif normalizer_type == "quantile":
         return QuantileNormalizer(

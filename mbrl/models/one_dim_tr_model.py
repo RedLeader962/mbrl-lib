@@ -3,7 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 import pathlib
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import warnings
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from deprecated import deprecated
 import torch
@@ -50,6 +51,21 @@ class OneDTransitionRewardModel(Model):
             the difference respect to the input observations.
             That is, ignoring rewards, pred_obs_{t + 1} = obs_t + model([obs_t, act_t]).
             Defaults to ``True``. Can be deactivated per dimension using ``no_delta_list``.
+
+            .. warning::
+               When combined with a robust normalizer (``normalizer_type`` in
+               ``{"winsorized", "quantile"}``) the regression target is built as
+               ``normalize(next_obs) - normalize(obs)`` — i.e. the difference of
+               two soft-clipped / quantile-warped values.  This is **not**
+               equivalent to ``normalize(next_obs - obs)`` and the
+               bounded-target / round-trip guarantees documented on
+               :class:`~mbrl.util.normalization.SoftWinsorizedNormalizer` do
+               **not** carry over to the delta target.  The
+               :class:`SoftWinsorizedNormalizer` Notion rationale only covers
+               input/output normalization, not delta targets.  A
+               :class:`RuntimeWarning` is emitted at construction time when
+               both options are combined; set ``target_is_delta=False`` to
+               recover the documented behaviour.
         normalize (bool): if ``True``, an input normalizer is created (type selected
             by ``normalizer_type``).  The user must call :meth:`update_normalizer`
             before using the model.  Defaults to ``False``.
@@ -135,11 +151,23 @@ class OneDTransitionRewardModel(Model):
                         )
                 self._obs_dim = obs_dim
                 self._act_dim = act_dim
+                # Per-`feature_dim` configuration (RLRP-658): if
+                # ``normalizer_kwargs`` carries dict-keyed values for
+                # ``winsor_percentile`` / ``soft_clip_iqr_mult`` and/or a
+                # global ``feature_dim_names`` list (obs_dims + act_dims),
+                # split them into obs- and act-specific subsets before
+                # forwarding to each ``create_normalizer`` call.  Scalar
+                # values are forwarded verbatim — back-compat preserved.
+                obs_norm_kwargs, act_norm_kwargs = self._split_normalizer_kwargs(
+                    norm_kwargs, obs_dim, act_dim
+                )
                 self.obs_normalizer = mbrl.util.normalization.create_normalizer(
-                    normalizer_type, obs_dim, self.model.device, dtype=norm_dtype, **norm_kwargs
+                    normalizer_type, obs_dim, self.model.device,
+                    dtype=norm_dtype, **obs_norm_kwargs,
                 )
                 self.act_normalizer = mbrl.util.normalization.create_normalizer(
-                    normalizer_type, act_dim, self.model.device, dtype=norm_dtype, **norm_kwargs
+                    normalizer_type, act_dim, self.model.device,
+                    dtype=norm_dtype, **act_norm_kwargs,
                 )
 
         self.learned_rewards = learned_rewards
@@ -147,9 +175,127 @@ class OneDTransitionRewardModel(Model):
         self.no_delta_list = no_delta_list if no_delta_list else []
         self.obs_process_fn = obs_process_fn
 
+        # Warn when ``target_is_delta=True`` is combined with a robust
+        # normalizer.  The Soft-Winsorization rationale (Notion page) and
+        # :class:`SoftWinsorizedNormalizer` only cover the input/output
+        # normalization pipeline; the delta target computed as
+        # ``normalize(next_obs) - normalize(obs)`` (see :meth:`_process_batch`)
+        # is **not** the same as ``normalize(next_obs - obs)`` once the
+        # tanh soft-clip / quantile warp is active, and the documented
+        # bounded-target / round-trip properties no longer hold.
+        if (
+            normalize
+            and target_is_delta
+            and normalizer_type in {"winsorized", "quantile"}
+        ):
+            warnings.warn(
+                f"OneDTransitionRewardModel: combining target_is_delta=True with "
+                f"normalizer_type={normalizer_type!r} is currently UNSUPPORTED by the "
+                "Soft-Winsorization rationale: the regression target becomes "
+                "`normalize(next_obs) - normalize(obs)`, which is the difference "
+                "of two soft-clipped / quantile-warped z-scores and not equal to "
+                "`normalize(next_obs - obs)`.  Training stays self-consistent but "
+                "the bounded-target / exact round-trip guarantees of "
+                "SoftWinsorizedNormalizer do NOT carry over to the delta target.  "
+                "Set target_is_delta=False or switch normalizer_type to 'standard' "
+                "to recover the documented behaviour.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         self.num_elites = num_elites
         if not num_elites and isinstance(self.model, Ensemble):
             self.num_elites = self.model.num_members
+
+    @staticmethod
+    def _split_normalizer_kwargs(
+        norm_kwargs: Dict[str, Any], obs_dim: int, act_dim: int
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Split normalizer kwargs into obs/act subsets for the per-`feature_dim`
+        config API (:class:`SoftWinsorizedNormalizer`).
+
+        Recognised keys (all optional, all back-compatible):
+
+        - ``feature_dim_names``: ordered list of length ``obs_dim + act_dim``
+          (typically ``obs_dims + act_dims`` from the active
+          ``simulator/*.yaml``).  Split into the first ``obs_dim`` names for
+          ``obs_normalizer`` and the remaining ``act_dim`` names for
+          ``act_normalizer``.
+        - ``obs_feature_dim_names`` / ``act_feature_dim_names``: explicit
+          per-normalizer lists; take precedence over ``feature_dim_names``
+          if both are provided.
+        - ``winsor_percentile`` / ``soft_clip_iqr_mult``: scalars are
+          forwarded verbatim; ``Mapping`` (dict / ``DictConfig``) values
+          are split key-by-key using the resolved obs/act
+          ``feature_dim_names`` subsets.
+
+        Scalar/legacy usage is unaffected — when no per-dim key is
+        present, the same dict is returned for both obs and act.
+        """
+        try:
+            from omegaconf import DictConfig, ListConfig, OmegaConf  # type: ignore
+
+            _OMEGA_AVAILABLE = True
+        except ImportError:  # pragma: no cover - omegaconf is a hard dep here
+            _OMEGA_AVAILABLE = False
+            DictConfig = ListConfig = OmegaConf = None  # type: ignore
+
+        def _to_plain(v):
+            if _OMEGA_AVAILABLE and isinstance(v, (DictConfig, ListConfig)):
+                return OmegaConf.to_container(v, resolve=True)
+            return v
+
+        def _is_mapping(v):
+            return isinstance(v, Mapping) or (
+                _OMEGA_AVAILABLE and isinstance(v, DictConfig)
+            )
+
+        # Resolve obs/act feature_dim_names (explicit override > split-from-combined).
+        combined_names = _to_plain(norm_kwargs.get("feature_dim_names"))
+        obs_names = _to_plain(norm_kwargs.get("obs_feature_dim_names"))
+        act_names = _to_plain(norm_kwargs.get("act_feature_dim_names"))
+
+        if combined_names is not None and (obs_names is None or act_names is None):
+            if len(combined_names) != obs_dim + act_dim:
+                raise ValueError(
+                    f"normalizer_kwargs.feature_dim_names has length "
+                    f"{len(combined_names)} but obs_dim + act_dim = "
+                    f"{obs_dim + act_dim}.  Provide the concatenation of "
+                    f"`obs_dims + act_dims` from your simulator config."
+                )
+            if obs_names is None:
+                obs_names = list(combined_names[:obs_dim])
+            if act_names is None:
+                act_names = list(combined_names[obs_dim:])
+
+        # Helper: drop the wrapper-only keys before forwarding.
+        wrapper_only_keys = {
+            "feature_dim_names",
+            "obs_feature_dim_names",
+            "act_feature_dim_names",
+        }
+
+        obs_out: Dict[str, Any] = {}
+        act_out: Dict[str, Any] = {}
+        for k, v in norm_kwargs.items():
+            if k in wrapper_only_keys:
+                continue
+            plain_v = _to_plain(v)
+            if _is_mapping(v) and obs_names is not None and act_names is not None:
+                # Split a feature-dim-name-keyed mapping into obs / act subsets.
+                obs_out[k] = {n: plain_v[n] for n in obs_names if n in plain_v}
+                act_out[k] = {n: plain_v[n] for n in act_names if n in plain_v}
+            else:
+                # Scalar / None / list — forward verbatim to both.
+                obs_out[k] = plain_v
+                act_out[k] = plain_v
+
+        if obs_names is not None:
+            obs_out["feature_dim_names"] = list(obs_names)
+        if act_names is not None:
+            act_out["feature_dim_names"] = list(act_names)
+
+        return obs_out, act_out
 
     def _ensure_tensor(self, val: mbrl.types.TensorType) -> torch.Tensor:
         """Convert to tensor on model device, handling MPS float64."""
@@ -272,7 +418,17 @@ class OneDTransitionRewardModel(Model):
         next_obs_t = self._ensure_tensor(next_obs)
         if self.target_is_delta:
             if self._uses_robust_normalizer:
-                # Compute delta in normalized space for consistent scaling
+                # NOTE (UNSUPPORTED by Soft-Winsorization rationale): the
+                # delta target below is the difference of two soft-clipped /
+                # quantile-warped z-scores, NOT equal to
+                # ``normalize(next_obs - obs)``.  The bounded-target / exact
+                # round-trip guarantees of ``SoftWinsorizedNormalizer`` do
+                # not hold here.  Training is self-consistent because
+                # prediction uses the same definition, but interpretability
+                # of the latent space as a per-feature z-score is lost.
+                # A RuntimeWarning is emitted at ``__init__`` time when this
+                # branch will be taken; see the class docstring for details.
+                # Compute delta in normalized space for consistent scaling.
                 target_obs = self._normalize_composed_obs(next_obs_t) - self._normalize_composed_obs(obs_t)
                 for dim in self.no_delta_list:
                     target_obs[..., dim] = self._normalize_composed_obs(next_obs_t)[..., dim]
