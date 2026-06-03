@@ -381,7 +381,10 @@ class OneDTransitionRewardModel(Model):
 
         obs_denorm = self.obs_normalizer.denormalize(
             obs_part.reshape(-1, Do)
-        ).reshape(*leading, Do * H)
+        )
+
+        if len(leading) > 0:
+            obs_denorm = obs_denorm.reshape(*leading, Do * H)
 
         if act_part.shape[-1] > 0:
             act_denorm = self.act_normalizer.denormalize(
@@ -627,13 +630,13 @@ class OneDTransitionRewardModel(Model):
             # Model output is in normalized space; denormalize at the output boundary
             if self.target_is_delta:
                 # Delta is in normalized space; add to normalized obs, then denormalize
-                norm_obs = self.obs_normalizer.normalize(obs)
+                norm_obs = self._normalize_composed_obs(obs)
                 next_observs_norm = next_observs + norm_obs
                 for dim in self.no_delta_list:
                     next_observs_norm[:, dim] = next_observs[:, dim]
-                next_observs = self.obs_normalizer.denormalize(next_observs_norm)
+                next_observs = self._denormalize_composed_obs(next_observs_norm)
             else:
-                next_observs = self.obs_normalizer.denormalize(next_observs)
+                next_observs = self._denormalize_composed_obs(next_observs)
         else:
             if self.target_is_delta:
                 tmp_ = next_observs + obs
