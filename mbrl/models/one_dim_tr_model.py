@@ -193,6 +193,30 @@ class OneDTransitionRewardModel(Model):
         space, so the wrapped model lives entirely in normalized space, the
         wrapper denormalizes predictions at its boundary, and the AR round-trip
         collapses to a no-op (no normalizer handle is propagated).
+
+    Residual (``target_is_delta``) targets — single-step and multi-step
+    (RLRP-686):
+
+    * The wrapper converts ``(obs, action, next_obs)`` into the regression
+      target.  Under ``target_is_delta`` the obs target is the per-single-step
+      RESIDUAL taken in RAW space, ``next_obs - obs`` (``no_delta_list`` feature
+      columns are kept ABSOLUTE), then normalized by a SEPARATE output
+      ``obs_sub`` fitted on the residual distribution (see ``_build_normalizers``
+      / ``update_normalizer``).  Fitting the residual as a single warped quantity
+      preserves the bounded / outlier-robust guarantee of winsorized / quantile
+      (it is NOT a difference of two warped z-scores).  This works identically
+      for single-step (``Ho=1``) and multi-step (``MultiStepMLP``) models because
+      ``obs``/``next_obs`` are the same ``Hi`` window shifted by one step and the
+      wrapped model slices the horizon internally.
+    * Deploy reconstruction (``sample``): the prediction is a residual, so the
+      raw next obs is ``obs + denormalize_output(residual)`` (``no_delta`` dims
+      absolute).
+    * Auto-regressive feedback (block facades only): the AR loop must map a
+      predicted RESIDUAL back to the next ABSOLUTE obs slot before splicing it
+      into the sliding window — see :meth:`reconstruct_ar_step_obs` and its
+      wiring via ``ExponentialFamilyMLP.set_ar_step_obs_reconstructor``.  The
+      asymmetric ``standard`` path keeps ``target_is_delta`` single-step-only
+      (upstream PETS / MBPO), handled by the raw-space AR round-trip above.
     """
 
     _LEGACY_NORMALIZER_DIRS = ("obs_normalizer", "act_normalizer")
@@ -585,6 +609,48 @@ class OneDTransitionRewardModel(Model):
         out = facade.act_sub.denormalize(act_pred_norm.reshape(-1, self._Da))
         return out.reshape(*leading, self._Da * k) if len(leading) > 0 else out.reshape(self._Da * k)
 
+    def reconstruct_ar_step_obs(
+        self,
+        prev_obs_norm: torch.Tensor,
+        predicted_residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """RLRP-686: map an AR-predicted RESIDUAL to the next ABSOLUTE obs slot.
+
+        Used by the auto-regressive feedback loop (block-facade
+        ``target_is_delta`` path) to splice the model prediction back into the
+        sliding-window input.  Both ``prev_obs_norm`` (the latest single-step obs
+        slot of the window) and the return value live in INPUT-normalized space;
+        ``predicted_residual`` is the model output, a per-single-step residual in
+        OUTPUT-normalized space.  All tensors are ``Do``-wide on the last axis.
+
+        Contract (per §3.7)::
+
+            O_prev_raw = input_denormalize(prev_obs_norm)
+            res_raw    = output_denormalize(predicted_residual)
+            O_next_raw = O_prev_raw + res_raw        # no_delta dims: = res_raw
+            return input_normalize(O_next_raw)
+
+        For ``target_is_delta=False`` the prediction is already an absolute obs in
+        (shared) normalized space, so it is returned unchanged.
+        """
+        if not self.target_is_delta:
+            return predicted_residual
+        Do = self._Do
+        prev_shape = prev_obs_norm.shape
+        res_shape = predicted_residual.shape
+        O_prev_raw = self.input_normalizer.obs_sub.denormalize(
+            prev_obs_norm.reshape(-1, Do)
+        ).reshape(prev_shape)
+        res_raw = self.output_normalizer.obs_sub.denormalize(
+            predicted_residual.reshape(-1, Do)
+        ).reshape(res_shape)
+        O_next_raw = O_prev_raw + res_raw
+        for dim in self.no_delta_list:
+            O_next_raw[..., dim] = res_raw[..., dim]
+        return self.input_normalizer.obs_sub.normalize(
+            O_next_raw.reshape(-1, Do)
+        ).reshape(res_shape)
+
     # ---- robust composed-tensor shims (RLRP-684 S1 interim) -----------------
     # These delegate to the unified obs/act sub-normalizers behind the
     # ``output_normalizer`` block facade.  They preserve the pre-refactor
@@ -621,6 +687,36 @@ class OneDTransitionRewardModel(Model):
                 *leading, action.shape[-1]
             )
         return facade.act_sub.normalize(action)
+
+    def _normalize_composed_obs_input(self, composed_obs: torch.Tensor) -> torch.Tensor:
+        """Normalize a composed obs tensor with the INPUT (absolute) facade.
+
+        RLRP-686: this is the correct normalizer for the *model input* obs.  It
+        must NOT route through ``output_normalizer`` because, for the
+        ``target_is_delta`` block path, the output obs sub-normalizer is fitted
+        on the per-single-step RESIDUAL distribution (a different statistic),
+        whereas the model input carries ABSOLUTE observations and must use the
+        input obs sub-normalizer.  For the non-delta path the input and output
+        sub-normalizers are physically shared, so this is bit-equivalent to
+        :meth:`_normalize_composed_obs`.
+        """
+        facade = self.input_normalizer
+        Do, Da = self._Do, self._Da
+        if not self._is_multistep:
+            return facade.obs_sub.normalize(composed_obs)
+        H = self.model.history_len
+        leading = composed_obs.shape[:-1]
+        obs_part = composed_obs[..., : Do * H]
+        act_part = composed_obs[..., Do * H :]
+        obs_norm = facade.obs_sub.normalize(obs_part.reshape(-1, Do)).reshape(
+            *leading, Do * H
+        )
+        if act_part.shape[-1] > 0:
+            act_norm = facade.act_sub.normalize(act_part.reshape(-1, Da)).reshape(
+                *leading, act_part.shape[-1]
+            )
+            return torch.cat([obs_norm, act_norm], dim=-1)
+        return obs_norm
 
     def _denormalize_composed_obs(self, composed_obs_norm: torch.Tensor) -> torch.Tensor:
         facade = self.output_normalizer
