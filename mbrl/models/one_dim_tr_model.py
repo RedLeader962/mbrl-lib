@@ -223,33 +223,16 @@ class OneDTransitionRewardModel(Model):
         norm_dtype = torch.double if normalize_double_precision else torch.float
         norm_kwargs = normalizer_kwargs or {}
 
-        if normalize:
-            self._build_normalizers(normalizer_type, obs_dim, act_dim, norm_dtype, norm_kwargs)
-
         self.learned_rewards = learned_rewards
         self.target_is_delta = target_is_delta
         self.no_delta_list = no_delta_list if no_delta_list else []
         self.obs_process_fn = obs_process_fn
 
-        if (
-            normalize
-            and target_is_delta
-            and normalizer_type in {"winsorized", "quantile"}
-        ):
-            warnings.warn(
-                f"OneDTransitionRewardModel: combining target_is_delta=True with "
-                f"normalizer_type={normalizer_type!r} is currently UNSUPPORTED by the "
-                "Soft-Winsorization rationale: the regression target becomes "
-                "`normalize(next_obs) - normalize(obs)`, which is the difference "
-                "of two soft-clipped / quantile-warped z-scores and not equal to "
-                "`normalize(next_obs - obs)`.  Training stays self-consistent but "
-                "the bounded-target / exact round-trip guarantees of "
-                "SoftWinsorizedNormalizer do NOT carry over to the delta target.  "
-                "Set target_is_delta=False or switch normalizer_type to 'standard' "
-                "to recover the documented behaviour.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        # RLRP-686: target_is_delta/no_delta_list must be known before building
+        # normalizers so the block facade can allocate a SEPARATE residual-fitted
+        # output obs sub-normalizer for the delta case (see _build_normalizers).
+        if normalize:
+            self._build_normalizers(normalizer_type, obs_dim, act_dim, norm_dtype, norm_kwargs)
 
         self.num_elites = num_elites
         if not num_elites and isinstance(self.model, Ensemble):
@@ -292,9 +275,28 @@ class OneDTransitionRewardModel(Model):
         act_sub = mbrl.util.normalization.create_normalizer(
             normalizer_type, act_dim, self.model.device, dtype=norm_dtype, **act_norm_kwargs,
         )
-        # Same physical sub-normalizers shared by input and output facades.
         self.input_normalizer = _InputOutputNormalizerFacade(obs_sub=obs_sub, act_sub=act_sub)
-        self.output_normalizer = _InputOutputNormalizerFacade(obs_sub=obs_sub, act_sub=act_sub)
+        if self.target_is_delta:
+            # RLRP-686 (Q3 resolution): the OUTPUT/target obs normalizer is fitted
+            # on the per-single-step RESIDUAL distribution (next_obs - obs), kept
+            # SEPARATE from the input obs normalizer.  This keeps the delta target a
+            # single winsorized/quantile-warped quantity (bounded / outlier-robust)
+            # rather than a difference of two warped z-scores.  ``no_delta_list``
+            # feature columns are instead fitted on the absolute-obs distribution
+            # (see update_normalizer).  The act sub-normalizer is shared (actions in
+            # the composed output are absolute, never residualized).
+            out_obs_sub = mbrl.util.normalization.create_normalizer(
+                normalizer_type, obs_dim, self.model.device, dtype=norm_dtype, **obs_norm_kwargs,
+            )
+            self.output_normalizer = _InputOutputNormalizerFacade(
+                obs_sub=out_obs_sub, act_sub=act_sub
+            )
+        else:
+            # Symmetric absolute target: input and output share the same physical
+            # sub-normalizers (unchanged RLRP-684 behaviour).
+            self.output_normalizer = _InputOutputNormalizerFacade(
+                obs_sub=obs_sub, act_sub=act_sub
+            )
 
     def _resolve_obs_act_dim(self, normalizer_type, obs_dim, act_dim):
         if obs_dim is not None and act_dim is not None:
@@ -655,6 +657,38 @@ class OneDTransitionRewardModel(Model):
             model_in = self._apply_input_normalizer(model_in)
         return model_in
 
+    def _obs_block_width(self, composed: torch.Tensor) -> int:
+        """Width (last-axis) of the observation block in a composed obs tensor.
+
+        For multi-step models the composed tensor is ``[obs(Do*H) | act(...)]``;
+        otherwise the whole tensor is the (single-step) obs block.
+        """
+        if self._is_multistep:
+            return self._Do * self.model.history_len
+        return composed.shape[-1]
+
+    def _raw_residual_obs_target(
+        self, obs_t: torch.Tensor, next_obs_t: torch.Tensor
+    ) -> torch.Tensor:
+        """Build the RAW per-single-step residual target over the obs block.
+
+        RLRP-686: ``mix`` equals ``next_obs - obs`` on the observation block
+        (consecutive single-step residual, since ``obs`` / ``next_obs`` are the
+        same ``Hi``-composed window shifted by one step), keeps the absolute
+        ``next_obs`` value on ``no_delta_list`` feature columns (single-step
+        relative, broadcast across all slots via ``dim::Do``), and leaves any
+        trailing act block as the absolute ``next_obs`` (actions are never
+        residualized).  The caller normalizes this with the residual-fitted
+        output obs sub-normalizer.
+        """
+        Do = self._Do
+        ow = self._obs_block_width(next_obs_t)
+        mix = next_obs_t.clone()
+        mix[..., :ow] = next_obs_t[..., :ow] - obs_t[..., :ow]
+        for dim in self.no_delta_list:
+            mix[..., dim:ow:Do] = next_obs_t[..., dim:ow:Do]
+        return mix
+
     def _process_batch(
         self, batch: mbrl.types.TransitionBatch, _as_float: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -663,16 +697,18 @@ class OneDTransitionRewardModel(Model):
         next_obs_t = self._ensure_tensor(next_obs)
 
         if self.output_normalizer is not None:
-            # Robust path: target lives in NORMALIZED space, keeping the full
-            # composed observation layout (obs block + act block) of next_obs.
-            next_obs_norm = self._normalize_composed_obs(next_obs_t)
+            # Robust / symmetric block path: target lives in NORMALIZED space,
+            # keeping the full composed observation layout (obs block + act
+            # block) of next_obs.
             if self.target_is_delta:
-                obs_baseline_norm = self._normalize_composed_obs(obs_t)
-                target_obs = next_obs_norm - obs_baseline_norm
-                for dim in self.no_delta_list:
-                    target_obs[..., dim] = next_obs_norm[..., dim]
+                # RLRP-686: residual taken in RAW space, then normalized by the
+                # residual-fitted output obs sub-normalizer (single bounded
+                # warped value for winsorized/quantile).
+                target_obs = self._normalize_composed_obs(
+                    self._raw_residual_obs_target(obs_t, next_obs_t)
+                )
             else:
-                target_obs = next_obs_norm
+                target_obs = self._normalize_composed_obs(next_obs_t)
         else:
             # Standard / no-normalize path: target stays in RAW space.
             if self.target_is_delta:
@@ -731,6 +767,27 @@ class OneDTransitionRewardModel(Model):
         else:
             self.input_normalizer.obs_sub.update_stats(obs.reshape(-1, Do))
             self.input_normalizer.act_sub.update_stats(action.reshape(-1, Da))
+
+        # RLRP-686: when the output obs sub-normalizer is a SEPARATE residual-fitted
+        # normalizer (target_is_delta block path), fit it on the per-single-step
+        # residual distribution (next_obs - obs over the obs block; absolute for
+        # no_delta_list feature columns), so the delta target stays a single
+        # bounded warped quantity.
+        if (
+            self.target_is_delta
+            and self.output_normalizer is not None
+            and self.output_normalizer.obs_sub is not self.input_normalizer.obs_sub
+        ):
+            next_obs = self._ensure_tensor(batch.next_obs)
+            if next_obs.ndim == 1:
+                next_obs = next_obs.unsqueeze(0)
+            if self.obs_process_fn:
+                next_obs = self.obs_process_fn(next_obs)
+            ow = self._obs_block_width(next_obs)
+            res_mix = self._raw_residual_obs_target(obs, next_obs)
+            self.output_normalizer.obs_sub.update_stats(
+                res_mix[..., :ow].reshape(-1, Do)
+            )
 
     def loss(
         self,
@@ -806,21 +863,23 @@ class OneDTransitionRewardModel(Model):
         preds, next_model_state = self.model.sample_1d(
             model_in, model_state, rng=rng, deterministic=deterministic
         )
-        next_obs_norm = preds[:, :-1] if self.learned_rewards else preds
+        next_obs_pred = preds[:, :-1] if self.learned_rewards else preds
 
         if self.target_is_delta:
-            if self.output_normalizer is not None:
-                obs_baseline_norm = self._normalize_output(obs, obs_steps=1, act_steps=0)
-            else:
-                obs_baseline_norm = obs
-            tmp_ = next_obs_norm + obs_baseline_norm
+            # RLRP-686 deploy reconstruction (Q3 contract): the prediction is a
+            # RESIDUAL; denormalize it (residual-fitted output normalizer, or a
+            # no-op for the standard/raw path) then add the RAW baseline obs.
+            # ``no_delta_list`` dims are absolute (skip the baseline add).
+            res_raw = self._denormalize_output(
+                next_obs_pred, obs_steps=1, act_steps=0
+            )
+            next_observs = obs + res_raw
             for dim in self.no_delta_list:
-                tmp_[..., dim] = next_obs_norm[..., dim]
-            next_obs_norm = tmp_
-
-        next_observs = self._denormalize_output(
-            next_obs_norm, obs_steps=1, act_steps=0
-        )
+                next_observs[..., dim] = res_raw[..., dim]
+        else:
+            next_observs = self._denormalize_output(
+                next_obs_pred, obs_steps=1, act_steps=0
+            )
 
         rewards = preds[:, -1:] if self.learned_rewards else None
         next_model_state["obs"] = next_observs
