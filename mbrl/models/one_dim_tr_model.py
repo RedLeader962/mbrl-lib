@@ -152,6 +152,47 @@ class OneDTransitionRewardModel(Model):
     consumes/produces UN-NORMALIZED tensors; the wrapped dynamic model
     consumes/produces NORMALIZED tensors; the wrapper is the only normalization
     boundary.
+
+    Normalizer design rationale (single-step vs multi-step, symmetric vs
+    asymmetric) — read this before touching the normalization code:
+
+    * Two facade *shapes* exist behind the ``input_normalizer`` /
+      ``output_normalizer`` pair:
+
+      - **single** facade: ONE ``ZScoreNormalizer`` fitted over the *whole
+        concatenated* model input vector (per-position statistics).  Used only
+        by ``normalizer_type="standard"``.
+      - **block** facade: a pair of *block-shared, per-single-step*
+        sub-normalizers ``obs_sub`` (width ``Do``) and ``act_sub`` (width
+        ``Da``), shared between the input and output facades.  Used by
+        ``"standard_symmetric"`` (plain Z-score) and the robust ``"winsorized"``
+        / ``"quantile"`` variants.
+
+    * Single-step vs multi-step is handled by the SAME block sub-normalizers and
+      is *not* a separate code path: a composed tensor of layout
+      ``[obs(Do*k) | act(Da*m)]`` is reshaped to a per-single-step ``(-1, Do)`` /
+      ``(-1, Da)`` view before the sub-normalizer is applied, then reshaped
+      back.  Hence training-time *multi-step* predictions (``k=H``, ``m=H-1``)
+      and deploy-time *single-step* observations (``k=1``, ``m=0``) are denorm-
+      alized by the exact same statistics — the multi-step result is bit-
+      identical to denormalizing each single step independently
+      (see ``_output_primitive`` and ``_output_layout_steps``, and the
+      ``TestRobustDenormMultiVsSingleStep`` regression suite).
+
+    * Symmetric vs asymmetric refers to whether the regression *target* is
+      normalized:
+
+      - **asymmetric** (``"standard"``): input is normalized, target stays in
+        RAW space (``output_normalizer is None``).  This preserves upstream
+        mbrl PETS / MBPO behaviour.  Because input and target live in different
+        spaces, downstream auto-regressive (AR) loops MUST run the
+        ``denormalize -> shift -> renormalize`` round-trip (fed by the
+        ``input_normalizer`` handle propagated to the wrapped model).
+      - **symmetric** (``"standard_symmetric"`` / ``"winsorized"`` /
+        ``"quantile"``): both input and target are normalized in the same block
+        space, so the wrapped model lives entirely in normalized space, the
+        wrapper denormalizes predictions at its boundary, and the AR round-trip
+        collapses to a no-op (no normalizer handle is propagated).
     """
 
     _LEGACY_NORMALIZER_DIRS = ("obs_normalizer", "act_normalizer")
@@ -466,6 +507,18 @@ class OneDTransitionRewardModel(Model):
         )
 
     def _output_primitive(self, y, *, obs_steps, act_steps, denorm):
+        """Single source of truth for output (de)normalization.
+
+        Layout contract: ``y`` has last-axis layout
+        ``[obs(Do*obs_steps) | act(Da*act_steps)]``.  Each block is reshaped to a
+        per-single-step ``(-1, Do)`` / ``(-1, Da)`` view, run through the
+        block-shared ``obs_sub`` / ``act_sub`` sub-normalizer (``denormalize``
+        when ``denorm`` else ``normalize``), then reshaped back to the original
+        leading dims.  Because the transform is per-single-step, the
+        multi-step training case (``obs_steps=H, act_steps=H-1``) and the
+        single-step deploy case (``obs_steps=1, act_steps=0``) share identical
+        statistics — see the class-docstring "Normalizer design rationale".
+        """
         facade = self.output_normalizer
         if facade is None:
             return y
