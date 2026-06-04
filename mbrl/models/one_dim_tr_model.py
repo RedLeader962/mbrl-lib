@@ -217,12 +217,19 @@ class OneDTransitionRewardModel(Model):
     def _build_normalizers(self, normalizer_type, obs_dim, act_dim, norm_dtype, norm_kwargs):
         """Construct the unified ``input_normalizer`` / ``output_normalizer`` facades.
 
-        - ``standard``: a single concatenated ``ZScoreNormalizer`` is used as the
-          input normalizer; the output normalizer is ``None`` (target stays in
-          raw space, matching the legacy standard behaviour).
-        - ``winsorized`` / ``quantile``: a per-single-step ``obs_sub`` (size
-          ``Do``) and ``act_sub`` (size ``Da``) pair is shared by both the input
-          and output facades.
+        - ``standard`` (asymmetric Z-score): a single concatenated
+          ``ZScoreNormalizer`` is used as the input normalizer; the output
+          normalizer is ``None`` (target stays in raw space, matching the
+          legacy standard behaviour and upstream mbrl PETS / MBPO). Downstream
+          AR loops keep the ``denormalize -> shift -> renormalize`` round-trip
+          for this path.
+        - ``standard_symmetric`` (NEW, RLRP-684 A1): block-shared per-single-step
+          ``obs_sub`` (size ``Do``) / ``act_sub`` (size ``Da``)
+          ``ZScoreNormalizer``s shared by both the input and output facades, so
+          the target is normalized and predictions are denormalized at the
+          wrapper boundary. The AR round-trip is a no-op for this path.
+        - ``winsorized`` / ``quantile``: same block facade as
+          ``standard_symmetric`` but with the robust normalizer variants.
         """
         if normalizer_type == "standard":
             single = mbrl.util.normalization.ZScoreNormalizer(

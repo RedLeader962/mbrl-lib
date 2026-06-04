@@ -1554,7 +1554,12 @@ def create_normalizer(
     """Factory function to create a normalizer by type string.
 
     Args:
-        normalizer_type: ``"standard"``, ``"winsorized"``, or ``"quantile"``.
+        normalizer_type: ``"standard"``, ``"standard_symmetric"``, ``"winsorized"``,
+            or ``"quantile"``. ``"standard_symmetric"`` builds a plain
+            :class:`ZScoreNormalizer` just like ``"standard"`` — the distinction is
+            handled by :class:`~mbrl.models.OneDTransitionRewardModel`, which uses the
+            block-shared (input *and* output) facade for ``"standard_symmetric"`` and the
+            single input-only facade for ``"standard"``.
         in_size: feature dimension.
         device: torch device.
         dtype: torch dtype.
@@ -1565,7 +1570,7 @@ def create_normalizer(
         A normalizer instance (``ZScoreNormalizer``, ``SoftWinsorizedNormalizer``,
         or ``QuantileNormalizer``).
     """
-    if normalizer_type == "standard":
+    if normalizer_type in ("standard", "standard_symmetric"):
         clip_range = kwargs.get("clip_range", None)
         return ZScoreNormalizer(in_size, device, dtype=dtype, clip_range=clip_range)
     elif normalizer_type == "winsorized":
