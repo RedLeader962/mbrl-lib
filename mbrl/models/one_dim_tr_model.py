@@ -587,21 +587,36 @@ class OneDTransitionRewardModel(Model):
         """Denormalize a (possibly sliced) multi-step obs prediction.
 
         ``obs_pred_norm`` has shape ``(..., Do * k)`` in NORMALIZED space.  When
-        ``self.target_is_delta`` and ``add_obs_baseline`` is provided, the
-        UN-NORMALIZED ``O_t`` baseline is added back in NORMALIZED space (the
-        Q4-consistent reduction) before the final denormalize.
+        ``self.target_is_delta`` and ``add_obs_baseline`` (a single-step ``O_t``
+        of shape ``(..., Do)``) is provided, the prediction is treated as a
+        per-single-step RESIDUAL and reconstructed in RAW space following the
+        RLRP-686 (Q3) contract — the SAME contract used by :meth:`sample` and
+        :meth:`reconstruct_ar_step_obs`::
+
+            res_raw    = output_denormalize(obs_pred_norm)
+            O_next_raw = add_obs_baseline + res_raw     # delta dims (baseline
+                                                        # broadcast across the
+                                                        # k horizon slots)
+            O_next_raw = res_raw                        # no_delta dims (absolute)
+
+        The baseline is added in RAW (not normalized) space so the
+        reconstruction is exact for the NONLINEAR ``winsorized`` / ``quantile``
+        warps as well as the linear ``standard_symmetric`` Z-score
+        (``denorm(norm(b) + r) != b + denorm(r)`` for nonlinear normalizers).
         """
         if self.output_normalizer is None:
             return obs_pred_norm
         k = horizon_steps if horizon_steps is not None else (obs_pred_norm.shape[-1] // self._Do)
+        res_raw = self._denormalize_output(obs_pred_norm, obs_steps=k, act_steps=0)
         if self.target_is_delta and add_obs_baseline is not None:
-            baseline_norm = self._normalize_output(
-                add_obs_baseline, obs_steps=1, act_steps=0
-            )
-            obs_pred_norm = obs_pred_norm + baseline_norm
+            Do = self._Do
+            leading = res_raw.shape[:-1]
+            res_view = res_raw.reshape(*leading, k, Do)
+            out_view = res_view + add_obs_baseline.unsqueeze(-2)
             for dim in self.no_delta_list:
-                obs_pred_norm[..., dim :: self._Do] = obs_pred_norm[..., dim :: self._Do]
-        return self._denormalize_output(obs_pred_norm, obs_steps=k, act_steps=0)
+                out_view[..., dim] = res_view[..., dim]
+            return out_view.reshape(*leading, Do * k)
+        return res_raw
 
     def denormalize_predicted_act(
         self,
