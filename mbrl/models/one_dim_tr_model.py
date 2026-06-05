@@ -218,6 +218,14 @@ class OneDTransitionRewardModel(Model):
       asymmetric ``standard`` path keeps ``target_is_delta`` single-step-only
       (upstream PETS / MBPO), handled by the raw-space AR round-trip above.
     """
+    # (CRITICAL) ToDo: Rethink the target is delta logic. (ref task RLRP-686)
+    # Implementation is not working as expected. Results are actulay worst. Might be because
+    # the observations are velocity so target delta become acceleration which amplifie the noise.
+    # Also the implementation is error prone and it compute target delta only on the observation
+    # part of the composed observation (i.e., it does not compute delta target on the action part)
+    # which mean that the observation components are realy not on the same scale as the action part.
+    # We need to rethink this!
+    #
 
     _LEGACY_NORMALIZER_DIRS = ("obs_normalizer", "act_normalizer")
 
