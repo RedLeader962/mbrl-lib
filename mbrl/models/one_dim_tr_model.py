@@ -430,8 +430,17 @@ class OneDTransitionRewardModel(Model):
         return hasattr(self.model, "history_len") and hasattr(self.model, "singlestep_obs_len")
 
     @property
-    def _uses_robust_normalizer(self) -> bool:
-        """True when the robust block facade (winsorized / quantile) is active."""
+    def _uses_block_normalizer(self) -> bool:
+        """True when a *block* facade is active (``standard_symmetric`` /
+        ``winsorized`` / ``quantile``), i.e. a per-single-step ``obs_sub`` /
+        ``act_sub`` normalizer pair with a symmetric input+output facade.
+
+        This is False for the asymmetric ``"standard"`` path (single
+        per-position ``ZScoreNormalizer``, raw target, ``output_normalizer`` is
+        ``None``).  Renamed from ``_uses_robust_normalizer`` (RLRP-685): the
+        block facade now also covers ``standard_symmetric``, which is *not* a
+        robust/bounded normalizer, so "block" is the accurate distinction.
+        """
         return self.output_normalizer is not None and self.output_normalizer.is_block
 
     @property

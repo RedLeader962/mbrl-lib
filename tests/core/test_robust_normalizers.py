@@ -863,7 +863,7 @@ class TestComposedObsNormalization:
         )
         batch = _make_batch(self.N, self.Do, self.Da, self.H)
         one_d.update_normalizer(batch)
-        assert not one_d._uses_robust_normalizer
+        assert not one_d._uses_block_normalizer
         model_in = one_d._get_model_input(batch.obs, batch.act)
         expected_dim = self.Do * self.H + self.Da * self.H
         assert model_in.shape == (self.N, expected_dim)
