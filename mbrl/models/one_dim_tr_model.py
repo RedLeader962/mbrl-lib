@@ -404,8 +404,15 @@ class OneDTransitionRewardModel(Model):
         return hasattr(self.model, "history_len") and hasattr(self.model, "singlestep_obs_len")
 
     @property
-    def _uses_robust_normalizer(self) -> bool:
-        """True when the robust block facade (winsorized / quantile) is active."""
+    def _uses_block_facade(self) -> bool:
+        """True when the block (obs/act-split) facade is active.
+
+        This is the case for **every** block-facade normalizer — the robust
+        ``winsorized`` / ``quantile`` types *and* ``standard_symmetric`` — i.e.
+        whenever an ``output_normalizer`` exists and normalizes input *and*
+        output through the shared obs/act sub-normalizers.  It is ``False`` for
+        the asymmetric ``standard`` single-facade path (input-only normalize).
+        """
         return self.output_normalizer is not None and self.output_normalizer.is_block
 
     @property
@@ -523,6 +530,20 @@ class OneDTransitionRewardModel(Model):
         if facade is None:
             return y
         Do, Da = self._Do, self._Da
+        # RLRP-684 WS-B (B1): fail-fast layout guard. The composed OUTPUT tensor
+        # must have last-axis width exactly ``Do*obs_steps + Da*act_steps``;
+        # otherwise the per-single-step ``reshape(-1, Do/Da)`` views below would
+        # either crash cryptically or silently mis-slice the obs/act blocks.
+        W = y.shape[-1]
+        expected = Do * obs_steps + Da * act_steps
+        if W != expected:
+            raise ValueError(
+                f"_output_primitive: composed OUTPUT layout expected last-axis "
+                f"width Do*obs_steps + Da*act_steps = {Do}*{obs_steps} + "
+                f"{Da}*{act_steps} = {expected}, but got {W}. Check the "
+                f"(obs_steps, act_steps) passed by the caller against the actual "
+                f"prediction width (did a reward column or act tail leak in?)."
+            )
         leading = y.shape[:-1]
         obs_len = Do * obs_steps
         obs_part = y[..., :obs_len]
@@ -583,20 +604,50 @@ class OneDTransitionRewardModel(Model):
         out = facade.act_sub.denormalize(act_pred_norm.reshape(-1, self._Da))
         return out.reshape(*leading, self._Da * k) if len(leading) > 0 else out.reshape(self._Da * k)
 
-    # ---- robust composed-tensor shims (RLRP-684 S1 interim) -----------------
+    # ---- INPUT-layout composed-tensor shims (RLRP-684) ----------------------
     # These delegate to the unified obs/act sub-normalizers behind the
-    # ``output_normalizer`` block facade.  They preserve the pre-refactor
-    # composed-obs / composed-act semantics bit-for-bit so existing call sites
-    # (notably ``OneDTransitionRewardModelV2``) keep working while the broader
-    # call-site sweep to the ``_normalize_output`` / ``_denormalize_output``
-    # primitives is completed in a follow-up.
+    # ``output_normalizer`` block facade, using the **INPUT / history** layout
+    # (obs block = ``Do * history_len``).  They are the single source of truth
+    # for (de)normalizing history-composed tensors (model inputs / training
+    # targets).  As of the RLRP-684 output-denorm sweep they must NEVER be used
+    # on model *outputs* (predictions), whose obs block uses the horizon layout
+    # ``Do * horizon_len`` (often single-step ``Do``) — those paths go through
+    # ``denormalize_predicted_obs`` / ``_denormalize_output`` instead.
+    #
+    # DEPRECATED: ``_denormalize_composed_obs`` has no production call-site left
+    # (all output denorm rerouted); it is retained only for the existing
+    # input-layout round-trip tests and guarded by a fail-fast layout assert.
 
+    def _assert_input_obs_block(self, width: int, Do: int, H: int, Da: int, who: str) -> None:
+        """Fail-fast layout guard for the INPUT/history composed shims.
+
+        The obs block must be exactly ``Do * H`` wide and any trailing act block
+        a whole multiple of ``Da``.  Passing an OUTPUT/horizon-layout tensor
+        (e.g. an obs-only single-step prediction of width ``Do``) previously
+        produced a cryptic ``reshape`` error deep in the sub-normalizer; this
+        raises a clear, diagnosable ``ValueError`` instead.
+        """
+        obs_block = Do * H
+        if width < obs_block or (width - obs_block) % max(Da, 1) != 0:
+            raise ValueError(
+                f"{who}: composed INPUT/history layout expected obs block "
+                f"Do*history_len = {Do}*{H} = {obs_block} (+ k*Da act tail, Da={Da}), "
+                f"but got last-axis width {width}. This usually means an OUTPUT/"
+                f"horizon-layout tensor (e.g. a single-step prediction of width Do) "
+                f"was passed to an input-layout shim; route model outputs through "
+                f"``denormalize_predicted_obs`` / ``_denormalize_output`` instead."
+            )
+
+    # (Priority) ToDo: refactor _normalize_composed_obs to one_dim_tr_model_v2.py
     def _normalize_composed_obs(self, composed_obs: torch.Tensor) -> torch.Tensor:
         facade = self.output_normalizer
         Do, Da = self._Do, self._Da
         if not self._is_multistep:
             return facade.obs_sub.normalize(composed_obs)
         H = self.model.history_len
+        self._assert_input_obs_block(
+            composed_obs.shape[-1], Do, H, Da, "_normalize_composed_obs"
+        )
         leading = composed_obs.shape[:-1]
         obs_part = composed_obs[..., : Do * H]
         act_part = composed_obs[..., Do * H :]
@@ -610,6 +661,7 @@ class OneDTransitionRewardModel(Model):
             return torch.cat([obs_norm, act_norm], dim=-1)
         return obs_norm
 
+    # (Priority) ToDo: refactor _normalize_composed_act to one_dim_tr_model_v2.py
     def _normalize_composed_act(self, action: torch.Tensor) -> torch.Tensor:
         facade = self.output_normalizer
         Da = self._Da
@@ -620,12 +672,23 @@ class OneDTransitionRewardModel(Model):
             )
         return facade.act_sub.normalize(action)
 
+    @deprecated(reason="DEPRECATED input-layout denorm shim (RLRP-684).")
     def _denormalize_composed_obs(self, composed_obs_norm: torch.Tensor) -> torch.Tensor:
+        """DEPRECATED input-layout denorm shim (RLRP-684).
+
+        No production call-site remains — all model-output denormalization was
+        rerouted to ``denormalize_predicted_obs`` / ``_denormalize_output``.
+        Kept only for the existing input-layout round-trip tests; guarded by the
+        same fail-fast layout assert as its ``normalize`` counterpart.
+        """
         facade = self.output_normalizer
         Do, Da = self._Do, self._Da
         if not self._is_multistep:
             return facade.obs_sub.denormalize(composed_obs_norm)
         H = self.model.history_len
+        self._assert_input_obs_block(
+            composed_obs_norm.shape[-1], Do, H, Da, "_denormalize_composed_obs"
+        )
         leading = composed_obs_norm.shape[:-1]
         obs_part = composed_obs_norm[..., : Do * H]
         act_part = composed_obs_norm[..., Do * H :]

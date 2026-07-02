@@ -11,7 +11,7 @@ Quick comparison of normalizers:
 
 - ``ZScoreNormalizer`` — Standard running-mean z-score.  No outlier protection.
   Differentiable, linearly invertible.  Cost: O(N).
-- ``SoftWinsorizedNormalizer`` — Winsorized z-score + adaptive tanh soft-clip.
+- ``SoftWinsorizedNormalizer`` — Winsorized z-score + adaptive asinh soft-clip.
   Moderate outlier robustness.  Differentiable, closed-form invertible.
   Cost: O(N log N).
 - ``QuantileNormalizer`` — Empirical-CDF mapping to standard normal.
@@ -47,11 +47,11 @@ Rule of thumb — parameter configuration:
   Lower it to ``0.01``–``0.02`` if outliers are rare; raise to ``0.10`` for
   heavily contaminated streams.
 - ``soft_clip_iqr_mult`` (default ``3.0``): IQR multiplier for the per-feature
-  tanh clip threshold (``c_i ≈ mult × IQR/σ ≈ mult × 1.35`` for Gaussian
+  asinh clip threshold (``c_i ≈ mult × IQR/σ ≈ mult × 1.35`` for Gaussian
   data).  ``3.0`` keeps ≈ ±4 σ in the identity region — a safe default.
   Reduce to ``1.5``–``2.0`` for aggressive tail compression; values below
   ``0.75`` hit the internal floor of 1.0 and trigger a warning.
-  Set to ``None`` to **disable** the tanh soft-clip stage entirely and
+  Set to ``None`` to **disable** the asinh soft-clip stage entirely and
   recover the classic ``WinsorizedNormalizer`` behavior (pure winsorized
   z-score, no soft-clipping).
 
@@ -221,8 +221,15 @@ class ZScoreNormalizer(Normalizer):
         device: torch.device,
         dtype=torch.float32,
         clip_range: Optional[float] = None,
+        strict_finite: bool = True,
     ):
         super().__init__()
+        # RLRP-684 WS-C: when True, non-finite *input data* / *statistics*
+        # (the ``normalize`` forward path and ``update_stats``) raise instead of
+        # being silently clamped/zeroed. This is a fail-fast on genuine data or
+        # statistic corruption; it does NOT govern ``denormalize`` (the model-
+        # output inverse path), where early-training non-finiteness is tolerated.
+        self.strict_finite: bool = strict_finite
         self.register_buffer("_mean", torch.zeros((1, in_size), dtype=dtype))
         self.register_buffer("_std", torch.ones((1, in_size), dtype=dtype))
         # Minimum std floor chosen relative to each dtype's machine epsilon:
@@ -268,6 +275,13 @@ class ZScoreNormalizer(Normalizer):
             )
 
         if torch.isnan(data).any() or torch.isinf(data).any():
+            if self.strict_finite:
+                raise ValueError(
+                    "ZScoreNormalizer.update_stats received data containing NaN "
+                    "or Inf (strict_finite=True). Fix the upstream data pipeline, "
+                    "or pass strict_finite=False to tolerate it (entries are then "
+                    "replaced with zeros)."
+                )
             warnings.warn(
                 "ZScoreNormalizer.update_stats received data containing NaN or Inf. "
                 "These entries will be replaced with zeros.",
@@ -317,6 +331,13 @@ class ZScoreNormalizer(Normalizer):
         )
         if not torch.isfinite(result).all():
             non_finite_count = (~torch.isfinite(result)).sum().item()
+            if self.strict_finite:
+                raise ValueError(
+                    f"ZScoreNormalizer.normalize produced {non_finite_count} "
+                    "non-finite values (strict_finite=True). This indicates "
+                    "corrupt input data or degenerate statistics (mean/std). "
+                    "Pass strict_finite=False to fall back to clamping."
+                )
             warnings.warn(
                 f"ZScoreNormalizer produced {non_finite_count} non-finite values. "
                 "Clamping to finite data range. "
@@ -428,7 +449,7 @@ class ZScoreNormalizer(Normalizer):
 
 class SoftWinsorizedNormalizer(Normalizer):
     """Robust normalizer using winsorized z-score with per-`feature_dim`
-    adaptive tanh soft-clipping.
+    adaptive asinh soft-clipping.
 
     **What it does:**
 
@@ -440,10 +461,10 @@ class SoftWinsorizedNormalizer(Normalizer):
        ``[q_alpha, q_{1-alpha}]`` quantile range before computing mean and
        standard deviation, then standardizes.  This prevents extreme outliers
        from inflating the statistics.
-    2. **Per-`feature_dim` adaptive tanh soft-clip** — Derives an automatic
+    2. **Per-`feature_dim` adaptive asinh soft-clip** — Derives an automatic
        clip threshold per ``feature_dim`` from the interquartile range (IQR) as
        ``c_i = soft_clip_iqr_mult_i * IQR_i / sigma_i``, then smoothly
-       compresses z-scores that exceed ``c_i`` via ``tanh``.  Values inside
+       compresses z-scores that exceed ``c_i`` via ``asinh``.  Values inside
        ``[-c_i, c_i]`` pass through untouched (identity region).
 
     The transform is differentiable everywhere, monotonic, and has an exact
@@ -454,7 +475,7 @@ class SoftWinsorizedNormalizer(Normalizer):
 
     - a Python scalar (broadcast to every ``feature_dim`` — back-compatible
       default behaviour); ``None`` is additionally accepted for
-      ``soft_clip_iqr_mult`` and disables the tanh stage on every dim,
+      ``soft_clip_iqr_mult`` and disables the asinh stage on every dim,
       recovering the classic ``WinsorizedNormalizer``.
     - a :class:`~typing.Mapping` keyed by ``feature_dim`` names (as listed in
       ``feature_dim_names``), with strict set-equality validation; a ``None``
@@ -480,7 +501,7 @@ class SoftWinsorizedNormalizer(Normalizer):
 
     The implementation faithfully follows the math of the specification
     (clamp at ``[Q_alpha, Q_{1-alpha}]`` → winsorized mean/std on the clamped
-    data → z-score on the **raw** input → adaptive tanh soft-clip with
+    data → z-score on the **raw** input → adaptive asinh soft-clip with
     ``c_i = tau · IQR_i / sigma_i`` where ``IQR_i = Q_{0.75} - Q_{0.25}``).
     Two intentional numerical-safety deviations are applied:
 
@@ -535,8 +556,13 @@ class SoftWinsorizedNormalizer(Normalizer):
         winsor_percentile: WinsorPercentileConfig = 0.05,
         soft_clip_iqr_mult: SoftClipIqrMultConfig = 3.0,
         feature_dim_names: Optional[Sequence[str]] = None,
+        strict_finite: bool = True,
     ):
         super().__init__()
+        # RLRP-684 WS-C: fail-fast on non-finite *data* / *statistics* (the
+        # ``normalize`` forward path + ``update_stats``); ``denormalize`` (the
+        # model-output inverse) stays tolerant. See ZScoreNormalizer.strict_finite.
+        self.strict_finite: bool = strict_finite
         self._in_size = in_size
         self._dtype = dtype
         self._feature_dim_names: Optional[List[str]] = (
@@ -884,6 +910,13 @@ class SoftWinsorizedNormalizer(Normalizer):
             )
 
         if torch.isnan(data).any() or torch.isinf(data).any():
+            if self.strict_finite:
+                raise ValueError(
+                    "SoftWinsorizedNormalizer.update_stats received data "
+                    "containing NaN or Inf (strict_finite=True). Fix the upstream "
+                    "data pipeline, or pass strict_finite=False to tolerate it "
+                    "(entries are then replaced with zeros)."
+                )
             warnings.warn(
                 "SoftWinsorizedNormalizer.update_stats received data containing NaN or Inf. "
                 "These entries will be replaced with zeros.",
@@ -986,25 +1019,59 @@ class SoftWinsorizedNormalizer(Normalizer):
 
     @staticmethod
     def _soft_clip(z: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
-        """Per-feature adaptive tanh soft-clip."""
+        r"""Per-feature adaptive **asinh** soft-clip (RLRP-684 WS-D).
+
+        Forward map ``S_τ`` with per-feature threshold ``τ = threshold``:
+
+            S_τ(z) = z                                    if |z| <= τ
+                   = sign(z) · ( τ + asinh(|z| − τ) )      if |z| >  τ
+
+        with ``asinh(u) = ln(u + sqrt(u² + 1))``.  This replaces the previous
+        **bounded** ``tanh`` tail, whose image was the band ``|y| ∈ [τ, τ+1)``
+        so any model output with ``|y| >= τ+1`` had no pre-image and was
+        silently saturated by the inverse ``clamp`` — i.e. the winsorized path
+        was NOT invertible on unbounded model outputs.
+
+        Properties of the ``asinh`` tail (see the module maths note):
+          * **Global bijection ℝ→ℝ**: ``asinh`` maps ``[0,∞)→[0,∞)`` so the tail
+            image is ``|y| ∈ [τ,∞)`` (surjective) and is strictly increasing
+            (injective) ⇒ exactly invertible for ANY real output (no clamp).
+          * **C¹ at the knee** ``|z|=τ``: ``asinh(0)=0`` and ``d/du asinh(u)→1``
+            as ``u→0⁺``, matching the identity-region slope 1 (same smoothness
+            class as the old ``tanh`` version).
+          * **Logarithmic outlier compression** (``asinh(u)=ln(2u)+O(1/u²)``):
+            heavy-tail compression is preserved, but WITHOUT a ceiling.
+        """
         abs_z = z.abs()
         within = abs_z <= threshold
         excess = abs_z - threshold
-        soft_clipped = z.sign() * (threshold + torch.tanh(excess))
+        soft_clipped = z.sign() * (threshold + torch.asinh(excess))
         return torch.where(within, z, soft_clipped)
 
     @staticmethod
     def _soft_clip_inverse(y: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
-        """Exact inverse of per-feature adaptive tanh soft-clip."""
+        r"""Exact analytic inverse of :meth:`_soft_clip` (RLRP-684 WS-D).
+
+            S_τ⁻¹(y) = y                                   if |y| <= τ
+                     = sign(y) · ( τ + sinh(|y| − τ) )      if |y| >  τ
+
+        with ``sinh(v) = (eᵛ − e⁻ᵛ)/2``.  Because ``sinh(asinh(u)) = u`` for all
+        ``u``, ``S_τ⁻¹(S_τ(z)) = z`` for every real ``z`` and ``S_τ(S_τ⁻¹(y)) = y``
+        for every real ``y``.  Unlike the previous ``atanh`` inverse there is
+        **no** ``clamp`` (``sinh`` is defined on all of ℝ), so denormalization is
+        exact for any model output.  Extreme ``|y|−τ`` may legitimately overflow
+        ``sinh`` to ±inf; that non-finite signal is surfaced by the WS-C
+        telemetry rather than silently saturated.
+        """
         abs_y = y.abs()
         within = abs_y <= threshold
-        excess = (abs_y - threshold).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-        soft_unclipped = y.sign() * (threshold + torch.atanh(excess))
+        excess = abs_y - threshold
+        soft_unclipped = y.sign() * (threshold + torch.sinh(excess))
         return torch.where(within, y, soft_unclipped)
 
     @torch.compiler.disable
     def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
-        """Winsorized z-score followed by per-feature adaptive tanh soft-clip.
+        """Winsorized z-score followed by per-feature adaptive asinh soft-clip.
 
         Args:
             val: The value to normalize.
@@ -1026,6 +1093,13 @@ class SoftWinsorizedNormalizer(Normalizer):
 
         if not torch.isfinite(z).all():
             non_finite_count = (~torch.isfinite(z)).sum().item()
+            if self.strict_finite:
+                raise ValueError(
+                    f"SoftWinsorizedNormalizer.normalize produced "
+                    f"{non_finite_count} non-finite values (strict_finite=True). "
+                    "This indicates corrupt input data or degenerate winsorized "
+                    "statistics. Pass strict_finite=False to fall back to clamping."
+                )
             warnings.warn(
                 f"SoftWinsorizedNormalizer produced {non_finite_count} non-finite values. "
                 "Clamping to finite data range.",
@@ -1281,8 +1355,12 @@ class QuantileNormalizer(Normalizer):
         dtype=torch.float32,
         n_bins: int = 1000,
         tail_policy: str = "linear",
+        strict_finite: bool = True,
     ):
         super().__init__()
+        # RLRP-684 WS-C: fail-fast on non-finite *data* in ``update_stats``;
+        # ``denormalize`` (the model-output inverse) stays tolerant.
+        self.strict_finite: bool = strict_finite
         assert tail_policy in ("linear",), f"Unsupported tail_policy: {tail_policy}"
         self.n_bins = n_bins
         self.tail_policy = tail_policy
@@ -1340,6 +1418,13 @@ class QuantileNormalizer(Normalizer):
             )
 
         if torch.isnan(data).any() or torch.isinf(data).any():
+            if self.strict_finite:
+                raise ValueError(
+                    "QuantileNormalizer.update_stats received data containing NaN "
+                    "or Inf (strict_finite=True). Fix the upstream data pipeline, "
+                    "or pass strict_finite=False to tolerate it (entries are then "
+                    "replaced with zeros)."
+                )
             warnings.warn(
                 "QuantileNormalizer.update_stats received data containing NaN or Inf. "
                 "These entries will be replaced with zeros.",
@@ -1354,6 +1439,21 @@ class QuantileNormalizer(Normalizer):
 
         # Per-feature quantile boundaries
         boundaries = torch.quantile(data, p, dim=0)  # (n_bins+1, in_size)
+
+        # RLRP-684 WS-B (B3): ``normalize`` / ``denormalize`` rely on
+        # ``torch.searchsorted`` over these boundaries, which requires them to be
+        # monotone non-decreasing along the bin axis (per feature).  Empirical
+        # quantiles are sorted by construction, but assert it explicitly so any
+        # future regression (e.g. NaN-poisoned data slipping through) fails fast
+        # with a clear message instead of returning silently wrong indices.
+        min_diff = (boundaries[1:] - boundaries[:-1]).min().item()
+        if min_diff < 0.0:
+            raise ValueError(
+                "QuantileNormalizer.update_stats produced non-monotone quantile "
+                f"boundaries (min adjacent diff = {min_diff}). searchsorted "
+                "requires monotone non-decreasing boundaries; check the input "
+                "data for NaN/Inf or degenerate features."
+            )
         self.quantile_boundaries.copy_(boundaries)
 
         # Update compatibility caches
@@ -1570,9 +1670,17 @@ def create_normalizer(
         A normalizer instance (``ZScoreNormalizer``, ``SoftWinsorizedNormalizer``,
         or ``QuantileNormalizer``).
     """
+    # RLRP-684 WS-C: forward the fail-fast-on-non-finite policy to every type.
+    strict_finite = kwargs.get("strict_finite", True)
     if normalizer_type in ("standard", "standard_symmetric"):
         clip_range = kwargs.get("clip_range", None)
-        return ZScoreNormalizer(in_size, device, dtype=dtype, clip_range=clip_range)
+        return ZScoreNormalizer(
+            in_size,
+            device,
+            dtype=dtype,
+            clip_range=clip_range,
+            strict_finite=strict_finite,
+        )
     elif normalizer_type == "winsorized":
         return SoftWinsorizedNormalizer(
             in_size,
@@ -1581,6 +1689,7 @@ def create_normalizer(
             winsor_percentile=kwargs.get("winsor_percentile", 0.05),
             soft_clip_iqr_mult=kwargs.get("soft_clip_iqr_mult", 3.0),
             feature_dim_names=kwargs.get("feature_dim_names", None),
+            strict_finite=strict_finite,
         )
     elif normalizer_type == "quantile":
         return QuantileNormalizer(
@@ -1589,9 +1698,10 @@ def create_normalizer(
             dtype=dtype,
             n_bins=kwargs.get("n_bins", 1000),
             tail_policy=kwargs.get("tail_policy", "linear"),
+            strict_finite=strict_finite,
         )
     else:
         raise ValueError(
             f"Unknown normalizer_type '{normalizer_type}'. "
-            "Choose from 'standard', 'winsorized', 'quantile'."
+            "Choose from 'standard', 'standard_symmetric', 'winsorized', 'quantile'."
         )

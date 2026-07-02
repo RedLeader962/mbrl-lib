@@ -165,16 +165,26 @@ class TestSaveLoad:
 # ------------------------------------------------------------------ #
 class TestNumericalRobustness:
     def test_update_stats_with_nan(self):
+        # RLRP-684 WS-C: default strict_finite=True -> fail fast on non-finite data.
         norm = mbrl.util.normalization.ZScoreNormalizer(2, torch.device(_DEVICE))
         data = torch.randn(20, 2)
         data[5, 0] = float("nan")
-        with pytest.warns(RuntimeWarning, match="NaN or Inf"):
+        with pytest.raises(ValueError, match="NaN or Inf"):
             norm.update_stats(data)
-        assert torch.isfinite(norm.mean).all()
-        assert torch.isfinite(norm.std).all()
+        # strict_finite=False restores the tolerant warn-and-zero fallback.
+        norm_soft = mbrl.util.normalization.ZScoreNormalizer(
+            2, torch.device(_DEVICE), strict_finite=False
+        )
+        with pytest.warns(RuntimeWarning, match="NaN or Inf"):
+            norm_soft.update_stats(data)
+        assert torch.isfinite(norm_soft.mean).all()
+        assert torch.isfinite(norm_soft.std).all()
 
     def test_update_stats_with_inf(self):
-        norm = mbrl.util.normalization.ZScoreNormalizer(2, torch.device(_DEVICE))
+        # strict_finite=False keeps the tolerant path (fail-fast covered above).
+        norm = mbrl.util.normalization.ZScoreNormalizer(
+            2, torch.device(_DEVICE), strict_finite=False
+        )
         data = torch.randn(20, 2)
         data[3, 1] = float("inf")
         with pytest.warns(RuntimeWarning, match="NaN or Inf"):
@@ -204,7 +214,9 @@ class TestNumericalRobustness:
             norm.update_stats(data)
 
     def test_normalize_degenerate_stats(self):
-        norm = mbrl.util.normalization.ZScoreNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.ZScoreNormalizer(
+            2, torch.device(_DEVICE), strict_finite=False
+        )
         norm.mean.fill_(float("inf"))
         with pytest.warns(RuntimeWarning, match="non-finite values"):
             result = norm.normalize(torch.ones(1, 2))
@@ -222,7 +234,11 @@ class TestNumericalRobustness:
 
     def test_robotic_data_scenario(self):
         """Simulate realistic robotic data with different scales and NaN spikes."""
-        norm = mbrl.util.normalization.ZScoreNormalizer(4, torch.device(_DEVICE))
+        # strict_finite=False: this scenario intentionally injects NaN/Inf spikes
+        # and asserts the tolerant fallback recovers usable statistics.
+        norm = mbrl.util.normalization.ZScoreNormalizer(
+            4, torch.device(_DEVICE), strict_finite=False
+        )
         n = 200
         data = torch.zeros(n, 4)
         data[:, 0] = torch.randn(n) * 0.01  # joint position (small)
@@ -471,8 +487,12 @@ class TestNonFiniteWarnAndClamp:
     """Verify that normalize/denormalize warn and clamp (not zero) on non-finite values."""
 
     def test_normalize_warns_on_non_finite(self):
-        """RuntimeWarning must be raised when normalize produces non-finite values."""
-        norm = mbrl.util.normalization.ZScoreNormalizer(2, torch.device(_DEVICE))
+        """RuntimeWarning must be raised when normalize produces non-finite values
+        (tolerant path, strict_finite=False). See TestStrictFinite for the
+        default fail-fast behavior."""
+        norm = mbrl.util.normalization.ZScoreNormalizer(
+            2, torch.device(_DEVICE), strict_finite=False
+        )
         norm.mean.fill_(float("inf"))
         with pytest.warns(RuntimeWarning, match="non-finite values"):
             norm.normalize(torch.ones(1, 2))
@@ -486,7 +506,9 @@ class TestNonFiniteWarnAndClamp:
 
     def test_normalize_clamps_to_finite_range(self):
         """Non-finite values should be clamped to [min, max] of the finite values."""
-        norm = mbrl.util.normalization.ZScoreNormalizer(3, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.ZScoreNormalizer(
+            3, torch.device(_DEVICE), strict_finite=False
+        )
         data = torch.randn(50, 3)
         norm.update_stats(data)
         # Force one std entry to zero to trigger inf in division
@@ -501,7 +523,9 @@ class TestNonFiniteWarnAndClamp:
 
     def test_normalize_all_non_finite_fallback_to_zeros(self):
         """When all values are non-finite, fallback must produce zeros."""
-        norm = mbrl.util.normalization.ZScoreNormalizer(2, torch.device(_DEVICE))
+        norm = mbrl.util.normalization.ZScoreNormalizer(
+            2, torch.device(_DEVICE), strict_finite=False
+        )
         norm.mean.fill_(float("inf"))
         norm.std.fill_(1.0)
         with pytest.warns(RuntimeWarning, match="non-finite values"):

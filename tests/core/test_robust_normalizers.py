@@ -108,13 +108,20 @@ class TestWinsorizedRobustness:
         )
 
     def test_nan_handling(self):
+        # RLRP-684 WS-C: default strict_finite=True -> fail fast on non-finite data.
         norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         data = torch.randn(50, 2)
         data[5, 0] = float("nan")
-        with pytest.warns(RuntimeWarning, match="NaN or Inf"):
+        with pytest.raises(ValueError, match="NaN or Inf"):
             norm.update_stats(data)
-        assert torch.isfinite(norm.winsorized_mean).all()
-        assert torch.isfinite(norm.winsorized_std).all()
+        # strict_finite=False restores the tolerant warn-and-zero fallback.
+        norm_soft = mbrl.util.normalization.SoftWinsorizedNormalizer(
+            2, torch.device(_DEVICE), strict_finite=False
+        )
+        with pytest.warns(RuntimeWarning, match="NaN or Inf"):
+            norm_soft.update_stats(data)
+        assert torch.isfinite(norm_soft.winsorized_mean).all()
+        assert torch.isfinite(norm_soft.winsorized_std).all()
 
     def test_constant_feature(self):
         norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
@@ -144,15 +151,23 @@ class TestWinsorizedRobustness:
 
 
 class TestWinsorizedSoftClip:
-    def test_soft_clip_bounded(self):
-        """Output should be bounded to ±(c_i + 1)."""
+    def test_soft_clip_asinh_unbounded_and_invertible(self):
+        """RLRP-684 WS-D: the asinh soft-clip is unbounded (no ceiling) and
+        exactly invertible even far out-of-band — unlike the old bounded tanh
+        tail whose image saturated at ±(c_i + 1) and was not invertible there.
+        """
         norm = mbrl.util.normalization.SoftWinsorizedNormalizer(2, torch.device(_DEVICE))
         data = torch.randn(500, 2)
         norm.update_stats(data)
         extreme = norm.winsorized_mean + 20.0 * norm.winsorized_std
         result = norm.normalize(extreme)
-        max_bound = norm.clip_threshold + 1.0
-        assert (result.abs() <= max_bound + 1e-5).all()
+        assert torch.isfinite(result).all()
+        # Genuinely unbounded tail: output exceeds the old tanh ceiling (c+1).
+        old_tanh_ceiling = norm.clip_threshold + 1.0
+        assert (result.abs() > old_tanh_ceiling).any()
+        # Exact analytic round-trip even out-of-band (no saturation).
+        recon = norm.denormalize(result)
+        assert torch.allclose(recon, extreme, atol=1e-4)
 
     def test_soft_clip_monotonic(self):
         """The soft-clip function must be monotonic."""
@@ -336,11 +351,19 @@ class TestQuantileRobustness:
         assert torch.allclose(result_clean[mask], result_dirty[mask], atol=0.1)
 
     def test_nan_handling(self):
+        # RLRP-684 WS-C: default strict_finite=True -> fail fast on non-finite data.
         norm = mbrl.util.normalization.QuantileNormalizer(2, torch.device(_DEVICE), n_bins=50)
         data = torch.randn(50, 2)
         data[5, 0] = float("nan")
-        with pytest.warns(RuntimeWarning, match="NaN or Inf"):
+        with pytest.raises(ValueError, match="NaN or Inf"):
             norm.update_stats(data)
+        # strict_finite=False restores the tolerant warn-and-zero fallback.
+        norm_soft = mbrl.util.normalization.QuantileNormalizer(
+            2, torch.device(_DEVICE), n_bins=50, strict_finite=False
+        )
+        with pytest.warns(RuntimeWarning, match="NaN or Inf"):
+            norm_soft.update_stats(data)
+        assert torch.isfinite(norm_soft.quantile_boundaries).all()
 
     def test_constant_feature(self):
         """Constant feature should not cause division by zero."""
@@ -863,7 +886,7 @@ class TestComposedObsNormalization:
         )
         batch = _make_batch(self.N, self.Do, self.Da, self.H)
         one_d.update_normalizer(batch)
-        assert not one_d._uses_robust_normalizer
+        assert not one_d._uses_block_facade
         model_in = one_d._get_model_input(batch.obs, batch.act)
         expected_dim = self.Do * self.H + self.Da * self.H
         assert model_in.shape == (self.N, expected_dim)
@@ -1360,3 +1383,125 @@ class TestSoftWinsorizedCudaDevice:
         # Enabled dims have positive (>= 1.0 due to the floor) threshold.
         assert normalizer.clip_threshold[0, 0].item() >= 1.0
         assert normalizer.clip_threshold[0, 2].item() >= 1.0
+
+
+# ------------------------------------------------------------------ #
+#  RLRP-684 — output-denorm layout sweep, fail-fast asserts, asinh
+# ------------------------------------------------------------------ #
+class TestRLRP684OutputDenorm:
+    """Reroute of model-OUTPUT de-normalization onto the layout-aware
+    primitives (``denormalize_predicted_obs`` / ``_denormalize_output``) and the
+    accompanying fail-fast layout asserts."""
+
+    Do, Da, H, N = 3, 1, 13, 100
+
+    def _make_model(self, ntype):
+        kwargs = {"n_bins": 50} if ntype == "quantile" else {}
+        model = _MockMultiStepModel(self.Do, self.Da, self.H)
+        one_d = mbrl.models.OneDTransitionRewardModel(
+            model=model,
+            normalize=True,
+            normalizer_type=ntype,
+            obs_dim=self.Do,
+            act_dim=self.Da,
+            target_is_delta=False,
+            learned_rewards=False,
+            normalizer_kwargs=kwargs,
+        )
+        one_d.update_normalizer(_make_batch(self.N, self.Do, self.Da, self.H))
+        return one_d
+
+    @pytest.mark.parametrize("ntype", ["standard_symmetric", "winsorized", "quantile"])
+    def test_denormalize_predicted_obs_single_step_through_ms_model(self, ntype):
+        """A single-step obs OUTPUT (width Do) must denormalize correctly through
+        a multi-step model — this is the exact tensor shape that crashed the
+        input-layout shim (``[1,360,180]`` reshape on size ``Do``)."""
+        one_d = self._make_model(ntype)
+        obs_ss = torch.randn(self.N, self.Do)
+        # Normalize obs-only single-step via the shared obs sub-normalizer,
+        # then denormalize via the layout-aware public helper (auto k = W//Do = 1).
+        obs_ss_norm = one_d.output_normalizer.obs_sub.normalize(obs_ss)
+        recovered = one_d.denormalize_predicted_obs(obs_ss_norm)
+        assert recovered.shape == obs_ss.shape
+        assert torch.allclose(recovered, obs_ss, atol=1e-4)
+
+    def test_input_layout_shim_fails_fast_on_output_tensor(self):
+        """WS-B/B2: feeding an OUTPUT/horizon-layout tensor (single-step, width
+        Do) to the deprecated input-layout shim must raise a clear ValueError
+        instead of the cryptic reshape crash."""
+        one_d = self._make_model("winsorized")
+        obs_ss_norm = torch.randn(self.N, self.Do)
+        with pytest.raises(ValueError, match="INPUT/history layout"):
+            one_d._denormalize_composed_obs(obs_ss_norm)
+
+    def test_output_primitive_width_assert(self):
+        """WS-B/B1: _output_primitive must reject a width that does not match
+        Do*obs_steps + Da*act_steps."""
+        one_d = self._make_model("winsorized")
+        bad = torch.randn(self.N, self.Do * 2)  # claims obs_steps=1 but width=2*Do
+        with pytest.raises(ValueError, match="composed OUTPUT layout"):
+            one_d._denormalize_output(bad, obs_steps=1, act_steps=0)
+
+
+class TestRLRP684AsinhSoftClip:
+    """Analytic properties of the asinh/sinh soft-clip (WS-D)."""
+
+    _SC = mbrl.util.normalization.SoftWinsorizedNormalizer
+
+    def test_sinh_inverts_asinh_out_of_band(self):
+        """Exact global round-trip S^-1(S(z)) == z for any z (incl. far tail)."""
+        threshold = torch.tensor([[3.0]])
+        z = torch.linspace(-50.0, 50.0, 1001, dtype=torch.float64).unsqueeze(1)
+        y = self._SC._soft_clip(z, threshold.double())
+        recovered = self._SC._soft_clip_inverse(y, threshold.double())
+        assert torch.allclose(recovered, z, atol=1e-9)
+
+    def test_unbounded_image(self):
+        """The tail image is unbounded (no ±(tau+1) ceiling like the old tanh)."""
+        threshold = torch.tensor([[3.0]])
+        z = torch.tensor([[100.0]])
+        y = self._SC._soft_clip(z, threshold)
+        # asinh(97) + 3 ~ 8.27 > tanh ceiling (tau + 1 = 4)
+        assert y.item() > threshold.item() + 1.0
+
+    def test_c1_continuity_at_knee(self):
+        """Slope -> 1 as |z| -> tau^+, matching the identity region (C^1)."""
+        threshold = torch.tensor([[3.0]])
+        eps = 1e-4
+        z0 = torch.tensor([[3.0 + eps]], dtype=torch.float64)
+        z1 = torch.tensor([[3.0 + 2 * eps]], dtype=torch.float64)
+        y0 = self._SC._soft_clip(z0, threshold.double())
+        y1 = self._SC._soft_clip(z1, threshold.double())
+        slope = (y1 - y0).item() / eps
+        assert slope == pytest.approx(1.0, abs=1e-2)
+
+    def test_monotonic_strictly_increasing(self):
+        threshold = torch.tensor([[2.5]])
+        z = torch.linspace(-20, 20, 4000, dtype=torch.float64).unsqueeze(1)
+        y = self._SC._soft_clip(z, threshold.double())
+        diffs = y[1:] - y[:-1]
+        assert (diffs > 0).all()
+
+
+class TestRLRP684Factory:
+    """WS-B/B4 factory message + WS-C strict_finite forwarding."""
+
+    def test_error_message_lists_standard_symmetric(self):
+        with pytest.raises(ValueError, match="standard_symmetric"):
+            mbrl.util.normalization.create_normalizer(
+                "bogus", 3, torch.device(_DEVICE)
+            )
+
+    @pytest.mark.parametrize(
+        "ntype", ["standard", "standard_symmetric", "winsorized", "quantile"]
+    )
+    def test_strict_finite_forwarded(self, ntype):
+        kwargs = {"n_bins": 50} if ntype == "quantile" else {}
+        norm = mbrl.util.normalization.create_normalizer(
+            ntype, 3, torch.device(_DEVICE), strict_finite=False, **kwargs
+        )
+        assert norm.strict_finite is False
+        norm_default = mbrl.util.normalization.create_normalizer(
+            ntype, 3, torch.device(_DEVICE), **kwargs
+        )
+        assert norm_default.strict_finite is True
