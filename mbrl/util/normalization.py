@@ -127,11 +127,22 @@ class Normalizer(torch.nn.Module, abc.ABC):
         """
 
     @abc.abstractmethod
-    def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+    def normalize(
+        self,
+        val: Union[float, mbrl.types.TensorType],
+        strict_finite: Optional[bool] = None,
+    ) -> torch.Tensor:
         """Normalize *val* according to stored statistics.
 
         Args:
             val: value(s) to normalize.
+            strict_finite: optional per-call override of the instance-level
+                :attr:`strict_finite` fail-fast policy. ``None`` (default) uses
+                the instance setting. Pass ``False`` when normalizing values
+                that are *model outputs* (e.g. auto-regressive test-time rollout
+                predictions fed back as inputs), which may legitimately be
+                non-finite / diverged early in training and should be clamped
+                rather than raise; genuine *input data* keeps the strict default.
 
         Returns:
             Normalized tensor (same dtype as input).
@@ -301,7 +312,11 @@ class ZScoreNormalizer(Normalizer):
         return None
 
     @torch.compiler.disable
-    def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+    def normalize(
+        self,
+        val: Union[float, mbrl.types.TensorType],
+        strict_finite: Optional[bool] = None,
+    ) -> torch.Tensor:
         """Normalizes the value according to the stored statistics.
 
         Equivalent to (val - mu) / sigma, where mu and sigma are the stored mean and
@@ -315,10 +330,17 @@ class ZScoreNormalizer(Normalizer):
 
         Args:
             val (float, np.ndarray or torch.Tensor): The value to normalize.
+            strict_finite: optional per-call override of :attr:`strict_finite`
+                (see :meth:`Normalizer.normalize`). ``None`` uses the instance
+                setting. Note that a non-finite ``result`` can also arise from a
+                *huge but finite* input overflowing ``(val - mu) / sigma`` (a
+                diverged model-output prediction fed back as input); the tolerant
+                path clamps it to the finite range instead of raising.
 
         Returns:
             (torch.Tensor): The normalized value.
         """
+        _strict_finite = self.strict_finite if strict_finite is None else strict_finite
         val = self._to_tensor(val)
         input_dtype = val.dtype
         compute_dtype = (
@@ -331,7 +353,7 @@ class ZScoreNormalizer(Normalizer):
         )
         if not torch.isfinite(result).all():
             non_finite_count = (~torch.isfinite(result)).sum().item()
-            if self.strict_finite:
+            if _strict_finite:
                 raise ValueError(
                     f"ZScoreNormalizer.normalize produced {non_finite_count} "
                     "non-finite values (strict_finite=True). This indicates "
@@ -1070,15 +1092,24 @@ class SoftWinsorizedNormalizer(Normalizer):
         return torch.where(within, y, soft_unclipped)
 
     @torch.compiler.disable
-    def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+    def normalize(
+        self,
+        val: Union[float, mbrl.types.TensorType],
+        strict_finite: Optional[bool] = None,
+    ) -> torch.Tensor:
         """Winsorized z-score followed by per-feature adaptive asinh soft-clip.
 
         Args:
             val: The value to normalize.
+            strict_finite: optional per-call override of :attr:`strict_finite`
+                (see :meth:`Normalizer.normalize`). ``None`` uses the instance
+                setting; pass ``False`` for tolerant clamping of model-output
+                (e.g. test-time-rollout feedback) values.
 
         Returns:
             The normalized value (same dtype as input).
         """
+        _strict_finite = self.strict_finite if strict_finite is None else strict_finite
         val = self._to_tensor(val)
         input_dtype = val.dtype
         compute_dtype = (
@@ -1093,7 +1124,7 @@ class SoftWinsorizedNormalizer(Normalizer):
 
         if not torch.isfinite(z).all():
             non_finite_count = (~torch.isfinite(z)).sum().item()
-            if self.strict_finite:
+            if _strict_finite:
                 raise ValueError(
                     f"SoftWinsorizedNormalizer.normalize produced "
                     f"{non_finite_count} non-finite values (strict_finite=True). "
@@ -1466,15 +1497,25 @@ class QuantileNormalizer(Normalizer):
         self._std_cache.copy_(iqr.unsqueeze(0))
 
     @torch.compiler.disable
-    def normalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+    def normalize(
+        self,
+        val: Union[float, mbrl.types.TensorType],
+        strict_finite: Optional[bool] = None,
+    ) -> torch.Tensor:
         """Map values through empirical CDF to standard normal via linear interpolation.
 
         Args:
             val: The value to normalize.
+            strict_finite: accepted for interface parity with
+                :meth:`Normalizer.normalize`. The quantile mapping is bounded by
+                construction (searchsorted + clamped linear interp/extrapolation),
+                so it neither overflows nor raises on non-finite inputs; the flag
+                is therefore inert here and kept only for a uniform call contract.
 
         Returns:
             The normalized value (same dtype as input).
         """
+        del strict_finite  # inert: quantile mapping is bounded, cannot overflow/raise
         val = self._to_tensor(val)
         input_dtype = val.dtype
         compute_dtype = (

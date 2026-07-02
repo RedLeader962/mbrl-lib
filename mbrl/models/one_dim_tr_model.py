@@ -69,14 +69,14 @@ class _InputOutputNormalizerFacade(torch.nn.Module):
     # Convenience delegations for the ``single`` (standard) configuration so that
     # ``wrapper.input_normalizer.normalize(x)`` keeps working at call sites that
     # operate on the concatenated standard input.
-    def normalize(self, val):
+    def normalize(self, val, strict_finite=None):
         if self.single is None:
             raise RuntimeError(
                 "normalize() is only defined for a single-normalizer facade; "
                 "use the wrapper _normalize_output / _apply_input_normalizer "
                 "primitives for the robust block facade."
             )
-        return self.single.normalize(val)
+        return self.single.normalize(val, strict_finite=strict_finite)
 
     def denormalize(self, val):
         if self.single is None:
@@ -639,11 +639,17 @@ class OneDTransitionRewardModel(Model):
             )
 
     # (Priority) ToDo: refactor _normalize_composed_obs to one_dim_tr_model_v2.py
-    def _normalize_composed_obs(self, composed_obs: torch.Tensor) -> torch.Tensor:
+    def _normalize_composed_obs(
+        self, composed_obs: torch.Tensor, strict_finite=None
+    ) -> torch.Tensor:
+        # ``strict_finite`` is an optional per-call override forwarded to the
+        # block sub-normalizers (see ``Normalizer.normalize``). Pass ``False`` for
+        # model-output (test-time-rollout feedback) values; ``None`` (default)
+        # keeps the strict fail-fast used for training/data.
         facade = self.output_normalizer
         Do, Da = self._Do, self._Da
         if not self._is_multistep:
-            return facade.obs_sub.normalize(composed_obs)
+            return facade.obs_sub.normalize(composed_obs, strict_finite=strict_finite)
         H = self.model.history_len
         self._assert_input_obs_block(
             composed_obs.shape[-1], Do, H, Da, "_normalize_composed_obs"
@@ -651,26 +657,28 @@ class OneDTransitionRewardModel(Model):
         leading = composed_obs.shape[:-1]
         obs_part = composed_obs[..., : Do * H]
         act_part = composed_obs[..., Do * H :]
-        obs_norm = facade.obs_sub.normalize(obs_part.reshape(-1, Do)).reshape(
-            *leading, Do * H
-        )
+        obs_norm = facade.obs_sub.normalize(
+            obs_part.reshape(-1, Do), strict_finite=strict_finite
+        ).reshape(*leading, Do * H)
         if act_part.shape[-1] > 0:
-            act_norm = facade.act_sub.normalize(act_part.reshape(-1, Da)).reshape(
-                *leading, act_part.shape[-1]
-            )
+            act_norm = facade.act_sub.normalize(
+                act_part.reshape(-1, Da), strict_finite=strict_finite
+            ).reshape(*leading, act_part.shape[-1])
             return torch.cat([obs_norm, act_norm], dim=-1)
         return obs_norm
 
     # (Priority) ToDo: refactor _normalize_composed_act to one_dim_tr_model_v2.py
-    def _normalize_composed_act(self, action: torch.Tensor) -> torch.Tensor:
+    def _normalize_composed_act(
+        self, action: torch.Tensor, strict_finite=None
+    ) -> torch.Tensor:
         facade = self.output_normalizer
         Da = self._Da
         if action.shape[-1] > Da:
             leading = action.shape[:-1]
-            return facade.act_sub.normalize(action.reshape(-1, Da)).reshape(
-                *leading, action.shape[-1]
-            )
-        return facade.act_sub.normalize(action)
+            return facade.act_sub.normalize(
+                action.reshape(-1, Da), strict_finite=strict_finite
+            ).reshape(*leading, action.shape[-1])
+        return facade.act_sub.normalize(action, strict_finite=strict_finite)
 
     @deprecated(reason="DEPRECATED input-layout denorm shim (RLRP-684).")
     def _denormalize_composed_obs(self, composed_obs_norm: torch.Tensor) -> torch.Tensor:
