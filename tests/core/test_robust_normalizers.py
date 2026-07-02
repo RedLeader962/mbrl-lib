@@ -461,8 +461,8 @@ class TestQuantileGradient:
 # ------------------------------------------------------------------ #
 class TestWinsorizedSoftClipDisabled:
     """When ``soft_clip_iqr_mult=None`` the normalizer recovers the classic
-    ``WinsorizedNormalizer`` behavior (pure winsorized z-score, no tanh
-    compression)."""
+    ``WinsorizedNormalizer`` behavior (pure winsorized z-score, no asinh
+    soft-clip compression)."""
 
     def test_init_disabled(self):
         norm = mbrl.util.normalization.SoftWinsorizedNormalizer(
