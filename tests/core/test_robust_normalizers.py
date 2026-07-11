@@ -1617,3 +1617,130 @@ class TestRLRP736FeatureDimMask:
             mbrl.util.normalization.ZScoreNormalizer(
                 4, torch.device(_DEVICE), normalize_dims=[True, False]
             )
+
+
+# ------------------------------------------------------------------ #
+#  RLRP-736 S1.2b — StrategyAwareNormalizer (unit_norm block wrapper)
+# ------------------------------------------------------------------ #
+class TestRLRP736StrategyAwareNormalizer:
+    """Unit-sphere block re-projection layered over a base normalizer."""
+
+    def _base(self, in_size=7, disabled_block=(3, 7)):
+        # Disable the quaternion-like block in the base (S1.2a mask) so the
+        # wrapper alone performs the unit projection on the raw block.
+        normalize_dims = [True] * in_size
+        for i in range(*disabled_block):
+            normalize_dims[i] = False
+        base = mbrl.util.normalization.ZScoreNormalizer(
+            in_size, torch.device(_DEVICE), normalize_dims=normalize_dims
+        )
+        torch.manual_seed(0)
+        data = torch.randn(400, in_size) * 3.0 + 1.0
+        # Make the block roughly unit-norm quaternion-ish data.
+        data[:, 3:7] = torch.nn.functional.normalize(data[:, 3:7], dim=-1)
+        base.update_stats(data)
+        return base, data
+
+    def _strategy(self, in_size=7, block=(3, 7)):
+        strat = ["inherit"] * in_size
+        for i in range(*block):
+            strat[i] = "unit_norm"
+        return strat
+
+    def test_normalize_block_has_unit_l2(self):
+        base, data = self._base()
+        norm = mbrl.util.normalization.StrategyAwareNormalizer(
+            base=base, strategy=self._strategy()
+        )
+        out = norm.normalize(data)
+        block_norm = torch.linalg.norm(out[:, 3:7], dim=-1)
+        assert torch.allclose(block_norm, torch.ones_like(block_norm), atol=1e-5)
+        # Non-block dims are just the base z-score (unchanged by the wrapper).
+        assert torch.equal(out[:, :3], base.normalize(data)[:, :3])
+
+    def test_roundtrip_for_unit_inputs(self):
+        base, data = self._base()
+        norm = mbrl.util.normalization.StrategyAwareNormalizer(
+            base=base, strategy=self._strategy()
+        )
+        recovered = norm.denormalize(norm.normalize(data))
+        # Block is already unit → round-trips; non-block via base z-score.
+        assert torch.allclose(recovered, data, atol=1e-4)
+
+    def test_no_unit_norm_is_identity_passthrough(self):
+        base, data = self._base(disabled_block=(0, 0))
+        # No unit_norm dim → wrapper must not alter base output.
+        norm = mbrl.util.normalization.StrategyAwareNormalizer(
+            base=base, strategy=["inherit"] * 7
+        )
+        assert torch.equal(norm.normalize(data), base.normalize(data))
+
+    def test_block_resolution(self):
+        blocks = mbrl.util.normalization.StrategyAwareNormalizer._resolve_unit_blocks(
+            ["inherit", "unit_norm", "unit_norm", "inherit", "unit_norm"]
+        )
+        assert blocks == [(1, 3), (4, 5)]
+
+    def test_save_load_restores_strategy(self):
+        base, data = self._base()
+        norm = mbrl.util.normalization.StrategyAwareNormalizer(
+            base=base, strategy=self._strategy()
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            norm.save(tmp)
+            base2 = mbrl.util.normalization.ZScoreNormalizer(
+                7, torch.device(_DEVICE), normalize_dims=[True] * 7
+            )
+            reloaded = mbrl.util.normalization.StrategyAwareNormalizer(
+                base=base2, strategy=["inherit"] * 7
+            )
+            reloaded.load(tmp)
+            assert reloaded._unit_norm_blocks == [(3, 7)]
+            out = reloaded.normalize(data)
+            block_norm = torch.linalg.norm(out[:, 3:7], dim=-1)
+            assert torch.allclose(block_norm, torch.ones_like(block_norm), atol=1e-5)
+
+
+# ------------------------------------------------------------------ #
+#  RLRP-736 S1.2b — facade routing of per_dim_strategy
+# ------------------------------------------------------------------ #
+class TestRLRP736FacadeStrategyRouting:
+    """`_split_normalizer_kwargs` splits `per_dim_strategy`; `_maybe_wrap_strategy`
+    only wraps when a `unit_norm` dim is present."""
+
+    def test_split_per_dim_strategy_obs_act(self):
+        from mbrl.models.one_dim_tr_model import OneDTransitionRewardModel
+
+        names = ["v0", "v1", "aw", "ax", "ay", "az", "c0", "dt"]
+        strat = ["inherit", "inherit", "unit_norm", "unit_norm", "unit_norm",
+                 "unit_norm", "inherit", "identity"]
+        obs_out, act_out = OneDTransitionRewardModel._split_normalizer_kwargs(
+            {"feature_dim_names": names, "per_dim_strategy": strat},
+            obs_dim=6,
+            act_dim=2,
+        )
+        assert obs_out["per_dim_strategy"] == strat[:6]
+        assert act_out["per_dim_strategy"] == strat[6:]
+
+    def test_maybe_wrap_only_for_unit_norm(self):
+        from mbrl.models.one_dim_tr_model import OneDTransitionRewardModel
+
+        base = mbrl.util.normalization.ZScoreNormalizer(4, torch.device(_DEVICE))
+        # No unit_norm -> returns the base unchanged.
+        assert (
+            OneDTransitionRewardModel._maybe_wrap_strategy(
+                base, ["inherit", "inherit", "identity", "inherit"]
+            )
+            is base
+        )
+        # unit_norm present -> wrapped.
+        wrapped = OneDTransitionRewardModel._maybe_wrap_strategy(
+            base, ["unit_norm", "unit_norm", "unit_norm", "unit_norm"]
+        )
+        assert isinstance(wrapped, mbrl.util.normalization.StrategyAwareNormalizer)
+
+    def test_maybe_wrap_none_strategy(self):
+        from mbrl.models.one_dim_tr_model import OneDTransitionRewardModel
+
+        base = mbrl.util.normalization.ZScoreNormalizer(4, torch.device(_DEVICE))
+        assert OneDTransitionRewardModel._maybe_wrap_strategy(base, None) is base

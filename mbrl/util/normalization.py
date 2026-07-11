@@ -1835,6 +1835,124 @@ class QuantileNormalizer(Normalizer):
         self._load_feature_mask(load_dir)
 
 
+class StrategyAwareNormalizer(Normalizer):
+    """Thin wrapper adding per-dimension *strategy* transforms over a base.
+
+    Introduced by stage 1 (action S1.2b) of the Per-Environment Feature
+    Handling ``.junie`` plan
+    (``rlrp-736-per-environment-feature-handling-plan-20260711.md``,
+    YouTrack RLRP-736).
+
+    The base normalizer (any concrete :class:`Normalizer`) handles the
+    ``standard`` / ``winsorized`` / ``quantile`` statistics and the S1.2a
+    per-dimension enable/disable mask.  This wrapper layers **block strategies**
+    that cannot be expressed as an independent per-dimension scalar transform —
+    currently only ``unit_norm``: contiguous runs of ``unit_norm`` dimensions
+    (e.g. the 4-D quaternion attitude block) are re-projected onto the unit
+    L2-sphere *after* the base transform, on both :meth:`normalize` and
+    :meth:`denormalize`.
+
+    Ordering contract: the ``unit_norm`` block is expected to be **disabled** in
+    the base normalizer's S1.2a mask (``normalize_dims=False`` for those dims),
+    so the base passes the raw block through untouched and this wrapper performs
+    the unit projection.  ``identity`` strategy dims are handled entirely by the
+    base mask and need no wrapper — hence a ``StrategyAwareNormalizer`` is only
+    constructed when at least one ``unit_norm`` dimension is present.
+
+    Back-compat: with no ``unit_norm`` dimension the wrapper is never created, so
+    every legacy path is byte-identical.
+    """
+
+    #: File name persisting the resolved strategy alongside the base stats.
+    _STRATEGY_FNAME = "norm_strategy.pt"
+    _UNIT_NORM = "unit_norm"
+
+    def __init__(self, base: Normalizer, strategy: Sequence[str]):
+        super().__init__()
+        self.base = base
+        self._strategy: List[str] = [str(s) for s in strategy]
+        self._unit_norm_blocks: List[Tuple[int, int]] = self._resolve_unit_blocks(
+            self._strategy
+        )
+        self.register_buffer(
+            "eps", torch.tensor(1e-12, dtype=torch.float32), persistent=False
+        )
+
+    @staticmethod
+    def _resolve_unit_blocks(strategy: Sequence[str]) -> List[Tuple[int, int]]:
+        """Return contiguous ``[start, stop)`` index runs of ``unit_norm`` dims."""
+        blocks: List[Tuple[int, int]] = []
+        start: Optional[int] = None
+        for idx, strat in enumerate(strategy):
+            if strat == StrategyAwareNormalizer._UNIT_NORM:
+                if start is None:
+                    start = idx
+            elif start is not None:
+                blocks.append((start, idx))
+                start = None
+        if start is not None:
+            blocks.append((start, len(strategy)))
+        return blocks
+
+    def _apply_unit_norm(self, val: torch.Tensor) -> torch.Tensor:
+        if not self._unit_norm_blocks:
+            return val
+        out = val.clone()
+        eps = self.eps.to(out.dtype)
+        for start, stop in self._unit_norm_blocks:
+            block = out[..., start:stop]
+            norm = torch.linalg.norm(block, dim=-1, keepdim=True).clamp_min(eps)
+            out[..., start:stop] = block / norm
+        return out
+
+    # --- delegated statistics ------------------------------------------------
+    @property
+    def device(self) -> torch.device:
+        return self.base.device
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return self.base.mean
+
+    @property
+    def std(self) -> torch.Tensor:
+        return self.base.std
+
+    @property
+    def strict_finite(self) -> bool:
+        return getattr(self.base, "strict_finite", True)
+
+    def update_stats(self, data: mbrl.types.TensorType) -> None:
+        self.base.update_stats(data)
+
+    def normalize(
+        self,
+        val: Union[float, mbrl.types.TensorType],
+        strict_finite: Optional[bool] = None,
+    ) -> torch.Tensor:
+        out = self.base.normalize(val, strict_finite=strict_finite)
+        return self._apply_unit_norm(out)
+
+    def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        out = self.base.denormalize(val)
+        return self._apply_unit_norm(out)
+
+    def save(self, save_dir: Union[str, pathlib.Path]) -> None:
+        save_dir = pathlib.Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        self.base.save(save_dir)
+        torch.save({"strategy": self._strategy}, save_dir / self._STRATEGY_FNAME)
+
+    def load(self, load_dir: Union[str, pathlib.Path]) -> None:
+        load_dir = pathlib.Path(load_dir)
+        self.base.load(load_dir)
+        path = load_dir / self._STRATEGY_FNAME
+        if path.exists():
+            payload = torch.load(path, weights_only=False, map_location="cpu")
+            self._strategy = [str(s) for s in payload["strategy"]]
+            self._unit_norm_blocks = self._resolve_unit_blocks(self._strategy)
+
+
 def create_normalizer(
     normalizer_type: str,
     in_size: int,

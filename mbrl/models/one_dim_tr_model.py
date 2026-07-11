@@ -286,15 +286,43 @@ class OneDTransitionRewardModel(Model):
         obs_norm_kwargs, act_norm_kwargs = self._split_normalizer_kwargs(
             norm_kwargs, obs_dim, act_dim
         )
+        # RLRP-736 S1.2b: extract the optional per-dim strategy vector (consumed
+        # only by the StrategyAwareNormalizer wrapper, not by create_normalizer).
+        obs_strategy = obs_norm_kwargs.pop("per_dim_strategy", None)
+        act_strategy = act_norm_kwargs.pop("per_dim_strategy", None)
         obs_sub = mbrl.util.normalization.create_normalizer(
             normalizer_type, obs_dim, self.model.device, dtype=norm_dtype, **obs_norm_kwargs,
         )
         act_sub = mbrl.util.normalization.create_normalizer(
             normalizer_type, act_dim, self.model.device, dtype=norm_dtype, **act_norm_kwargs,
         )
+        # RLRP-736 S1.2b: layer a StrategyAwareNormalizer only when a block
+        # strategy (currently UNIT_NORM) is present; otherwise the sub is used
+        # as-is so every legacy path stays byte-identical.
+        obs_sub = self._maybe_wrap_strategy(obs_sub, obs_strategy)
+        act_sub = self._maybe_wrap_strategy(act_sub, act_strategy)
         # Same physical sub-normalizers shared by input and output facades.
         self.input_normalizer = _InputOutputNormalizerFacade(obs_sub=obs_sub, act_sub=act_sub)
         self.output_normalizer = _InputOutputNormalizerFacade(obs_sub=obs_sub, act_sub=act_sub)
+
+    @staticmethod
+    def _maybe_wrap_strategy(sub, strategy):
+        """Wrap ``sub`` in a ``StrategyAwareNormalizer`` iff a block strategy
+        (currently ``unit_norm``) is present; otherwise return ``sub`` unchanged.
+
+        Introduced by RLRP-736 S1.2b. Returning ``sub`` unchanged when no block
+        strategy is requested keeps every legacy normalizer path byte-identical.
+        """
+        if not strategy:
+            return sub
+        if not any(
+            str(s) == mbrl.util.normalization.StrategyAwareNormalizer._UNIT_NORM
+            for s in strategy
+        ):
+            return sub
+        return mbrl.util.normalization.StrategyAwareNormalizer(
+            base=sub, strategy=strategy
+        )
 
     def _resolve_obs_act_dim(self, normalizer_type, obs_dim, act_dim):
         if obs_dim is not None and act_dim is not None:
@@ -350,6 +378,13 @@ class OneDTransitionRewardModel(Model):
         obs_names = _to_plain(norm_kwargs.get("obs_feature_dim_names"))
         act_names = _to_plain(norm_kwargs.get("act_feature_dim_names"))
 
+        # RLRP-736 S1.2b: a concatenated per-dim strategy vector (length
+        # obs_dim + act_dim) is split into obs/act subsets exactly like
+        # ``feature_dim_names``.  It carries block strategies (e.g. UNIT_NORM)
+        # that the ``StrategyAwareNormalizer`` wrapper consumes; the concrete
+        # ``create_normalizer`` variants ignore it.
+        combined_strategy = _to_plain(norm_kwargs.get("per_dim_strategy"))
+
         if combined_names is not None and (obs_names is None or act_names is None):
             if len(combined_names) != obs_dim + act_dim:
                 raise ValueError(
@@ -367,6 +402,7 @@ class OneDTransitionRewardModel(Model):
             "feature_dim_names",
             "obs_feature_dim_names",
             "act_feature_dim_names",
+            "per_dim_strategy",
         }
 
         obs_out: Dict[str, Any] = {}
@@ -386,6 +422,16 @@ class OneDTransitionRewardModel(Model):
             obs_out["feature_dim_names"] = list(obs_names)
         if act_names is not None:
             act_out["feature_dim_names"] = list(act_names)
+
+        if combined_strategy is not None:
+            if len(combined_strategy) != obs_dim + act_dim:
+                raise ValueError(
+                    f"normalizer_kwargs.per_dim_strategy has length "
+                    f"{len(combined_strategy)} but obs_dim + act_dim = "
+                    f"{obs_dim + act_dim}."
+                )
+            obs_out["per_dim_strategy"] = list(combined_strategy[:obs_dim])
+            act_out["per_dim_strategy"] = list(combined_strategy[obs_dim:])
 
         return obs_out, act_out
 
