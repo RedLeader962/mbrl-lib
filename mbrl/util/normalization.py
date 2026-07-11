@@ -177,6 +177,134 @@ class Normalizer(torch.nn.Module, abc.ABC):
             val = val.float()
         return val.to(self.device)
 
+    # ------------------------------------------------------------------
+    # Per-feature-dimension customization (shared by ALL variants)
+    # ------------------------------------------------------------------
+    #
+    # Introduced by stage 1 (action S1.2a) of the Per-Environment Feature
+    # Handling ``.junie`` plan
+    # (``rlrp-736-per-environment-feature-handling-plan-20260711.md``,
+    # YouTrack RLRP-736). Lifts per-``feature_dim`` naming
+    # (``feature_dim_names``) and a per-dimension enable/disable mask
+    # (``normalize_dims``) to the abstract base so every concrete variant
+    # (``ZScoreNormalizer``, ``SoftWinsorizedNormalizer``,
+    # ``QuantileNormalizer``, and any future type) supports them uniformly.
+    #
+    # Back-compat: the default (``normalize_dims=True`` /
+    # ``feature_dim_names=None``) yields an all-``True`` mask, so
+    # :meth:`_apply_norm_mask` short-circuits and the output is byte-identical
+    # to the pre-plan behaviour for every variant.
+
+    #: File name used to persist the per-dimension mask alongside the
+    #: variant-specific statistics (optional; absent for legacy checkpoints).
+    _FEATURE_MASK_FNAME = "norm_feature_mask.pt"
+
+    def _setup_feature_dim_mask(
+        self,
+        in_size: int,
+        feature_dim_names: Optional[Sequence[str]] = None,
+        normalize_dims: Union[bool, Sequence[bool], Mapping[str, bool]] = True,
+    ) -> None:
+        """Resolve and register the per-dimension normalization mask.
+
+        Args:
+            in_size: feature dimension of the normalizer.
+            feature_dim_names: optional ordered names of length ``in_size``.
+            normalize_dims: ``bool`` (all on/off), a per-dim ``bool`` sequence of
+                length ``in_size``, or a ``{feature_name: bool}`` mapping (which
+                requires ``feature_dim_names``). Dimensions mapped to ``False``
+                are passed through untouched (identity) by
+                :meth:`normalize`/:meth:`denormalize`.
+        """
+        names = list(feature_dim_names) if feature_dim_names is not None else None
+        if names is not None and len(names) != in_size:
+            raise ValueError(
+                f"feature_dim_names has length {len(names)} but in_size={in_size}."
+            )
+        self.feature_dim_names: Optional[List[str]] = names
+        mask = self._resolve_normalize_dims(normalize_dims, in_size, names)
+        self.register_buffer("_norm_mask", mask)
+        self._norm_mask_all_true: bool = bool(torch.all(mask).item())
+
+    @staticmethod
+    def _resolve_normalize_dims(
+        normalize_dims: Union[bool, Sequence[bool], Mapping[str, bool]],
+        in_size: int,
+        feature_dim_names: Optional[List[str]],
+    ) -> torch.Tensor:
+        """Resolve ``normalize_dims`` to a 1-D ``bool`` mask of length ``in_size``.
+
+        ``True`` means "normalize this dimension" (default); ``False`` means
+        "pass through untouched". Accepts a scalar ``bool``, a per-dim sequence,
+        or a ``{feature_name: bool}`` mapping.
+        """
+        if isinstance(normalize_dims, bool):
+            return torch.full((in_size,), normalize_dims, dtype=torch.bool)
+        if isinstance(normalize_dims, Mapping):
+            if feature_dim_names is None:
+                raise ValueError(
+                    "normalize_dims given as a mapping requires feature_dim_names."
+                )
+            name_to_idx = {name: i for i, name in enumerate(feature_dim_names)}
+            mask = torch.ones((in_size,), dtype=torch.bool)
+            for key, enabled in normalize_dims.items():
+                if key not in name_to_idx:
+                    raise ValueError(
+                        f"normalize_dims key '{key}' not found in feature_dim_names."
+                    )
+                mask[name_to_idx[key]] = bool(enabled)
+            return mask
+        seq = list(normalize_dims)
+        if len(seq) != in_size:
+            raise ValueError(
+                f"normalize_dims sequence has length {len(seq)} but in_size={in_size}."
+            )
+        return torch.tensor([bool(v) for v in seq], dtype=torch.bool)
+
+    def _apply_norm_mask(
+        self, transformed: torch.Tensor, raw_val: torch.Tensor
+    ) -> torch.Tensor:
+        """Restore disabled dimensions to their raw (pass-through) value.
+
+        Short-circuits (returns ``transformed`` unchanged) when the mask is
+        all-``True`` — guaranteeing byte-identical output for the default
+        configuration.
+        """
+        if getattr(self, "_norm_mask_all_true", True):
+            return transformed
+        raw = self._to_tensor(raw_val).to(transformed.dtype)
+        # Store/apply the mask as a 1-D last-dim mask so it broadcasts against
+        # any trailing ``in_size`` dimension without inserting a leading axis.
+        mask = self._norm_mask.to(device=transformed.device).reshape(-1)
+        return torch.where(mask, transformed, raw)
+
+    def _save_feature_mask(self, save_dir: Union[str, pathlib.Path]) -> None:
+        """Persist the per-dimension mask next to the variant statistics."""
+        if getattr(self, "_norm_mask", None) is None:
+            return
+        torch.save(
+            {
+                "norm_mask": self._norm_mask.cpu(),
+                "feature_dim_names": getattr(self, "feature_dim_names", None),
+            },
+            pathlib.Path(save_dir) / self._FEATURE_MASK_FNAME,
+        )
+
+    def _load_feature_mask(self, load_dir: Union[str, pathlib.Path]) -> None:
+        """Restore the per-dimension mask if present (legacy-tolerant)."""
+        path = pathlib.Path(load_dir) / self._FEATURE_MASK_FNAME
+        if not path.exists():
+            # Legacy checkpoint: keep the mask resolved at construction time.
+            return
+        payload = torch.load(path, weights_only=False, map_location="cpu")
+        mask = payload["norm_mask"].to(device=self.device, dtype=torch.bool).reshape(-1)
+        if getattr(self, "_norm_mask", None) is None:
+            self.register_buffer("_norm_mask", mask)
+        else:
+            self._norm_mask = mask
+        self.feature_dim_names = payload.get("feature_dim_names", None)
+        self._norm_mask_all_true = bool(torch.all(self._norm_mask).item())
+
 
 class ZScoreNormalizer(Normalizer):
     """Standard running-mean z-score normalizer with optional hard clipping.
@@ -233,6 +361,8 @@ class ZScoreNormalizer(Normalizer):
         dtype=torch.float32,
         clip_range: Optional[float] = None,
         strict_finite: bool = True,
+        feature_dim_names: Optional[Sequence[str]] = None,
+        normalize_dims: Union[bool, Sequence[bool], Mapping[str, bool]] = True,
     ):
         super().__init__()
         # RLRP-684 WS-C: when True, non-finite *input data* / *statistics*
@@ -250,6 +380,8 @@ class ZScoreNormalizer(Normalizer):
         _eps_value = 1e-14 if dtype == torch.double else 1e-5
         self.register_buffer("eps", torch.tensor(_eps_value, dtype=dtype))
         self.clip_range: Optional[float] = clip_range
+        # RLRP-736 S1.2a: per-feature-dim naming + enable/disable mask.
+        self._setup_feature_dim_mask(in_size, feature_dim_names, normalize_dims)
         self.to(device)
 
     @property
@@ -377,7 +509,7 @@ class ZScoreNormalizer(Normalizer):
         if self.clip_range is not None:
             result = result.clamp(-self.clip_range, self.clip_range)
 
-        return result.to(input_dtype)
+        return self._apply_norm_mask(result.to(input_dtype), val)
 
     @torch.compiler.disable
     def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
@@ -421,7 +553,7 @@ class ZScoreNormalizer(Normalizer):
             else:
                 result = torch.zeros_like(result)
 
-        return result.to(input_dtype)
+        return self._apply_norm_mask(result.to(input_dtype), val)
 
     def save(self, save_dir: Union[str, pathlib.Path]) -> None:
         """Saves statistics to a torch file."""
@@ -430,6 +562,7 @@ class ZScoreNormalizer(Normalizer):
             {"mean": self._mean.cpu(), "std": self._std.cpu(), "eps": self.eps.cpu()},
             save_dir / self._STATS_FNAME,
         )
+        self._save_feature_mask(save_dir)
 
         return None
 
@@ -465,6 +598,8 @@ class ZScoreNormalizer(Normalizer):
             raise FileNotFoundError(
                 f"No normalizer stats found at '{pt_path}' or '{pickle_path}'."
             )
+
+        self._load_feature_mask(load_dir)
 
         return None
 
@@ -579,6 +714,7 @@ class SoftWinsorizedNormalizer(Normalizer):
         soft_clip_iqr_mult: SoftClipIqrMultConfig = 3.0,
         feature_dim_names: Optional[Sequence[str]] = None,
         strict_finite: bool = True,
+        normalize_dims: Union[bool, Sequence[bool], Mapping[str, bool]] = True,
     ):
         super().__init__()
         # RLRP-684 WS-C: fail-fast on non-finite *data* / *statistics* (the
@@ -691,6 +827,10 @@ class SoftWinsorizedNormalizer(Normalizer):
                     stacklevel=2,
                 )
 
+        # RLRP-736 S1.2a: per-feature-dim naming + enable/disable mask.
+        self._setup_feature_dim_mask(
+            in_size, self._feature_dim_names, normalize_dims
+        )
         self.to(device)
 
     # ------------------------------------------------------------------ #
@@ -1158,7 +1298,7 @@ class SoftWinsorizedNormalizer(Normalizer):
             z_soft = self._soft_clip(z, self.clip_threshold.to(compute_dtype))
             mask = self._soft_clip_active_mask.to(z.device)
             result = torch.where(mask, z_soft, z)
-        return result.to(input_dtype)
+        return self._apply_norm_mask(result.to(input_dtype), val)
 
     @torch.compiler.disable
     def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
@@ -1212,7 +1352,7 @@ class SoftWinsorizedNormalizer(Normalizer):
             else:
                 result = torch.zeros_like(result)
 
-        return result.to(input_dtype)
+        return self._apply_norm_mask(result.to(input_dtype), val)
 
     def save(self, save_dir: Union[str, pathlib.Path]) -> None:
         save_dir = pathlib.Path(save_dir)
@@ -1237,6 +1377,7 @@ class SoftWinsorizedNormalizer(Normalizer):
             },
             save_dir / self._STATS_FNAME,
         )
+        self._save_feature_mask(save_dir)
         return None
 
     def load(self, load_dir: Union[str, pathlib.Path]) -> None:
@@ -1311,6 +1452,8 @@ class SoftWinsorizedNormalizer(Normalizer):
             self.winsor_percentile = stats["winsor_percentile"]
         if "soft_clip_iqr_mult" in stats:
             self.soft_clip_iqr_mult = stats["soft_clip_iqr_mult"]
+
+        self._load_feature_mask(load_dir)
 
         # Recompute fast-path flags from the loaded buffers so the hot path
         # reflects the loaded configuration.
@@ -1387,6 +1530,8 @@ class QuantileNormalizer(Normalizer):
         n_bins: int = 1000,
         tail_policy: str = "linear",
         strict_finite: bool = True,
+        feature_dim_names: Optional[Sequence[str]] = None,
+        normalize_dims: Union[bool, Sequence[bool], Mapping[str, bool]] = True,
     ):
         super().__init__()
         # RLRP-684 WS-C: fail-fast on non-finite *data* in ``update_stats``;
@@ -1414,6 +1559,8 @@ class QuantileNormalizer(Normalizer):
 
         _eps_value = 1e-14 if dtype == torch.double else 1e-5
         self.register_buffer("eps", torch.tensor(_eps_value, dtype=dtype))
+        # RLRP-736 S1.2a: per-feature-dim naming + enable/disable mask.
+        self._setup_feature_dim_mask(in_size, feature_dim_names, normalize_dims)
         self.to(device)
 
     @property
@@ -1574,7 +1721,7 @@ class QuantileNormalizer(Normalizer):
             result_t = torch.where(upper_mask, extrap_high, result_t)
 
         result = result_t.t().reshape(original_shape)  # (batch, d) then reshape
-        return result.to(input_dtype)
+        return self._apply_norm_mask(result.to(input_dtype), val)
 
     @torch.compiler.disable
     def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
@@ -1646,7 +1793,7 @@ class QuantileNormalizer(Normalizer):
             result = torch.where(upper_mask, extrap_high, result)
 
         result = result.reshape(original_shape)
-        return result.to(input_dtype)
+        return self._apply_norm_mask(result.to(input_dtype), val)
 
     def save(self, save_dir: Union[str, pathlib.Path]):
         save_dir = pathlib.Path(save_dir)
@@ -1662,6 +1809,7 @@ class QuantileNormalizer(Normalizer):
             },
             save_dir / self._STATS_FNAME,
         )
+        self._save_feature_mask(save_dir)
 
     def load(self, load_dir: Union[str, pathlib.Path]):
         load_dir = pathlib.Path(load_dir)
@@ -1683,6 +1831,8 @@ class QuantileNormalizer(Normalizer):
             self.n_bins = stats["n_bins"]
         if "tail_policy" in stats:
             self.tail_policy = stats["tail_policy"]
+
+        self._load_feature_mask(load_dir)
 
 
 def create_normalizer(
@@ -1721,6 +1871,8 @@ def create_normalizer(
             dtype=dtype,
             clip_range=clip_range,
             strict_finite=strict_finite,
+            feature_dim_names=kwargs.get("feature_dim_names", None),
+            normalize_dims=kwargs.get("normalize_dims", True),
         )
     elif normalizer_type == "winsorized":
         return SoftWinsorizedNormalizer(
@@ -1731,6 +1883,7 @@ def create_normalizer(
             soft_clip_iqr_mult=kwargs.get("soft_clip_iqr_mult", 3.0),
             feature_dim_names=kwargs.get("feature_dim_names", None),
             strict_finite=strict_finite,
+            normalize_dims=kwargs.get("normalize_dims", True),
         )
     elif normalizer_type == "quantile":
         return QuantileNormalizer(
@@ -1740,6 +1893,8 @@ def create_normalizer(
             n_bins=kwargs.get("n_bins", 1000),
             tail_policy=kwargs.get("tail_policy", "linear"),
             strict_finite=strict_finite,
+            feature_dim_names=kwargs.get("feature_dim_names", None),
+            normalize_dims=kwargs.get("normalize_dims", True),
         )
     else:
         raise ValueError(

@@ -1505,3 +1505,115 @@ class TestRLRP684Factory:
             ntype, 3, torch.device(_DEVICE), **kwargs
         )
         assert norm_default.strict_finite is True
+
+
+# ------------------------------------------------------------------ #
+#  RLRP-736 S1.2a — per-feature-dimension mask (ALL variants)
+# ------------------------------------------------------------------ #
+_ALL_NTYPES = ["standard", "standard_symmetric", "winsorized", "quantile"]
+
+
+def _make_normalizer(ntype, in_size, **kwargs):
+    """Build a normalizer of ``ntype`` via the factory (small n_bins for speed)."""
+    if ntype == "quantile":
+        kwargs.setdefault("n_bins", 100)
+    return mbrl.util.normalization.create_normalizer(
+        ntype, in_size, torch.device(_DEVICE), **kwargs
+    )
+
+
+class TestRLRP736FeatureDimMask:
+    """Per-feature-dimension naming + enable/disable mask on every variant."""
+
+    _NAMES = ["a", "b", "c", "d"]
+
+    def _fit_data(self):
+        torch.manual_seed(0)
+        # Distinct per-column scales so normalization is clearly non-identity.
+        return torch.randn(500, 4) * torch.tensor([1.0, 5.0, 10.0, 0.5]) + 3.0
+
+    @pytest.mark.parametrize("ntype", _ALL_NTYPES)
+    def test_default_all_true_is_bit_exact(self, ntype):
+        """Default (no mask) output is byte-identical to a plain build."""
+        data = self._fit_data()
+        ref = _make_normalizer(ntype, 4)
+        ref.update_stats(data)
+        masked = _make_normalizer(
+            ntype, 4, feature_dim_names=self._NAMES, normalize_dims=True
+        )
+        masked.update_stats(data)
+        assert torch.equal(ref.normalize(data), masked.normalize(data))
+        assert masked._norm_mask_all_true is True
+
+    @pytest.mark.parametrize("ntype", _ALL_NTYPES)
+    def test_disabled_dims_pass_through(self, ntype):
+        """Dimensions mapped to ``False`` are returned untouched (identity)."""
+        data = self._fit_data()
+        norm = _make_normalizer(
+            ntype,
+            4,
+            feature_dim_names=self._NAMES,
+            normalize_dims={"b": False, "d": False},
+        )
+        norm.update_stats(data)
+        out = norm.normalize(data)
+        # Disabled columns are byte-identical to the raw input.
+        assert torch.equal(out[:, 1], data[:, 1])
+        assert torch.equal(out[:, 3], data[:, 3])
+        # Enabled columns are actually transformed.
+        assert not torch.equal(out[:, 0], data[:, 0])
+        assert not torch.equal(out[:, 2], data[:, 2])
+
+    @pytest.mark.parametrize("ntype", _ALL_NTYPES)
+    def test_sequence_mask_and_roundtrip(self, ntype):
+        """Per-dim ``bool`` sequence works and the transform round-trips."""
+        data = self._fit_data()
+        norm = _make_normalizer(
+            ntype, 4, normalize_dims=[True, False, True, False]
+        )
+        norm.update_stats(data)
+        recovered = norm.denormalize(norm.normalize(data))
+        assert torch.allclose(recovered, data, atol=1e-4)
+
+    @pytest.mark.parametrize("ntype", _ALL_NTYPES)
+    def test_save_load_restores_mask(self, ntype):
+        """The per-dimension mask survives save/load."""
+        data = self._fit_data()
+        norm = _make_normalizer(
+            ntype,
+            4,
+            feature_dim_names=self._NAMES,
+            normalize_dims={"b": False, "d": False},
+        )
+        norm.update_stats(data)
+        with tempfile.TemporaryDirectory() as tmp:
+            norm.save(tmp)
+            reloaded = _make_normalizer(ntype, 4)  # default all-True mask
+            assert reloaded._norm_mask_all_true is True
+            reloaded.load(tmp)
+            assert reloaded._norm_mask_all_true is False
+            assert reloaded.feature_dim_names == self._NAMES
+            out = reloaded.normalize(data)
+            assert torch.equal(out[:, 1], data[:, 1])
+            assert torch.equal(out[:, 3], data[:, 3])
+
+    def test_mapping_without_names_raises(self):
+        with pytest.raises(ValueError, match="requires feature_dim_names"):
+            mbrl.util.normalization.ZScoreNormalizer(
+                4, torch.device(_DEVICE), normalize_dims={"a": False}
+            )
+
+    def test_unknown_mask_key_raises(self):
+        with pytest.raises(ValueError, match="not found in feature_dim_names"):
+            mbrl.util.normalization.ZScoreNormalizer(
+                4,
+                torch.device(_DEVICE),
+                feature_dim_names=self._NAMES,
+                normalize_dims={"zzz": False},
+            )
+
+    def test_sequence_length_mismatch_raises(self):
+        with pytest.raises(ValueError, match="normalize_dims sequence"):
+            mbrl.util.normalization.ZScoreNormalizer(
+                4, torch.device(_DEVICE), normalize_dims=[True, False]
+            )
