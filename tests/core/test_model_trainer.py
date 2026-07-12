@@ -457,3 +457,102 @@ class TestLegacyCallbackZeroGradFix:
                     f"Call {call_idx}: param.grad must be zeroed after "
                     f"train() (RLRP-606); found {p.grad}"
                 )
+
+
+class _FakeStrategy:
+    @staticmethod
+    def reduce_boolean_decision(decision, all=False):  # noqa: A002 - mirror PL signature
+        return decision
+
+
+class _FakeTrainer:
+    """Minimal stand-in for ``pl.Trainer`` exposing only what
+    ``EarlyStopping._run_early_stopping_check`` reads.
+    """
+
+    def __init__(self):
+        self.callback_metrics = {}
+        self.fast_dev_run = False
+        self.should_stop = False
+        self.current_epoch = 0
+        self.strategy = _FakeStrategy()
+
+    def set_val_loss(self, value):
+        self.callback_metrics = {"val/loss": torch.tensor(float(value))}
+
+
+def _drive(cb, losses):
+    """Feed a sequence of ``val/loss`` values through the callback's
+    ``_run_early_stopping_check`` and return the epoch index (0-based) at which
+    ``should_stop`` first became True, or ``None`` if it never stopped.
+    """
+    trainer = _FakeTrainer()
+    stop_at = None
+    for i, loss in enumerate(losses):
+        trainer.current_epoch = i
+        trainer.set_val_loss(loss)
+        cb._run_early_stopping_check(trainer)
+        if trainer.should_stop and stop_at is None:
+            stop_at = i
+    return stop_at
+
+
+class TestRLRP736WarmupAwareEarlyStopping:
+    """RLRP-736: early-stopping patience must only start counting once the
+    optimizer warmup phase has ended.
+    """
+
+    def test_warmup_zero_is_byte_identical_to_base(self):
+        # A warmup-aware callback with warmup_epochs=0 must stop at the exact
+        # same epoch as the stock EarlyStopping over the same loss stream.
+        losses = [0.20, 0.20, 0.50, 0.50, 0.50]
+        base = mbrl.models.model_trainer.EarlyStopping(
+            monitor="val/loss", patience=1, min_delta=0.0, mode="min",
+            check_on_train_epoch_end=False,
+        )
+        warm0 = mbrl.models.model_trainer._WarmupAwareEarlyStopping(
+            monitor="val/loss", patience=1, min_delta=0.0, mode="min",
+            check_on_train_epoch_end=False, warmup_epochs=0,
+        )
+        assert _drive(base, losses) == _drive(warm0, losses)
+
+    def test_patience_deferred_until_warmup_ends(self):
+        # Warmup-era low losses (0.20) must NOT seed the best score. With
+        # warmup_epochs=2 the first two checks are skipped; the best is seeded
+        # at the first post-warmup check (0.50, epoch 2) and patience=1 then
+        # trips at epoch 3 (0.50 == 0.50 -> no improvement).
+        losses = [0.20, 0.20, 0.50, 0.50, 0.50]
+        warm = mbrl.models.model_trainer._WarmupAwareEarlyStopping(
+            monitor="val/loss", patience=1, min_delta=0.0, mode="min",
+            check_on_train_epoch_end=False, warmup_epochs=2,
+        )
+        base = mbrl.models.model_trainer.EarlyStopping(
+            monitor="val/loss", patience=1, min_delta=0.0, mode="min",
+            check_on_train_epoch_end=False,
+        )
+        # Base seeds best=0.20 at epoch0, no-improve at epoch1 -> stop epoch1.
+        assert _drive(base, losses) == 1
+        # Warmup-aware skips epochs 0,1; best=0.50 at epoch2; stop at epoch3.
+        assert _drive(warm, losses) == 3
+
+    def test_no_stop_when_recovers_after_warmup(self):
+        # Mirrors the observed run: low warmup losses, a post-warmup transient,
+        # then monotone recovery. With warmup deferral it should NOT early-stop.
+        losses = [0.20, 0.20, 0.55, 0.54, 0.53, 0.52, 0.51]
+        warm = mbrl.models.model_trainer._WarmupAwareEarlyStopping(
+            monitor="val/loss", patience=2, min_delta=0.0, mode="min",
+            check_on_train_epoch_end=False, warmup_epochs=2,
+        )
+        assert _drive(warm, losses) is None
+        assert warm.wait_count == 0
+
+    def test_best_score_not_seeded_during_warmup(self):
+        losses = [0.01, 0.02]
+        warm = mbrl.models.model_trainer._WarmupAwareEarlyStopping(
+            monitor="val/loss", patience=3, min_delta=0.0, mode="min",
+            check_on_train_epoch_end=False, warmup_epochs=2,
+        )
+        _drive(warm, losses)
+        # best_score untouched (still +inf init) because both checks were warmup.
+        assert not torch.isfinite(warm.best_score)
+        assert warm.wait_count == 0

@@ -34,6 +34,41 @@ MODEL_LOG_FORMAT = [
 ]
 
 
+class _WarmupAwareEarlyStopping(EarlyStopping):
+    """``EarlyStopping`` that defers patience counting until an optimizer warmup
+    phase completes.
+
+    RLRP-736 (plan `rlrp-736-per-environment-feature-handling-plan-20260711.md`,
+    YouTrack RLRP-736): during a learning-rate warmup the loss is not yet
+    representative of the converged optimization regime -- the LR is still
+    ramping, so an artificially low warmup-era ``val/loss`` becomes an
+    unbeatable "best" that immediately starts the patience countdown the moment
+    the LR jumps to its full value (a common cause of premature early stopping
+    right after warmup). This subclass skips the early-stopping check entirely
+    for the first ``warmup_epochs`` validation evaluations, so BOTH the
+    ``best_score`` baseline AND the patience ``wait_count`` only begin once the
+    warmup phase has ended.
+
+    With ``warmup_epochs == 0`` the behaviour is byte-identical to the base
+    :class:`~pytorch_lightning.callbacks.EarlyStopping`.
+    """
+
+    def __init__(self, *args, warmup_epochs: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._warmup_epochs = max(int(warmup_epochs), 0)
+        self._warmup_checks_seen = 0
+
+    def _run_early_stopping_check(self, trainer: "pl.Trainer") -> None:
+        # ``on_validation_end`` only reaches here for genuine checks (Lightning
+        # guards it behind ``_should_skip_check``), so counting invocations is a
+        # robust, ``current_epoch``-semantics-independent way to gate the first
+        # ``warmup_epochs`` evaluations.
+        if self._warmup_checks_seen < self._warmup_epochs:
+            self._warmup_checks_seen += 1
+            return
+        super()._run_early_stopping_check(trainer)
+
+
 class _IteratorDataset(IterableDataset):
     def __init__(self, it: TransitionIterator):
         self.it = it
@@ -471,9 +506,10 @@ class ModelTrainer:
         dataset_val: Optional[TransitionIterator] = None,
         num_epochs: Optional[int] = None,
         patience: Optional[int] = None,
+        patience_warmup_epochs: int = 0,
         improvement_threshold: float = 0.01,
         callback: Optional[Callable] = None,
-        batch_callback: Optional[Callable] = None,
+        batch_callback: Optional[Callable] =  None,
         evaluate: bool = True,
         silent: bool = False,
     ) -> Tuple[List[float], List[float]]:
@@ -502,6 +538,15 @@ class ModelTrainer:
                 training. That is, training will stop after ``patience``
                 number of epochs without improvement.
                 Ignored if ``evaluate=False``.
+            patience_warmup_epochs (int): if ``> 0``, early-stopping patience is
+                NOT counted for the first ``patience_warmup_epochs`` validation
+                evaluations (RLRP-736). Both the ``best_score`` baseline and the
+                patience ``wait_count`` only start being tracked once this
+                optimizer warmup window has elapsed, so a low warmup-era
+                ``val/loss`` (small ramping LR) cannot seed an unbeatable best
+                and prematurely trigger early stopping right after warmup.
+                Defaults to ``0`` (byte-identical to the legacy behaviour).
+                Ignored if ``evaluate=False`` or ``patience is None``.
             improvement_threshold (float): The threshold in relative decrease
                 of the evaluation score at which the model is seen as having
                 improved. Ignored if ``evaluate=False``.
@@ -572,15 +617,28 @@ class ModelTrainer:
         # Lightning Callbacks
         callbacks = []
         if evaluate and dataset_val and patience is not None:
-            callbacks.append(
-                EarlyStopping(
+            _warmup_epochs = max(int(patience_warmup_epochs or 0), 0)
+            if _warmup_epochs > 0:
+                # RLRP-736: defer patience counting until the optimizer warmup
+                # phase completes (see `_WarmupAwareEarlyStopping`). Byte-identical
+                # to the base callback when `_warmup_epochs == 0`.
+                early_stopping = _WarmupAwareEarlyStopping(
+                    monitor="val/loss",
+                    patience=patience,
+                    min_delta=0.0,
+                    mode="min",
+                    check_on_train_epoch_end=False,
+                    warmup_epochs=_warmup_epochs,
+                )
+            else:
+                early_stopping = EarlyStopping(
                     monitor="val/loss",
                     patience=patience,
                     min_delta=0.0,
                     mode="min",
                     check_on_train_epoch_end=False,
                 )
-            )
+            callbacks.append(early_stopping)
 
         legacy_cb = _LegacyCallback(
             model_trainer=self,
