@@ -1675,6 +1675,20 @@ class TestRLRP736StrategyAwareNormalizer:
         )
         assert torch.equal(norm.normalize(data), base.normalize(data))
 
+    def test_normalize_is_autograd_safe(self):
+        # RLRP-736 regression: the unit-norm block re-projection must not use an
+        # in-place slice assignment on a strided view, which otherwise breaks
+        # backprop ("modified by an inplace operation ... AsStridedBackward0").
+        base, data = self._base()
+        norm = mbrl.util.normalization.StrategyAwareNormalizer(
+            base=base, strategy=self._strategy()
+        )
+        x = data.clone().requires_grad_(True)
+        out = norm.normalize(x)
+        out.pow(2).sum().backward()
+        assert x.grad is not None
+        assert torch.isfinite(x.grad).all()
+
     def test_block_resolution(self):
         blocks = mbrl.util.normalization.StrategyAwareNormalizer._resolve_unit_blocks(
             ["inherit", "unit_norm", "unit_norm", "inherit", "unit_norm"]

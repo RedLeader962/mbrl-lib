@@ -1897,13 +1897,30 @@ class StrategyAwareNormalizer(Normalizer):
     def _apply_unit_norm(self, val: torch.Tensor) -> torch.Tensor:
         if not self._unit_norm_blocks:
             return val
-        out = val.clone()
-        eps = self.eps.to(out.dtype)
+        if not torch.is_tensor(val):
+            val = torch.as_tensor(val)
+        eps = self.eps.to(val.dtype)
+        # Reassemble the last dimension out of contiguous segments, projecting
+        # only the ``unit_norm`` blocks onto the L2 unit sphere. We build the
+        # result via ``torch.cat`` of freshly-computed slices instead of an
+        # in-place write into a cloned tensor: an in-place assignment such as
+        # ``out[..., start:stop] = block / norm`` mutates a strided view that is
+        # also read on the RHS, which breaks autograd during backprop
+        # ("one of the variables needed for gradient computation has been
+        # modified by an inplace operation ... AsStridedBackward0"). RLRP-736.
+        dim = val.shape[-1]
+        segments: List[torch.Tensor] = []
+        cursor = 0
         for start, stop in self._unit_norm_blocks:
-            block = out[..., start:stop]
+            if start > cursor:
+                segments.append(val[..., cursor:start])
+            block = val[..., start:stop]
             norm = torch.linalg.norm(block, dim=-1, keepdim=True).clamp_min(eps)
-            out[..., start:stop] = block / norm
-        return out
+            segments.append(block / norm)
+            cursor = stop
+        if cursor < dim:
+            segments.append(val[..., cursor:dim])
+        return torch.cat(segments, dim=-1)
 
     # --- delegated statistics ------------------------------------------------
     @property
