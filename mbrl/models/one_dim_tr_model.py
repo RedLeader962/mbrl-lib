@@ -2,6 +2,7 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
+import inspect
 import pathlib
 import warnings
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -35,6 +36,17 @@ MODEL_LOG_FORMAT = [
 _NEUTRAL_NORM_STRATEGY = "inherit"
 #: RLRP-761 S5.2 — the strategy whose silent drop is a CORRECTNESS bug.
 _UNIT_NORM_STRATEGY = "unit_norm"
+#: RLRP-761 S4 — the block-facade type whose obs INPUT and obs TARGET scales are
+#: DECOUPLED (state std vs one-step innovation). It is the only type for which
+#: the facade's namesake input-equals-output symmetry does not hold; the two
+#: spaces are reconciled by the single diagonal ``ar_bridge_gain``.
+_INNOVATION_NORMALIZER_TYPE = "standard_symmetric_innovation"
+#: RLRP-761 S4.8 — types for which ``target_is_delta=True`` is EXPLICITLY
+#: supported. The robust types warp non-affinely, so their delta target is a
+#: difference of warped z-scores; every affine type (including the innovation
+#: one, where ``normalize(y) - normalize(x) = (y - x)/s`` exactly, i.e. "the
+#: delta expressed in innovation units") is exempt by construction.
+_NON_AFFINE_NORMALIZER_TYPES = frozenset({"winsorized", "quantile"})
 
 
 class _InputOutputNormalizerFacade(torch.nn.Module):
@@ -250,7 +262,7 @@ class OneDTransitionRewardModel(Model):
         if (
             normalize
             and target_is_delta
-            and normalizer_type in {"winsorized", "quantile"}
+            and normalizer_type in _NON_AFFINE_NORMALIZER_TYPES
         ):
             warnings.warn(
                 f"OneDTransitionRewardModel: combining target_is_delta=True with "
@@ -310,14 +322,63 @@ class OneDTransitionRewardModel(Model):
         obs_sub = mbrl.util.normalization.create_normalizer(
             normalizer_type, obs_dim, self.model.device, dtype=norm_dtype, **obs_norm_kwargs,
         )
+        # RLRP-761 S4.3: the innovation scale is a property of the predicted
+        # STATE, so the act block keeps the plain symmetric z-score (see the
+        # decoupling note below).
+        act_normalizer_type = (
+            "standard_symmetric"
+            if normalizer_type == _INNOVATION_NORMALIZER_TYPE
+            else normalizer_type
+        )
         act_sub = mbrl.util.normalization.create_normalizer(
-            normalizer_type, act_dim, self.model.device, dtype=norm_dtype, **act_norm_kwargs,
+            act_normalizer_type,
+            act_dim,
+            self.model.device,
+            dtype=norm_dtype,
+            **{
+                k: v
+                for k, v in act_norm_kwargs.items()
+                if not k.startswith("innovation_")
+            },
         )
         # RLRP-736 S1.2b: layer a StrategyAwareNormalizer only when a block
         # strategy (currently UNIT_NORM) is present; otherwise the sub is used
         # as-is so every legacy path stays byte-identical.
         obs_sub = self._maybe_wrap_strategy(obs_sub, obs_strategy)
         act_sub = self._maybe_wrap_strategy(act_sub, act_strategy)
+
+        if normalizer_type == _INNOVATION_NORMALIZER_TYPE:
+            # RLRP-761 S4.3 — DECOUPLED obs scales. The target is scaled by the
+            # one-step innovation ``s`` (``obs_sub`` above), but reusing ``s`` on
+            # the INPUT would feed the network ``O(10)`` values, since
+            # ``sigma_state / s`` reaches ~13 on the reference dataset. The input
+            # therefore keeps the well-conditioned state scale, and the two
+            # spaces are reconciled by the single diagonal :attr:`ar_bridge_gain`
+            # (``S4.4``) instead of a denormalize/renormalize pair.
+            #
+            # The ACT block stays SHARED: "innovation" is a property of the
+            # predicted state, and sharing keeps ``denormalize_predicted_act``
+            # and the AR action splice in one space (gain 1 by construction).
+            obs_input_sub = mbrl.util.normalization.create_normalizer(
+                "standard_symmetric",
+                obs_dim,
+                self.model.device,
+                dtype=norm_dtype,
+                **{
+                    k: v
+                    for k, v in obs_norm_kwargs.items()
+                    if not k.startswith("innovation_")
+                },
+            )
+            obs_input_sub = self._maybe_wrap_strategy(obs_input_sub, obs_strategy)
+            self.input_normalizer = _InputOutputNormalizerFacade(
+                obs_sub=obs_input_sub, act_sub=act_sub
+            )
+            self.output_normalizer = _InputOutputNormalizerFacade(
+                obs_sub=obs_sub, act_sub=act_sub
+            )
+            return
+
         # Same physical sub-normalizers shared by input and output facades.
         self.input_normalizer = _InputOutputNormalizerFacade(obs_sub=obs_sub, act_sub=act_sub)
         self.output_normalizer = _InputOutputNormalizerFacade(obs_sub=obs_sub, act_sub=act_sub)
@@ -559,6 +620,96 @@ class OneDTransitionRewardModel(Model):
         return self.output_normalizer is not None and self.output_normalizer.is_block
 
     @property
+    def uses_decoupled_obs_scales(self) -> bool:
+        """True when the obs INPUT and obs TARGET scales differ (RLRP-761 ``S4``).
+
+        ``False`` for every legacy type, where the two facades hold the *same*
+        physical sub-normalizers — which is what keeps :attr:`ar_bridge_gain` a
+        no-op and every pre-plan path bit-exact (measure ``M5``).
+        """
+        return (
+            self.input_normalizer is not None
+            and self.output_normalizer is not None
+            and self.input_normalizer.is_block
+            and self.input_normalizer.obs_sub is not self.output_normalizer.obs_sub
+        )
+
+    @property
+    def ar_bridge_gain(self) -> Optional[torch.Tensor]:
+        """The diagonal TARGET-space -> INPUT-space obs map, or ``None``.
+
+        RLRP-761 ``S4.4``. Both spaces are centred on the same ``mu``, so the
+        location cancels and the conversion of a prediction spliced back into
+        the AR window is the single elementwise multiply::
+
+            z_input = z_target * (s / sigma_state)
+
+        Strictly cheaper and exactly invertible compared with the ``standard``
+        path's ``denormalize -> shift -> renormalize`` pair. Returns ``None``
+        (meaning "identity, do nothing") for every non-decoupled type, so the
+        AR call site needs no type test.
+
+        **Per-dim scope.** The gain is ``1`` on every dimension that is not
+        actually rescaled, i.e. a ``unit_norm`` / ``identity`` dim, whose base
+        transform is a pass-through in BOTH spaces (a quaternion or gravity
+        direction is never divided by an innovation). It is the innovation ratio
+        on the base-normalized dims **and** on the ``zscore``-strategy dims,
+        which the :class:`StrategyAwareNormalizer` standardizes using the base
+        moments and therefore DO differ between the two spaces.
+        """
+        if not self.uses_decoupled_obs_scales:
+            return None
+        target_wrapper = self.output_normalizer.obs_sub
+        input_wrapper = self.input_normalizer.obs_sub
+        target_sub = getattr(target_wrapper, "base", target_wrapper)
+        input_sub = getattr(input_wrapper, "base", input_wrapper)
+        eps = float(getattr(input_sub, "eps", torch.tensor(1e-5)).reshape(-1)[0])
+        gain = target_sub.std.reshape(-1) / torch.clamp(
+            input_sub.std.reshape(-1), min=eps
+        )
+
+        rescaled = self._rescaled_dim_mask(target_wrapper, target_sub, gain)
+        return torch.where(rescaled, gain, torch.ones_like(gain))
+
+    @staticmethod
+    def _rescaled_dim_mask(wrapper, base, like: torch.Tensor) -> torch.Tensor:
+        """Mask of the dims whose value is actually divided by a scale.
+
+        A dim is rescaled when the base normalizer's own S1.2a mask enables it,
+        or when the strategy wrapper standardizes it (``zscore``, RLRP-761
+        ``S1.1``, which deliberately runs on a base-DISABLED dim).
+        """
+        mask = getattr(base, "_norm_mask", None)
+        if mask is None:
+            mask = torch.ones_like(like, dtype=torch.bool)
+        else:
+            mask = mask.reshape(-1).to(device=like.device, dtype=torch.bool)
+        zscore_mask = getattr(wrapper, "_zscore_mask", None)
+        if zscore_mask is not None:
+            mask = mask | zscore_mask.reshape(-1).to(
+                device=like.device, dtype=torch.bool
+            )
+        return mask
+
+    def _obs_sub_for(self, space: str):
+        """Return the obs sub-normalizer of the requested space.
+
+        ``space='target'`` (default everywhere) preserves the historical
+        behaviour — the composed shims have always read the *output* facade —
+        and both spaces resolve to the SAME object for every non-decoupled
+        type, so this is a strict no-op outside ``S4``.
+        """
+        if space == "input":
+            facade = self.input_normalizer
+        elif space == "target":
+            facade = self.output_normalizer
+        else:
+            raise ValueError(
+                f"Unknown normalization space '{space}'; expected 'input' or 'target'."
+            )
+        return facade.obs_sub
+
+    @property
     def obs_normalizer(self):
         """Backward-compat accessor: the robust obs sub-normalizer (or ``None``)."""
         f = self.output_normalizer
@@ -783,16 +934,23 @@ class OneDTransitionRewardModel(Model):
 
     # (Priority) ToDo: refactor _normalize_composed_obs to one_dim_tr_model_v2.py
     def _normalize_composed_obs(
-        self, composed_obs: torch.Tensor, strict_finite=None
+        self, composed_obs: torch.Tensor, strict_finite=None, space: str = "target"
     ) -> torch.Tensor:
         # ``strict_finite`` is an optional per-call override forwarded to the
         # block sub-normalizers (see ``Normalizer.normalize``). Pass ``False`` for
         # model-output (test-time-rollout feedback) values; ``None`` (default)
         # keeps the strict fail-fast used for training/data.
+        #
+        # ``space`` (RLRP-761 S4.9) selects the obs scale. It matters ONLY for
+        # ``standard_symmetric_innovation``, whose input and target obs scales
+        # are decoupled; every other type resolves both to the same object.
+        # The default stays ``'target'`` so the historical behaviour of this
+        # shim (always the output facade) is preserved.
         facade = self.output_normalizer
+        obs_sub = self._obs_sub_for(space)
         Do, Da = self._Do, self._Da
         if not self._is_multistep:
-            return facade.obs_sub.normalize(composed_obs, strict_finite=strict_finite)
+            return obs_sub.normalize(composed_obs, strict_finite=strict_finite)
         H = self.model.history_len
         self._assert_input_obs_block(
             composed_obs.shape[-1], Do, H, Da, "_normalize_composed_obs"
@@ -800,7 +958,7 @@ class OneDTransitionRewardModel(Model):
         leading = composed_obs.shape[:-1]
         obs_part = composed_obs[..., : Do * H]
         act_part = composed_obs[..., Do * H :]
-        obs_norm = facade.obs_sub.normalize(
+        obs_norm = obs_sub.normalize(
             obs_part.reshape(-1, Do), strict_finite=strict_finite
         ).reshape(*leading, Do * H)
         if act_part.shape[-1] > 0:
@@ -940,11 +1098,81 @@ class OneDTransitionRewardModel(Model):
             act_from_composed = obs[..., Do * H :].reshape(-1, Da)
             act_current = action.reshape(-1, Da)
             act_pooled = torch.cat([act_from_composed, act_current], dim=0)
-            self.input_normalizer.obs_sub.update_stats(obs_block)
+            self._update_obs_subs(obs_block, self._composed_history_sequence_ids(obs_block, H))
             self.input_normalizer.act_sub.update_stats(act_pooled)
         else:
-            self.input_normalizer.obs_sub.update_stats(obs.reshape(-1, Do))
+            self._update_obs_subs(obs.reshape(-1, Do), None)
             self.input_normalizer.act_sub.update_stats(action.reshape(-1, Da))
+
+    def _composed_history_sequence_ids(
+        self, obs_block: torch.Tensor, history_len: int
+    ) -> Optional[torch.Tensor]:
+        """Sequence ids for the flattened composed-history obs rows (RLRP-761 ``S4.5``).
+
+        The plan called for threading trajectory ids from the replay buffer.
+        That turned out to be unnecessary: the composed multistep observation
+        of a batch row **already is** ``history_len`` CONSECUTIVE frames, and
+        ``update_normalizer`` reshapes those rows to ``(-1, Do)`` in time order.
+        Labelling each window with its own id therefore recovers the exact
+        within-trajectory adjacency an innovation estimator needs, with zero
+        plumbing and no dependence on how the buffer was shuffled.
+
+        Only differences *inside* a window are used, so the estimator never
+        crosses a window (let alone an episode) boundary.
+
+        :return: ``(N,)`` ids, or ``None`` when the window is too short for a
+            difference (``history_len < 2``).
+        """
+        if history_len < 2:
+            return None
+        n_windows = obs_block.shape[0] // history_len
+        if n_windows < 1:
+            return None
+        return torch.arange(
+            n_windows, device=obs_block.device
+        ).repeat_interleave(history_len)
+
+    def _update_obs_subs(
+        self, obs_block: torch.Tensor, sequence_ids: Optional[torch.Tensor]
+    ) -> None:
+        """Fit every obs sub-normalizer, forwarding ``sequence_ids`` when supported.
+
+        Under ``S4`` the input and target obs scales are decoupled, so BOTH
+        physical sub-normalizers must be fitted (they are the same object for
+        every other type, where the ``dict.fromkeys`` de-duplication below makes
+        this a single call, exactly as before).
+        """
+        subs = list(
+            dict.fromkeys(
+                [
+                    id_sub
+                    for id_sub in (
+                        self.input_normalizer.obs_sub,
+                        self.output_normalizer.obs_sub
+                        if self.output_normalizer is not None
+                        else None,
+                    )
+                    if id_sub is not None
+                ]
+            )
+        )
+        for sub in subs:
+            if sequence_ids is not None and self._accepts_sequence_ids(sub):
+                sub.update_stats(obs_block, sequence_ids=sequence_ids)
+            else:
+                sub.update_stats(obs_block)
+
+    @staticmethod
+    def _accepts_sequence_ids(sub) -> bool:
+        """Whether ``sub.update_stats`` takes the ``sequence_ids`` keyword."""
+        try:
+            signature = inspect.signature(sub.update_stats)
+        except (TypeError, ValueError):
+            return False
+        parameters = signature.parameters
+        return "sequence_ids" in parameters or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        )
 
     def loss(
         self,

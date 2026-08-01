@@ -68,6 +68,8 @@ Rule of thumb — parameter configuration:
 """
 import abc
 import difflib
+import inspect
+import math
 import pathlib
 import warnings
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -1835,6 +1837,288 @@ class QuantileNormalizer(Normalizer):
         self._load_feature_mask(load_dir)
 
 
+#: Consistency constant of the MAD as a std estimator for Gaussian data.
+_MAD_TO_STD = 1.4826
+#: ``Var(x[t+1] - 2 x[t] + x[t-1]) = 6 Var(x)`` for white noise.
+_SECOND_DIFF_VARIANCE_GAIN = 6.0
+
+
+class InnovationScaledNormalizer(ZScoreNormalizer):
+    """Z-score normalizer scaled by the one-step INNOVATION instead of the state std.
+
+    Introduced by stage ``S4`` of the RLRP-761 ``.junie`` plan
+    (``rlrp-761-feature-aware-normalization-and-diagnostics-plan-20260801.md``).
+
+    **The quantity.** ``standard_symmetric`` divides the target by the *state*
+    std ``sigma``. On the reference UGV dataset that inverts the feature ranking
+    the evaluation metric cares about: the terrain-vibration channels
+    (``linear_vels.z``, ``angular_vels.x/y``) have a tiny ``sigma`` and are
+    amplified 29-77x, so they take over the target's energy budget even though
+    they are largely irreducible noise (root cause ``H1`` of the investigation
+    report). This normalizer instead divides by the **innovation scale**
+    ``s_d`` — the magnitude of what the model is actually asked to predict from
+    one step to the next::
+
+        normalize(x)   = (x - mu) / s
+        denormalize(z) = z * s + mu
+
+    so a normalized residual of ``1.0`` means "one typical one-step innovation",
+    for every feature, every robot and every dataset.
+
+    **Scale modes** (``innovation_scale_mode``):
+
+    - ``one_step_delta`` — ``s = std(x[t+1] - x[t])``, the plain innovation std.
+    - ``noise_floor``    — ``s = 1.4826 * MAD(x[t+1] - 2 x[t] + x[t-1]) / sqrt(6)``,
+      the IRREDUCIBLE high-frequency component. The second difference annihilates
+      any locally-linear signal, and the **MAD** form (rather than the std) is
+      load-bearing for this research program: a genuine adverse event (traction
+      loss on a rock, weight transfer in an aggressive turn) is a rare LARGE
+      excursion, and it must stay a large multiple of the floor rather than
+      raising its own bar.
+    - ``explicit``       — a caller-provided vector.
+
+    Mirrors :func:`tools.feature_handling_tools.feature_statistics.estimate_feature_scales`
+    (the ``S3`` estimator) formula-for-formula; the duplication is deliberate,
+    since the fork must not depend on the research codebase.
+
+    **Sequence awareness.** A difference is meaningless across a sequence
+    boundary, so :meth:`update_stats` accepts ``sequence_ids``: a ``(N,)``
+    integer tensor whose consecutive equal runs mark contiguous-in-time rows.
+    The multistep wrapper derives it for free from the composed history window
+    (each batch row carries ``history_len`` consecutive frames), so no replay-
+    buffer plumbing is required. **Without** ``sequence_ids`` the innovation is
+    not observable at all; the normalizer then falls back to the state std —
+    i.e. degrades exactly to ``standard_symmetric`` — and warns once, rather
+    than silently fitting a differencing estimator to shuffled rows.
+
+    :param innovation_scale_mode: one of :attr:`VALID_SCALE_MODES`.
+    :param innovation_scale_floor: absolute lower bound on ``s``, keeping the
+        transform finite for a constant / quantized channel.
+    :param innovation_scale: the explicit ``(in_size,)`` vector, required by
+        (and only used with) ``innovation_scale_mode='explicit'``.
+    """
+
+    #: The persisted innovation payload (versioned; see :meth:`load`).
+    _INNOVATION_FNAME = "innovation_scale.pt"
+    #: ``S4.6`` payload version. ``1`` = the plain :class:`ZScoreNormalizer`
+    #: layout with no innovation file (the legacy fallback).
+    _PAYLOAD_VERSION = 2
+
+    VALID_SCALE_MODES = ("one_step_delta", "noise_floor", "explicit")
+
+    def __init__(
+        self,
+        in_size: int,
+        device: torch.device,
+        dtype=torch.float32,
+        clip_range: Optional[float] = None,
+        strict_finite: bool = True,
+        feature_dim_names: Optional[Sequence[str]] = None,
+        normalize_dims: Union[bool, Sequence[bool], Mapping[str, bool]] = True,
+        innovation_scale_mode: str = "one_step_delta",
+        innovation_scale_floor: float = 1e-6,
+        innovation_scale: Optional[Sequence[float]] = None,
+    ):
+        super().__init__(
+            in_size,
+            device,
+            dtype=dtype,
+            clip_range=clip_range,
+            strict_finite=strict_finite,
+            feature_dim_names=feature_dim_names,
+            normalize_dims=normalize_dims,
+        )
+        if str(innovation_scale_mode) not in self.VALID_SCALE_MODES:
+            raise ValueError(
+                f"Unknown innovation_scale_mode "
+                f"'{innovation_scale_mode}'. Choose from "
+                f"{list(self.VALID_SCALE_MODES)}."
+            )
+        self.innovation_scale_mode = str(innovation_scale_mode)
+        self.innovation_scale_floor = float(innovation_scale_floor)
+        #: The plain STATE std, retained alongside ``_std`` (= the innovation
+        #: scale) because the AR bridge gain and the ``S2`` diagnostic both need
+        #: the ratio between the two spaces.
+        self.register_buffer("_state_std", torch.ones((1, in_size), dtype=dtype))
+        self._explicit_scale: Optional[torch.Tensor] = None
+        if innovation_scale is not None:
+            explicit = torch.as_tensor(
+                list(innovation_scale), dtype=dtype
+            ).reshape(1, -1)
+            if explicit.shape[-1] != in_size:
+                raise ValueError(
+                    f"innovation_scale has {explicit.shape[-1]} entries but the "
+                    f"normalizer has in_size={in_size}."
+                )
+            self._explicit_scale = explicit.to(device)
+        elif self.innovation_scale_mode == "explicit":
+            raise ValueError(
+                "innovation_scale_mode='explicit' requires the "
+                "'innovation_scale' vector to be provided."
+            )
+        #: One-shot guard for the "no sequence structure" degradation.
+        self._sequence_fallback_warned = False
+
+    # ---- statistics ------------------------------------------------------
+
+    @property
+    def state_std(self) -> torch.Tensor:
+        """The plain state std (the ``standard_symmetric`` scale)."""
+        return self._state_std
+
+    @property
+    def innovation_scale(self) -> torch.Tensor:
+        """The active per-feature innovation scale (``== self.std``)."""
+        return self._std
+
+    @property
+    def bridge_gain(self) -> torch.Tensor:
+        """``s / sigma_state`` — the diagonal target-space -> input-space map.
+
+        With input ``(x - mu)/sigma_state`` and target ``(y - mu)/s`` the mean
+        cancels exactly, so converting a prediction from target space to input
+        space is the single elementwise multiply ``z_input = z_target * gain``
+        (``S4.4``). Equals ``1`` whenever the innovation scale degenerates to
+        the state std, which is what keeps every legacy path a no-op.
+        """
+        return self._std / torch.clamp(self._state_std, min=self.eps.item())
+
+    @staticmethod
+    def _grouped_difference(
+        data: torch.Tensor, sequence_ids: torch.Tensor, order: int
+    ) -> Optional[torch.Tensor]:
+        """Return the ``order``-th difference taken WITHIN each sequence.
+
+        Rows are assumed to be in time order inside a run of equal ids (which is
+        how both the composed history window and a replay-buffer trajectory are
+        laid out). Any difference straddling a boundary is dropped.
+        """
+        if order not in (1, 2):
+            raise ValueError(f"Unsupported difference order {order}.")
+        ids = sequence_ids.reshape(-1)
+        if ids.shape[0] != data.shape[0]:
+            raise ValueError(
+                f"sequence_ids has {ids.shape[0]} entries but data has "
+                f"{data.shape[0]} rows."
+            )
+        if data.shape[0] <= order:
+            return None
+        if order == 1:
+            valid = ids[1:] == ids[:-1]
+            diff = data[1:] - data[:-1]
+        else:
+            valid = (ids[2:] == ids[1:-1]) & (ids[1:-1] == ids[:-2])
+            diff = data[2:] - 2.0 * data[1:-1] + data[:-2]
+        diff = diff[valid]
+        return diff if diff.shape[0] >= 2 else None
+
+    def _estimate_innovation_scale(
+        self, data: torch.Tensor, sequence_ids: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Estimate ``s`` from *data*, or ``None`` when it is not observable."""
+        if self.innovation_scale_mode == "explicit":
+            return self._explicit_scale.to(dtype=data.dtype, device=data.device)
+        if sequence_ids is None:
+            return None
+        order = 1 if self.innovation_scale_mode == "one_step_delta" else 2
+        diff = self._grouped_difference(data, sequence_ids, order)
+        if diff is None:
+            return None
+        if self.innovation_scale_mode == "one_step_delta":
+            scale = diff.std(0, keepdim=True)
+        else:
+            median = diff.median(dim=0, keepdim=True).values
+            mad = (diff - median).abs().median(dim=0, keepdim=True).values
+            scale = _MAD_TO_STD * mad / math.sqrt(_SECOND_DIFF_VARIANCE_GAIN)
+        return scale
+
+    def update_stats(
+        self,
+        data: mbrl.types.TensorType,
+        sequence_ids: Optional[mbrl.types.TensorType] = None,
+    ) -> None:
+        """Fit ``mu``, the state std and the innovation scale.
+
+        :param data: ``(N, in_size)`` samples.
+        :param sequence_ids: optional ``(N,)`` integer tensor marking
+            contiguous-in-time runs (see the class docstring).
+        """
+        super().update_stats(data)
+        self._state_std.copy_(self._std)
+
+        tensor = self._to_tensor(data)
+        ids = None if sequence_ids is None else self._to_tensor(sequence_ids)
+        scale = self._estimate_innovation_scale(tensor, ids)
+        if scale is None:
+            if not self._sequence_fallback_warned:
+                self._sequence_fallback_warned = True
+                warnings.warn(
+                    "InnovationScaledNormalizer.update_stats could not observe "
+                    "the one-step innovation (no usable 'sequence_ids' — a "
+                    "normalizer fitted on shuffled transitions has no notion of "
+                    "'next step'). Falling back to the STATE std, i.e. this "
+                    "normalizer degrades to 'standard_symmetric' and the AR "
+                    "bridge gain is 1. Pass sequence_ids to enable innovation "
+                    "scaling (RLRP-761 S4.1).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return None
+
+        scale = scale.to(dtype=self._std.dtype, device=self._std.device).reshape(
+            1, -1
+        )
+        scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
+        floor = max(self.innovation_scale_floor, self.eps.item())
+        self._std.copy_(torch.clamp(scale, min=floor))
+        return None
+
+    # ---- persistence (S4.6) ----------------------------------------------
+
+    def save(self, save_dir: Union[str, pathlib.Path]) -> None:
+        super().save(save_dir)
+        save_dir = pathlib.Path(save_dir)
+        torch.save(
+            {
+                "version": self._PAYLOAD_VERSION,
+                "state_std": self._state_std.cpu(),
+                "innovation_scale_mode": self.innovation_scale_mode,
+                "innovation_scale_floor": self.innovation_scale_floor,
+            },
+            save_dir / self._INNOVATION_FNAME,
+        )
+        return None
+
+    def load(self, load_dir: Union[str, pathlib.Path]) -> None:
+        """Restore the statistics, tolerating a v1 (plain z-score) payload.
+
+        ``S4.6`` / risk ``R-B``: a checkpoint written before this class existed
+        carries no innovation file. Its ``_std`` IS the state std, so the
+        fallback sets ``state_std = std`` — which makes the AR bridge gain
+        exactly ``1`` and reproduces the ``standard_symmetric`` behaviour the
+        checkpoint was trained under, instead of silently mixing two spaces.
+        """
+        super().load(load_dir)
+        load_dir = pathlib.Path(load_dir)
+        path = load_dir / self._INNOVATION_FNAME
+        if not path.exists():
+            self._state_std.copy_(self._std)
+            warnings.warn(
+                f"InnovationScaledNormalizer.load found no '{self._INNOVATION_FNAME}' "
+                f"in '{load_dir}' (payload v1). The stored scale is treated as the "
+                f"STATE std, so the AR bridge gain is 1 and the checkpoint behaves "
+                f"as 'standard_symmetric' (RLRP-761 S4.6).",
+                FutureWarning,
+                stacklevel=2,
+            )
+            return None
+        payload = torch.load(path, weights_only=False, map_location="cpu")
+        self._state_std.copy_(payload["state_std"].to(self.device))
+        self.innovation_scale_mode = str(payload["innovation_scale_mode"])
+        self.innovation_scale_floor = float(payload["innovation_scale_floor"])
+        return None
+
+
 class StrategyAwareNormalizer(Normalizer):
     """Thin wrapper adding per-dimension *strategy* transforms over a base.
 
@@ -2008,8 +2292,26 @@ class StrategyAwareNormalizer(Normalizer):
     def strict_finite(self) -> bool:
         return getattr(self.base, "strict_finite", True)
 
-    def update_stats(self, data: mbrl.types.TensorType) -> None:
-        self.base.update_stats(data)
+    def update_stats(self, data: mbrl.types.TensorType, **kwargs) -> None:
+        # ``**kwargs`` forwards the RLRP-761 S4 ``sequence_ids`` (and any future
+        # fit-time argument) to a base that accepts it. Bases that do NOT (every
+        # legacy type) must not see the keyword: the wrapper is transparent, so
+        # a caller cannot know which base it is talking to.
+        if kwargs:
+            try:
+                accepted = inspect.signature(self.base.update_stats).parameters
+            except (TypeError, ValueError):  # pragma: no cover - exotic callable
+                accepted = {}
+            kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key in accepted
+                or any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in accepted.values()
+                )
+            }
+        self.base.update_stats(data, **kwargs)
 
     def normalize(
         self,
@@ -2067,8 +2369,9 @@ def create_normalizer(
     """Factory function to create a normalizer by type string.
 
     Args:
-        normalizer_type: ``"standard"``, ``"standard_symmetric"``, ``"winsorized"``,
-            or ``"quantile"``. ``"standard_symmetric"`` builds a plain
+        normalizer_type: ``"standard"``, ``"standard_symmetric"``,
+            ``"standard_symmetric_innovation"``, ``"winsorized"``, or
+            ``"quantile"``. ``"standard_symmetric"`` builds a plain
             :class:`ZScoreNormalizer` just like ``"standard"`` — the distinction is
             handled by :class:`~mbrl.models.OneDTransitionRewardModel`, which uses the
             block-shared (input *and* output) facade for ``"standard_symmetric"`` and the
@@ -2085,6 +2388,25 @@ def create_normalizer(
     """
     # RLRP-684 WS-C: forward the fail-fast-on-non-finite policy to every type.
     strict_finite = kwargs.get("strict_finite", True)
+    if normalizer_type == "standard_symmetric_innovation":
+        # RLRP-761 S4.2. Note this builds the TARGET-space normalizer; the
+        # decoupled, state-scaled INPUT normalizer of the same block is a plain
+        # ``standard_symmetric`` one, built by
+        # ``OneDTransitionRewardModel._build_normalizers``.
+        return InnovationScaledNormalizer(
+            in_size,
+            device,
+            dtype=dtype,
+            clip_range=kwargs.get("clip_range", None),
+            strict_finite=strict_finite,
+            feature_dim_names=kwargs.get("feature_dim_names", None),
+            normalize_dims=kwargs.get("normalize_dims", True),
+            innovation_scale_mode=kwargs.get(
+                "innovation_scale_mode", "one_step_delta"
+            ),
+            innovation_scale_floor=kwargs.get("innovation_scale_floor", 1e-6),
+            innovation_scale=kwargs.get("innovation_scale", None),
+        )
     if normalizer_type in ("standard", "standard_symmetric"):
         clip_range = kwargs.get("clip_range", None)
         return ZScoreNormalizer(
@@ -2121,5 +2443,6 @@ def create_normalizer(
     else:
         raise ValueError(
             f"Unknown normalizer_type '{normalizer_type}'. "
-            "Choose from 'standard', 'standard_symmetric', 'winsorized', 'quantile'."
+            "Choose from 'standard', 'standard_symmetric', "
+            "'standard_symmetric_innovation', 'winsorized', 'quantile'."
         )
