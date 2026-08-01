@@ -28,6 +28,15 @@ MODEL_LOG_FORMAT = [
 ]
 
 
+#: RLRP-761 S5.1 — the ``per_dim_strategy`` value that means "no per-dim
+#: contract at all", i.e. the vector-global ``normalizer_type`` applies. Kept as
+#: a literal (rather than importing ``NormStrategy`` from ``src``) because the
+#: fork must not depend on the research codebase.
+_NEUTRAL_NORM_STRATEGY = "inherit"
+#: RLRP-761 S5.2 — the strategy whose silent drop is a CORRECTNESS bug.
+_UNIT_NORM_STRATEGY = "unit_norm"
+
+
 class _InputOutputNormalizerFacade(torch.nn.Module):
     """Unified normalizer facade hiding the standard / robust duality.
 
@@ -211,10 +220,17 @@ class OneDTransitionRewardModel(Model):
         obs_dim: Optional[int] = None,
         act_dim: Optional[int] = None,
         normalizer_kwargs: Optional[Dict[str, Any]] = None,
+        allow_contract_drop: bool = False,
     ):
         super().__init__(model.device)
         self.model = model
         self.normalizer_type = normalizer_type
+        self.allow_contract_drop = bool(allow_contract_drop)
+        #: RLRP-761 S5.3 — the feature-handling contract entries that the
+        #: ``standard`` single-facade path DROPPED, or ``None`` when nothing was
+        #: dropped. Consumed by the training-start feature-normalization
+        #: diagnostic to render the ``CONTRACT-DROPPED`` banner.
+        self.dropped_feature_contract: Optional[Dict[str, Any]] = None
         self._obs_dim = obs_dim
         self._act_dim = act_dim
 
@@ -273,6 +289,7 @@ class OneDTransitionRewardModel(Model):
           ``standard_symmetric`` but with the robust normalizer variants.
         """
         if normalizer_type == "standard":
+            self._guard_contract_drop(norm_kwargs)
             single = mbrl.util.normalization.ZScoreNormalizer(
                 self.model.in_size, self.model.device, dtype=norm_dtype,
             )
@@ -305,20 +322,100 @@ class OneDTransitionRewardModel(Model):
         self.input_normalizer = _InputOutputNormalizerFacade(obs_sub=obs_sub, act_sub=act_sub)
         self.output_normalizer = _InputOutputNormalizerFacade(obs_sub=obs_sub, act_sub=act_sub)
 
+    def _guard_contract_drop(self, norm_kwargs):
+        """Detect (and refuse) a SILENT feature-handling contract drop.
+
+        RLRP-761 ``S5.1``/``S5.2``. The ``standard`` single-facade path returns
+        before :meth:`_split_normalizer_kwargs` is ever called, so
+        ``feature_dim_names`` / ``normalize_dims`` / ``per_dim_strategy`` — the
+        whole RLRP-736 feature contract the handler resolved — are discarded
+        without a word. That is merely surprising for a ``zscore`` dim (it is
+        why ``dt`` ends up standardized on this path), but it is a **correctness
+        bug** for a ``unit_norm`` block: ``standard`` would z-score a quaternion
+        (or a gravity direction, ``S5.4``) straight off the unit sphere.
+
+        Behaviour:
+
+        - any non-neutral ``per_dim_strategy`` entry (i.e. not ``inherit``) or a
+          ``normalize_dims`` mask disabling a dim → one ``WARNING`` naming the
+          dropped dims, and the drop is recorded in
+          :attr:`dropped_feature_contract` for the ``S2`` table (``S5.3``);
+        - any dropped ``unit_norm`` entry → :class:`ValueError`, unless
+          ``allow_contract_drop=True``
+          (``one_dim_transition_model.allow_contract_drop``) restores the
+          historical silent behaviour for reproducing old runs.
+
+        A neutral contract (or none at all) leaves this a strict no-op, so every
+        pre-plan ``standard`` run stays bit-exact (measure ``M5``).
+
+        :param norm_kwargs: The resolved ``normalizer_kwargs`` mapping.
+        :raises ValueError: on a dropped ``unit_norm`` strategy.
+        """
+        if not norm_kwargs:
+            return
+        names = list(norm_kwargs.get("feature_dim_names", None) or [])
+        strategy = norm_kwargs.get("per_dim_strategy", None) or []
+        mask = norm_kwargs.get("normalize_dims", None)
+
+        def _name(index):
+            return names[index] if index < len(names) else f"dim[{index}]"
+
+        dropped = {
+            _name(i): str(s)
+            for i, s in enumerate(strategy)
+            if str(s) != _NEUTRAL_NORM_STRATEGY
+        }
+        if isinstance(mask, dict):
+            for key, value in mask.items():
+                if not bool(value):
+                    dropped.setdefault(str(key), "normalize_dims=False")
+        elif isinstance(mask, (list, tuple)):
+            for i, value in enumerate(mask):
+                if not bool(value):
+                    dropped.setdefault(_name(i), "normalize_dims=False")
+        if not dropped:
+            return
+
+        self.dropped_feature_contract = dict(dropped)
+        detail = ", ".join(f"{k}->{v}" for k, v in dropped.items())
+        message = (
+            f"OneDTransitionRewardModel: normalizer_type='standard' uses the "
+            f"single concatenated facade and therefore DROPS the whole "
+            f"per-feature normalization contract; the following resolved "
+            f"entries have NO effect: {detail}. Every dim is z-scored over the "
+            f"flattened multistep input instead. Use 'standard_symmetric' "
+            f"(or 'winsorized' / 'quantile') to honour the contract."
+        )
+        if any(v == _UNIT_NORM_STRATEGY for v in dropped.values()):
+            if not self.allow_contract_drop:
+                raise ValueError(
+                    message
+                    + " Dropping a 'unit_norm' block is a CORRECTNESS bug (the "
+                    "block would be z-scored off the unit sphere). Set "
+                    "one_dim_transition_model.allow_contract_drop=true to "
+                    "reproduce the historical silent behaviour anyway."
+                )
+            warnings.warn(message, RuntimeWarning, stacklevel=3)
+            return
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+
     @staticmethod
     def _maybe_wrap_strategy(sub, strategy):
-        """Wrap ``sub`` in a ``StrategyAwareNormalizer`` iff a block strategy
-        (currently ``unit_norm``) is present; otherwise return ``sub`` unchanged.
+        """Wrap ``sub`` in a ``StrategyAwareNormalizer`` iff an *active* per-dim
+        strategy is present; otherwise return ``sub`` unchanged.
 
-        Introduced by RLRP-736 S1.2b. Returning ``sub`` unchanged when no block
+        Introduced by RLRP-736 S1.2b (``unit_norm``) and widened by RLRP-761 S1.3
+        to ``zscore`` (see
+        :attr:`~mbrl.util.normalization.StrategyAwareNormalizer._ACTIVE_STRATEGIES`).
+        ``inherit`` / ``identity`` dims need no wrapper: the former is the
+        vector-global behaviour and the latter is fully handled by the base
+        ``normalize_dims`` mask. Returning ``sub`` unchanged when no active
         strategy is requested keeps every legacy normalizer path byte-identical.
         """
         if not strategy:
             return sub
-        if not any(
-            str(s) == mbrl.util.normalization.StrategyAwareNormalizer._UNIT_NORM
-            for s in strategy
-        ):
+        _active = mbrl.util.normalization.StrategyAwareNormalizer._ACTIVE_STRATEGIES
+        if not any(str(s) in _active for s in strategy):
             return sub
         return mbrl.util.normalization.StrategyAwareNormalizer(
             base=sub, strategy=strategy

@@ -1847,25 +1847,51 @@ class StrategyAwareNormalizer(Normalizer):
     ``standard`` / ``winsorized`` / ``quantile`` statistics and the S1.2a
     per-dimension enable/disable mask.  This wrapper layers **block strategies**
     that cannot be expressed as an independent per-dimension scalar transform —
-    currently only ``unit_norm``: contiguous runs of ``unit_norm`` dimensions
-    (e.g. the 4-D quaternion attitude block) are re-projected onto the unit
-    L2-sphere *after* the base transform, on both :meth:`normalize` and
-    :meth:`denormalize`.
+    or that must bypass the vector-global ``normalizer_type``:
 
-    Ordering contract: the ``unit_norm`` block is expected to be **disabled** in
-    the base normalizer's S1.2a mask (``normalize_dims=False`` for those dims),
-    so the base passes the raw block through untouched and this wrapper performs
-    the unit projection.  ``identity`` strategy dims are handled entirely by the
-    base mask and need no wrapper — hence a ``StrategyAwareNormalizer`` is only
-    constructed when at least one ``unit_norm`` dimension is present.
+    - ``unit_norm``: contiguous runs of ``unit_norm`` dimensions (e.g. the 4-D
+      quaternion attitude block) are re-projected onto the unit L2-sphere
+      *after* the base transform, on both :meth:`normalize` and
+      :meth:`denormalize`.
+    - ``zscore`` (RLRP-761 S1.1): the dimension is **plainly standardized**,
+      ``(x - mean_d) / std_d``, bypassing any robust warping (soft-clipping,
+      quantile binning) the vector-global ``normalizer_type`` would otherwise
+      apply.  This un-conflates "exempt from robust warping" from "exempt from
+      normalization", which ``identity`` previously merged (see RLRP-761: the
+      whole UGV action block, ``dt`` included, was passed through raw and became
+      invisible to the network).
 
-    Back-compat: with no ``unit_norm`` dimension the wrapper is never created, so
-    every legacy path is byte-identical.
+    Ordering contract: both strategies expect the dimension to be **disabled**
+    in the base normalizer's S1.2a mask (``normalize_dims=False``), so the base
+    passes the raw value through untouched and this wrapper performs the
+    transform.  ``identity`` / ``inherit`` strategy dims are handled entirely by
+    the base mask and need no wrapper — hence a ``StrategyAwareNormalizer`` is
+    only constructed when at least one *active* strategy dim
+    (:attr:`_ACTIVE_STRATEGIES`) is present.
+
+    .. note:: **``zscore`` reuses the base statistics.**
+        No additional statistics and no additional persisted buffers are
+        required: :meth:`Normalizer._apply_norm_mask` is a *transform-time* mask
+        only — :meth:`update_stats` still fits **every** dimension — and every
+        concrete variant exposes ``mean`` / ``std`` over the full ``in_size``.
+        The consequence, which is deliberate but must not be discovered rather
+        than read: under ``normalizer_type='winsorized'`` / ``'quantile'`` those
+        moments are the **robust** ones (winsorized mean/std, IQR-based scale),
+        so a ``zscore`` dim inherits the same robustness as the rest of the
+        vector and resolves to a slightly different affine depending on the
+        vector-global type.
+
+    Back-compat: with no active-strategy dimension the wrapper is never created,
+    so every legacy path is byte-identical.
     """
 
     #: File name persisting the resolved strategy alongside the base stats.
     _STRATEGY_FNAME = "norm_strategy.pt"
     _UNIT_NORM = "unit_norm"
+    #: RLRP-761 S1.1 — plain standardization, bypassing the robust warp.
+    _ZSCORE = "zscore"
+    #: Strategies that require the wrapper to be built (RLRP-761 S1.3).
+    _ACTIVE_STRATEGIES = frozenset({_UNIT_NORM, _ZSCORE})
 
     def __init__(self, base: Normalizer, strategy: Sequence[str]):
         super().__init__()
@@ -1877,6 +1903,49 @@ class StrategyAwareNormalizer(Normalizer):
         self.register_buffer(
             "eps", torch.tensor(1e-12, dtype=torch.float32), persistent=False
         )
+        self.register_buffer(
+            "_zscore_mask",
+            self._resolve_zscore_mask(self._strategy),
+            persistent=False,
+        )
+
+    @staticmethod
+    def _resolve_zscore_mask(strategy: Sequence[str]) -> torch.Tensor:
+        """Return a 1-D ``bool`` mask of the ``zscore`` dimensions."""
+        return torch.tensor(
+            [str(s) == StrategyAwareNormalizer._ZSCORE for s in strategy],
+            dtype=torch.bool,
+        )
+
+    @property
+    def has_zscore_dims(self) -> bool:
+        """Whether at least one dimension uses the ``zscore`` strategy."""
+        return bool(self._zscore_mask.any().item())
+
+    def _zscore_moments(self, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the base ``(mean, std)`` as 1-D tensors, with a floored std."""
+        mean = self.base.mean.reshape(-1).to(dtype=dtype)
+        std = self.base.std.reshape(-1).to(dtype=dtype)
+        base_eps = getattr(self.base, "eps", None)
+        eps = (
+            base_eps.to(dtype=dtype).reshape(-1)[0]
+            if torch.is_tensor(base_eps)
+            else torch.tensor(1e-5, dtype=dtype, device=std.device)
+        )
+        return mean, torch.clamp(std, min=eps)
+
+    def _apply_zscore(self, val: torch.Tensor, inverse: bool) -> torch.Tensor:
+        """Standardize (or un-standardize) the ``zscore`` dimensions in place-free."""
+        if not self.has_zscore_dims:
+            return val
+        if not torch.is_tensor(val):
+            val = torch.as_tensor(val)
+        mean, std = self._zscore_moments(val.dtype)
+        mean = mean.to(val.device)
+        std = std.to(val.device)
+        mask = self._zscore_mask.to(val.device).reshape(-1)
+        transformed = val * std + mean if inverse else (val - mean) / std
+        return torch.where(mask, transformed, val)
 
     @staticmethod
     def _resolve_unit_blocks(strategy: Sequence[str]) -> List[Tuple[int, int]]:
@@ -1948,11 +2017,26 @@ class StrategyAwareNormalizer(Normalizer):
         strict_finite: Optional[bool] = None,
     ) -> torch.Tensor:
         out = self.base.normalize(val, strict_finite=strict_finite)
+        out = self._apply_zscore(out, inverse=False)
         return self._apply_unit_norm(out)
 
     def denormalize(self, val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
-        out = self.base.denormalize(val)
+        # Exact inverse ordering of :meth:`normalize`. ``unit_norm`` is an
+        # idempotent projection (applied on both directions by design) and
+        # ``zscore`` dims are disjoint from it, so the two commute; the explicit
+        # ordering is kept for readability.
+        out = self._apply_zscore(self._to_tensor_like(val), inverse=True)
+        out = self.base.denormalize(out)
         return self._apply_unit_norm(out)
+
+    @staticmethod
+    def _to_tensor_like(val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:
+        """Convert *val* to a tensor without moving it off its current device."""
+        if torch.is_tensor(val):
+            return val
+        if isinstance(val, np.ndarray):
+            return torch.from_numpy(val)
+        return torch.as_tensor(val)
 
     def save(self, save_dir: Union[str, pathlib.Path]) -> None:
         save_dir = pathlib.Path(save_dir)
@@ -1968,6 +2052,9 @@ class StrategyAwareNormalizer(Normalizer):
             payload = torch.load(path, weights_only=False, map_location="cpu")
             self._strategy = [str(s) for s in payload["strategy"]]
             self._unit_norm_blocks = self._resolve_unit_blocks(self._strategy)
+            self._zscore_mask = self._resolve_zscore_mask(self._strategy).to(
+                self._zscore_mask.device
+            )
 
 
 def create_normalizer(
