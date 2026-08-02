@@ -161,6 +161,55 @@ class Normalizer(torch.nn.Module, abc.ABC):
             De-normalized tensor (same dtype as input).
         """
 
+    # ------------------------------------------------------------------
+    # RLRP-761 P1.1b/P1.1c — denormalization slope (variance transport)
+    # ------------------------------------------------------------------
+    #
+    # A *variance* expressed in normalized space is carried to physical space by
+    # the SQUARE of the denormalization slope. For an affine denormalizer that
+    # slope is the per-dimension constant ``s_d`` and the transport is exact:
+    #
+    #     logvar_phys[..., d] = logvar_norm[..., d] + 2 * log(s_d)
+    #
+    # For a NON-affine denormalizer (``SoftWinsorizedNormalizer``,
+    # ``QuantileNormalizer``) no such constant exists: the slope depends on the
+    # value. The plan's resolution (RLRP-761 plan revision 2, option (a)) is a
+    # LOCAL LINEARIZATION (delta method) at the predicted mean, which requires
+    # the diagonal of the denormalization Jacobian evaluated at that point.
+
+    #: Lower bound on the denormalization slope used for variance transport.
+    #: Guards ``log(s_d)`` against a degenerate / zero slope (RLRP-761 P1.1d).
+    JACOBIAN_FLOOR: float = 1e-12
+
+    @property
+    def is_affine(self) -> bool:
+        """Whether :meth:`denormalize` is an affine map with a constant per-dim slope.
+
+        ``True`` means the variance transport is **exact**; ``False`` means a
+        consumer must treat :meth:`denormalize_jacobian_diag` as a first-order
+        (``local_linear``) approximation and declare it as such (RLRP-761 P7).
+        """
+        return True
+
+    @abc.abstractmethod
+    def denormalize_jacobian_diag(
+        self, val: Union[float, mbrl.types.TensorType]
+    ) -> torch.Tensor:
+        """Diagonal of ``d denormalize / d val`` evaluated element-wise at *val*.
+
+        Returns a tensor broadcastable to (in practice, the same shape as)
+        *val*, strictly positive (floored at :attr:`JACOBIAN_FLOOR`).
+        Dimensions disabled by the S1.2a mask are pass-through, hence slope 1.
+        """
+
+    def _mask_jacobian(self, jac: torch.Tensor) -> torch.Tensor:
+        """Force slope ``1`` on the pass-through dimensions of the S1.2a mask."""
+        jac = jac.clamp_min(self.JACOBIAN_FLOOR)
+        if getattr(self, "_norm_mask_all_true", True):
+            return jac
+        mask = self._norm_mask.to(device=jac.device).reshape(-1)
+        return torch.where(mask, jac, torch.ones_like(jac))
+
     @abc.abstractmethod
     def save(self, save_dir: Union[str, pathlib.Path]) -> None:
         """Persist normalizer statistics to *save_dir*."""
@@ -556,6 +605,18 @@ class ZScoreNormalizer(Normalizer):
                 result = torch.zeros_like(result)
 
         return self._apply_norm_mask(result.to(input_dtype), val)
+
+    def denormalize_jacobian_diag(
+        self, val: Union[float, mbrl.types.TensorType]
+    ) -> torch.Tensor:
+        """Constant per-dimension slope ``std`` (RLRP-761 P1.1c, regime A).
+
+        ``denormalize`` is ``std * z + mean``, so the slope does not depend on
+        *val* — the variance transport ``+2*log(std)`` is **exact**.
+        """
+        val = self._to_tensor(val)
+        jac = self._std.to(device=val.device, dtype=val.dtype).reshape(-1)
+        return self._mask_jacobian(jac.expand_as(val).clone())
 
     def save(self, save_dir: Union[str, pathlib.Path]) -> None:
         """Saves statistics to a torch file."""
@@ -1356,6 +1417,66 @@ class SoftWinsorizedNormalizer(Normalizer):
 
         return self._apply_norm_mask(result.to(input_dtype), val)
 
+    @property
+    def is_affine(self) -> bool:
+        """``False`` unless the soft-clip is disabled on **every** dimension.
+
+        With the asinh soft-clip active the denormalization slope depends on the
+        value (RLRP-761 P1.1b); with it fully disabled the map degenerates to a
+        plain (affine) winsorized z-score.
+        """
+        return bool(self._soft_clip_all_disabled)
+
+    def denormalize_jacobian_diag(
+        self, val: Union[float, mbrl.types.TensorType]
+    ) -> torch.Tensor:
+        r"""Analytic slope of :meth:`denormalize` at *val* (RLRP-761 P1.1c).
+
+        ``denormalize(y) = S_tau^{-1}(y) * winsorized_std + winsorized_mean`` with
+
+        .. code-block:: text
+
+            d/dy S_tau^{-1}(y) = 1                      if |y| <= tau
+                               = cosh(|y| - tau)        otherwise
+
+        (the derivative of ``sign(y)*(tau + sinh(|y|-tau))``). Outside the knee
+        this is a **local** slope: the transport built on it is first-order
+        (``local_linear``), see :meth:`saturated_soft_clip_mask`.
+        """
+        val = self._to_tensor(val)
+        dtype = val.dtype
+        threshold = self.clip_threshold.to(device=val.device, dtype=dtype)
+        std = self.winsorized_std.to(device=val.device, dtype=dtype)
+        excess = val.abs() - threshold
+        # ``cosh`` of a large excess overflows; the floor/telemetry of P1.1d and
+        # the caller's clamp handle the (already flagged) saturated region.
+        slope_tail = torch.cosh(excess.clamp(max=80.0))
+        slope = torch.where(excess <= 0, torch.ones_like(slope_tail), slope_tail)
+        if self._soft_clip_all_disabled:
+            slope = torch.ones_like(slope)
+        elif not self._soft_clip_all_enabled:
+            active = self._soft_clip_active_mask.to(val.device).reshape(-1)
+            slope = torch.where(active, slope, torch.ones_like(slope))
+        return self._mask_jacobian(slope * std)
+
+    def saturated_soft_clip_mask(
+        self, val: Union[float, mbrl.types.TensorType]
+    ) -> torch.Tensor:
+        """Element-wise ``True`` where *val* lies in the soft-clipped tail (P1.1d).
+
+        There the first-order variance transport is least trustworthy; the
+        caller is expected to surface it rather than silently trust the number.
+        """
+        val = self._to_tensor(val)
+        threshold = self.clip_threshold.to(device=val.device, dtype=val.dtype)
+        beyond = val.abs() > threshold
+        if self._soft_clip_all_disabled:
+            return torch.zeros_like(beyond)
+        if self._soft_clip_all_enabled:
+            return beyond
+        active = self._soft_clip_active_mask.to(val.device).reshape(-1)
+        return beyond & active
+
     def save(self, save_dir: Union[str, pathlib.Path]) -> None:
         save_dir = pathlib.Path(save_dir)
         torch.save(
@@ -1796,6 +1917,78 @@ class QuantileNormalizer(Normalizer):
 
         result = result.reshape(original_shape)
         return self._apply_norm_mask(result.to(input_dtype), val)
+
+    @property
+    def is_affine(self) -> bool:
+        """Always ``False`` — the inverse is piecewise-linear with a per-bin slope."""
+        return False
+
+    def denormalize_jacobian_diag(
+        self, val: Union[float, mbrl.types.TensorType]
+    ) -> torch.Tensor:
+        """Active-bin slope of :meth:`denormalize` at *val* (RLRP-761 P1.1c).
+
+        Inside the calibrated range the inverse is
+        ``b_low + (v - t_low)/(t_high - t_low) * (b_high - b_low)``, so the slope
+        is ``(b_high - b_low)/(t_high - t_low)``. In the tails it is the first
+        (resp. last) bin slope used by :meth:`denormalize` for extrapolation.
+        Piecewise-constant, hence **local** — the resulting variance transport is
+        ``local_linear``, not exact.
+        """
+        val = self._to_tensor(val)
+        input_dtype = val.dtype
+        compute_dtype = (
+            torch.float64
+            if val.dtype == torch.float64
+            or self.quantile_boundaries.dtype == torch.float64
+            else self.quantile_boundaries.dtype
+        )
+        val_c = val.to(compute_dtype)
+        original_shape = val_c.shape
+        if val_c.ndim == 1:
+            val_c = val_c.unsqueeze(0)
+        if val_c.ndim > 2:
+            val_c = val_c.reshape(-1, val_c.shape[-1])
+
+        boundaries = self.quantile_boundaries.to(compute_dtype)  # (K+1, d)
+        targets = self.target_quantiles.to(compute_dtype)  # (K+1,)
+        batch_size, in_size = val_c.shape
+
+        idx_flat = torch.searchsorted(
+            targets.contiguous(), val_c.reshape(-1), right=False
+        )
+        idx = idx_flat.clamp(1, self.n_bins).reshape(batch_size, in_size)
+        idx_low = (idx - 1).clamp(0, self.n_bins)
+
+        denom = (targets[idx] - targets[idx_low]).clamp(min=1e-12)
+        slope = (
+            torch.gather(boundaries, 0, idx) - torch.gather(boundaries, 0, idx_low)
+        ) / denom
+
+        # Tail extrapolation slopes — mirror :meth:`denormalize` exactly.
+        lower_mask = val_c < targets[0]
+        upper_mask = val_c > targets[-1]
+        if lower_mask.any():
+            slope_low = (boundaries[1] - boundaries[0]) / (
+                targets[1] - targets[0]
+            ).clamp(min=1e-12)
+            slope = torch.where(lower_mask, slope_low.expand_as(slope), slope)
+        if upper_mask.any():
+            slope_high = (boundaries[-1] - boundaries[-2]) / (
+                targets[-1] - targets[-2]
+            ).clamp(min=1e-12)
+            slope = torch.where(upper_mask, slope_high.expand_as(slope), slope)
+
+        slope = slope.reshape(original_shape).to(input_dtype)
+        return self._mask_jacobian(slope)
+
+    def tail_extrapolated_mask(
+        self, val: Union[float, mbrl.types.TensorType]
+    ) -> torch.Tensor:
+        """Element-wise ``True`` outside the calibrated quantile range (P1.1d)."""
+        val = self._to_tensor(val)
+        targets = self.target_quantiles.to(device=val.device, dtype=val.dtype)
+        return (val < targets[0]) | (val > targets[-1])
 
     def save(self, save_dir: Union[str, pathlib.Path]):
         save_dir = pathlib.Path(save_dir)
@@ -2330,6 +2523,48 @@ class StrategyAwareNormalizer(Normalizer):
         out = self._apply_zscore(self._to_tensor_like(val), inverse=True)
         out = self.base.denormalize(out)
         return self._apply_unit_norm(out)
+
+    @property
+    def is_affine(self) -> bool:
+        """Affine iff the base is and no ``unit_norm`` block is present.
+
+        The ``zscore`` strategy is itself affine, but the ``unit_norm`` L2
+        projection is not even diagonal (RLRP-761 P1.1b).
+        """
+        return bool(self.base.is_affine) and not self._unit_norm_blocks
+
+    def denormalize_jacobian_diag(
+        self, val: Union[float, mbrl.types.TensorType]
+    ) -> torch.Tensor:
+        """Composed slope of :meth:`denormalize` at *val* (RLRP-761 P1.1c).
+
+        Per dimension:
+
+        - ``zscore``: the base is a pass-through (S1.2a mask ``False``), so the
+          whole slope is the wrapper's own ``std_d``.
+        - ``unit_norm``: the projection is **not** diagonal; slope ``1`` is
+          reported and the block must be treated as un-transportable variance
+          (in practice these dims carry no meaningful scale change).
+        - otherwise: the base slope, evaluated at the (unchanged) value.
+        """
+        val = self._to_tensor_like(val)
+        base_jac = self.base.denormalize_jacobian_diag(val)
+        jac = base_jac
+        if self.has_zscore_dims:
+            _, std = self._zscore_moments(base_jac.dtype)
+            std = std.to(base_jac.device)
+            mask = self._zscore_mask.to(base_jac.device).reshape(-1)
+            jac = torch.where(mask, std.expand_as(base_jac), base_jac)
+        for start, stop in self._unit_norm_blocks:
+            jac = torch.cat(
+                [
+                    jac[..., :start],
+                    torch.ones_like(jac[..., start:stop]),
+                    jac[..., stop:],
+                ],
+                dim=-1,
+            )
+        return jac.clamp_min(self.JACOBIAN_FLOOR)
 
     @staticmethod
     def _to_tensor_like(val: Union[float, mbrl.types.TensorType]) -> torch.Tensor:

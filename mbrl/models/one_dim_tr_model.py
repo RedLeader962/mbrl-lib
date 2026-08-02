@@ -883,6 +883,96 @@ class OneDTransitionRewardModel(Model):
                 obs_pred_norm[..., dim :: self._Do] = obs_pred_norm[..., dim :: self._Do]
         return self._denormalize_output(obs_pred_norm, obs_steps=k, act_steps=0)
 
+    # -- RLRP-761 P1.1 — variance transport (prediction-statistics channel) ---
+
+    def output_variance_transport_is_exact(self) -> bool:
+        """Whether :meth:`denormalize_predicted_logvar` is exact for the obs block.
+
+        ``False`` means the transport is a first-order **local linearization**
+        (``variance_approximation='local_linear'``, RLRP-761 P1.1 regime B) and
+        every consumer must declare it as such rather than present it as an
+        exact number.
+        """
+        facade = self.output_normalizer
+        if facade is None:
+            return True
+        return bool(facade.obs_sub.is_affine)
+
+    def denormalize_predicted_logvar(
+        self,
+        logvar_norm: torch.Tensor,
+        mean_norm: Optional[torch.Tensor] = None,
+        horizon_steps: Optional[int] = None,
+    ) -> torch.Tensor:
+        r"""Carry a NORMALIZED-space obs log-variance to physical space.
+
+        A variance transforms with the **square** of the denormalization slope
+        and takes **no** mean offset::
+
+            logvar_phys[..., d] = logvar_norm[..., d] + 2 * log(s_d)
+
+        Two regimes (RLRP-761 plan revision 2, option (a)):
+
+        * **A — affine** (``standard*``, ``standard_symmetric_innovation``, and
+          the ``zscore``/pass-through dims of ``StrategyAwareNormalizer``):
+          ``s_d`` is the constant per-dim scale and the result is **exact**.
+        * **B — non-affine** (``winsorized``, ``quantile``): no constant ``s_d``
+          exists, so ``s_d`` is the *local* slope evaluated at ``mean_norm``
+          (delta method). The result is a first-order approximation; see
+          :meth:`output_variance_transport_is_exact`.
+
+        Args:
+            logvar_norm: ``(..., Do * k)`` log-variance in NORMALIZED space.
+            mean_norm: the NORMALIZED predicted mean, same shape, used as the
+                linearization point. Required in regime B; ignored in regime A.
+            horizon_steps: explicit ``k``. **Always pass it** — inferring it from
+                the tensor width silently mis-slices a composed layout
+                (RLRP-761 ``Q-B``).
+
+        Returns:
+            The log-variance in PHYSICAL units (strict no-op when there is no
+            output normalizer, i.e. ``normalizer_type='standard'``).
+        """
+        facade = self.output_normalizer
+        if facade is None:
+            return logvar_norm
+        k = (
+            horizon_steps
+            if horizon_steps is not None
+            else (logvar_norm.shape[-1] // self._Do)
+        )
+        expected = self._Do * k
+        if logvar_norm.shape[-1] != expected:
+            raise ValueError(
+                f"denormalize_predicted_logvar: expected last-axis width "
+                f"Do*k = {self._Do}*{k} = {expected}, got "
+                f"{logvar_norm.shape[-1]}. Slice the statistics channel exactly "
+                f"like `next_obs` before calling (RLRP-761 P1.8/P1.9)."
+            )
+        obs_sub = facade.obs_sub
+        if obs_sub.is_affine:
+            point = torch.zeros_like(logvar_norm)
+        else:
+            if mean_norm is None:
+                raise ValueError(
+                    "denormalize_predicted_logvar: `mean_norm` is REQUIRED for a "
+                    "non-affine output normalizer (winsorized / quantile) — it is "
+                    "the linearization point of the delta-method transport."
+                )
+            if mean_norm.shape != logvar_norm.shape:
+                raise ValueError(
+                    f"denormalize_predicted_logvar: mean_norm shape "
+                    f"{tuple(mean_norm.shape)} != logvar_norm shape "
+                    f"{tuple(logvar_norm.shape)}."
+                )
+            point = mean_norm
+        leading = point.shape[:-1]
+        scale = obs_sub.denormalize_jacobian_diag(point.reshape(-1, self._Do))
+        scale = scale.reshape(*leading, expected) if leading else scale.reshape(expected)
+        return logvar_norm + 2.0 * torch.log(
+            scale.to(logvar_norm.dtype).clamp_min(obs_sub.JACOBIAN_FLOOR)
+        )
+
     def denormalize_predicted_act(
         self,
         act_pred_norm: torch.Tensor,
