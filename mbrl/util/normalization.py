@@ -2261,6 +2261,21 @@ class InnovationScaledNormalizer(ZScoreNormalizer):
         scale = scale.to(dtype=self._std.dtype, device=self._std.device).reshape(
             1, -1
         )
+        non_finite = ~torch.isfinite(scale)
+        if bool(non_finite.any().item()):
+            # RLRP-761 S9.3 -- replacing the scale by 1.0 leaves that channel
+            # effectively UNSCALED inside an innovation target space, which is a
+            # large but invisible mis-weighting. The sibling failure (absent
+            # `sequence_ids`, above) warns; this one is the same class and must too.
+            warnings.warn(
+                "InnovationScaledNormalizer.update_stats: the estimated innovation "
+                "scale is NOT FINITE at composed indices "
+                f"{non_finite.reshape(-1).nonzero().reshape(-1).tolist()}; "
+                "those dimensions fall back to a scale of 1.0, i.e. they are left "
+                "UNSCALED in the innovation target space (RLRP-761 S9.3).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
         floor = max(self.innovation_scale_floor, self.eps.item())
         self._std.copy_(torch.clamp(scale, min=floor))
@@ -2385,6 +2400,14 @@ class StrategyAwareNormalizer(Normalizer):
             self._resolve_zscore_mask(self._strategy),
             persistent=False,
         )
+        # RLRP-761 S11.2 -- the presence of a `zscore` dim is a property of the
+        # STRATEGY, which is fixed after `__init__` / `load`. Reading it from the
+        # mask tensor (`.any().item()`) on every transform call is a device->host
+        # SYNCHRONIZATION on a path executed once per AR unroll step; cache it as a
+        # plain Python bool instead.
+        self._has_zscore: bool = bool(self._zscore_mask.any().item())
+        # RLRP-761 S11.1 -- cached masked affine, see :meth:`_zscore_affine`.
+        self._zscore_affine_cache = None
 
     @staticmethod
     def _resolve_zscore_mask(strategy: Sequence[str]) -> torch.Tensor:
@@ -2396,8 +2419,51 @@ class StrategyAwareNormalizer(Normalizer):
 
     @property
     def has_zscore_dims(self) -> bool:
-        """Whether at least one dimension uses the ``zscore`` strategy."""
-        return bool(self._zscore_mask.any().item())
+        """Whether at least one dimension uses the ``zscore`` strategy.
+
+        RLRP-761 ``S11.2``: a cached Python ``bool``, **not** a tensor reduction.
+        This predicate gates every :meth:`normalize` / :meth:`denormalize` /
+        :meth:`denormalize_jacobian_diag` call, so a ``.any().item()`` here would
+        stall the compute stream on a device->host sync once per call.
+        """
+        return self._has_zscore
+
+    def _invalidate_zscore_cache(self) -> None:
+        """Drop the cached masked affine (RLRP-761 ``S11.1``, risk ``R-P``).
+
+        Must be called from every path that can change the base statistics or the
+        resolved strategy: :meth:`update_stats` and :meth:`load`. Device / dtype
+        moves need no explicit invalidation because both are part of the cache key.
+        """
+        self._zscore_affine_cache = None
+
+    def _zscore_affine(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the cached ``(mean_eff, std_eff, mask)`` masked affine.
+
+        RLRP-761 ``S11.1``. ``mean_eff = where(mask, mean, 0)`` and
+        ``std_eff = where(mask, std, 1)`` make the wrapper's transform a **single
+        fused affine over the whole vector** -- the non-``zscore`` dims are an
+        exact identity by construction -- so no mask select, no per-call moment
+        rebuild and no per-call ``.to(device)`` is required.
+
+        The same ``std_eff`` serves :meth:`denormalize_jacobian_diag`, so ``std``
+        keeps exactly ONE source of truth in this class.
+        """
+        key = (str(device), dtype)
+        cached = self._zscore_affine_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        mean, std = self._zscore_moments(dtype)
+        mask = self._zscore_mask.reshape(-1).to(device)
+        mean = mean.to(device)
+        std = std.to(device)
+        mean_eff = torch.where(mask, mean, torch.zeros_like(mean))
+        std_eff = torch.where(mask, std, torch.ones_like(std))
+        payload = (mean_eff, std_eff, mask)
+        self._zscore_affine_cache = (key, payload)
+        return payload
 
     def _zscore_moments(self, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the base ``(mean, std)`` as 1-D tensors, with a floored std."""
@@ -2417,12 +2483,11 @@ class StrategyAwareNormalizer(Normalizer):
             return val
         if not torch.is_tensor(val):
             val = torch.as_tensor(val)
-        mean, std = self._zscore_moments(val.dtype)
-        mean = mean.to(val.device)
-        std = std.to(val.device)
-        mask = self._zscore_mask.to(val.device).reshape(-1)
-        transformed = val * std + mean if inverse else (val - mean) / std
-        return torch.where(mask, transformed, val)
+        mean_eff, std_eff, _ = self._zscore_affine(val.device, val.dtype)
+        # Exact identity on the non-`zscore` dims (mean 0, std 1), so the masked
+        # select `torch.where(mask, transformed, val)` is unnecessary -- one fused
+        # affine over the full vector replaces three full-tensor passes.
+        return val * std_eff + mean_eff if inverse else (val - mean_eff) / std_eff
 
     @staticmethod
     def _resolve_unit_blocks(strategy: Sequence[str]) -> List[Tuple[int, int]]:
@@ -2505,6 +2570,7 @@ class StrategyAwareNormalizer(Normalizer):
                 )
             }
         self.base.update_stats(data, **kwargs)
+        self._invalidate_zscore_cache()
 
     def normalize(
         self,
@@ -2551,10 +2617,11 @@ class StrategyAwareNormalizer(Normalizer):
         base_jac = self.base.denormalize_jacobian_diag(val)
         jac = base_jac
         if self.has_zscore_dims:
-            _, std = self._zscore_moments(base_jac.dtype)
-            std = std.to(base_jac.device)
-            mask = self._zscore_mask.to(base_jac.device).reshape(-1)
-            jac = torch.where(mask, std.expand_as(base_jac), base_jac)
+            # `std_eff` is `std` on the `zscore` dims (and 1 elsewhere, unused
+            # here), i.e. the SAME cached tensor the transform uses -- one source
+            # of truth for `std` (RLRP-761 S11.1, risk `R-P`).
+            _, std_eff, mask = self._zscore_affine(base_jac.device, base_jac.dtype)
+            jac = torch.where(mask, std_eff.expand_as(base_jac), base_jac)
         for start, stop in self._unit_norm_blocks:
             jac = torch.cat(
                 [
@@ -2592,6 +2659,8 @@ class StrategyAwareNormalizer(Normalizer):
             self._zscore_mask = self._resolve_zscore_mask(self._strategy).to(
                 self._zscore_mask.device
             )
+            self._has_zscore = bool(self._zscore_mask.any().item())
+        self._invalidate_zscore_cache()
 
 
 def create_normalizer(
