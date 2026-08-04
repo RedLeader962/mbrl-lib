@@ -2061,6 +2061,15 @@ class InnovationScaledNormalizer(ZScoreNormalizer):
     **Scale modes** (``innovation_scale_mode``):
 
     - ``one_step_delta`` — ``s = std(x[t+1] - x[t])``, the plain innovation std.
+      **Robustness trade-off (RLRP-761 S9.4).** This is the DEFAULT because it is
+      exactly what its name says (the innovation std), but the ``std`` is NOT
+      robust: a single adverse excursion (traction loss, aggressive turn) inflates
+      ``s_d`` for that channel, which SHRINKS its normalized target and therefore
+      down-weights the very event this research program wants to keep salient —
+      the opposite of the intent. ``noise_floor`` (MAD-based, below) is immune to
+      this and is the recommended mode for adverse-event work; ``one_step_delta``
+      remains preferable when the innovation is genuinely near-Gaussian and no
+      rare large excursions are expected.
     - ``noise_floor``    — ``s = 1.4826 * MAD(x[t+1] - 2 x[t] + x[t-1]) / sqrt(6)``,
       the IRREDUCIBLE high-frequency component. The second difference annihilates
       any locally-linear signal, and the **MAD** form (rather than the std) is
