@@ -356,9 +356,21 @@ class OneDTransitionRewardModel(Model):
             # spaces are reconciled by the single diagonal :attr:`ar_bridge_gain`
             # (``S4.4``) instead of a denormalize/renormalize pair.
             #
-            # The ACT block stays SHARED: "innovation" is a property of the
-            # predicted state, and sharing keeps ``denormalize_predicted_act``
-            # and the AR action splice in one space (gain 1 by construction).
+            # RLRP-761 S12.1 — the ACT block is now ALSO decoupled. The MS
+            # forecast/mixture self-feed (``state_history_update``,
+            # ``obs_space_only=False``) predicts the commands AND ``dt`` and
+            # re-injects them, so the act block is a genuine FORECAST target, not
+            # exogenous waste. Scaling the act TARGET by its own innovation puts
+            # it in the SAME innovation-relative semantic as the obs target, so
+            # the predictability weighting governs its loss-budget share instead
+            # of an accidental obs-vs-act scale mismatch. The act INPUT keeps the
+            # well-conditioned state z-score (``act_sub`` above); the two act
+            # spaces are reconciled by the diagonal :attr:`ar_bridge_gain_act`
+            # (``S12.4``) at the self-feed splice, exactly as for obs. This is a
+            # normalizer-construction concern keyed off the feature contract, so
+            # it applies uniformly to every environment family (operator
+            # decision 2, 2026-08-03); a math env with no act block simply has
+            # no act dims to scale.
             obs_input_sub = mbrl.util.normalization.create_normalizer(
                 "standard_symmetric",
                 obs_dim,
@@ -371,11 +383,22 @@ class OneDTransitionRewardModel(Model):
                 },
             )
             obs_input_sub = self._maybe_wrap_strategy(obs_input_sub, obs_strategy)
+            # Target act sub: the innovation normalizer, built with the SAME
+            # ``innovation_*`` kwargs (e.g. ``innovation_scale_mode``) as the obs
+            # sub so obs and act share one innovation-scale *semantic*.
+            act_target_sub = mbrl.util.normalization.create_normalizer(
+                _INNOVATION_NORMALIZER_TYPE,
+                act_dim,
+                self.model.device,
+                dtype=norm_dtype,
+                **act_norm_kwargs,
+            )
+            act_target_sub = self._maybe_wrap_strategy(act_target_sub, act_strategy)
             self.input_normalizer = _InputOutputNormalizerFacade(
                 obs_sub=obs_input_sub, act_sub=act_sub
             )
             self.output_normalizer = _InputOutputNormalizerFacade(
-                obs_sub=obs_sub, act_sub=act_sub
+                obs_sub=obs_sub, act_sub=act_target_sub
             )
             return
 
@@ -659,15 +682,60 @@ class OneDTransitionRewardModel(Model):
         """
         if not self.uses_decoupled_obs_scales:
             return None
-        target_wrapper = self.output_normalizer.obs_sub
-        input_wrapper = self.input_normalizer.obs_sub
+        return self._diagonal_bridge_gain(
+            self.output_normalizer.obs_sub, self.input_normalizer.obs_sub
+        )
+
+    @property
+    def uses_decoupled_act_scales(self) -> bool:
+        """True when the act INPUT and act TARGET scales differ (RLRP-761 ``S12``).
+
+        ``False`` for every legacy type and for pre-``S12`` innovation runs,
+        where the two facades hold the *same* physical ``act_sub`` object — which
+        keeps :attr:`ar_bridge_gain_act` a no-op and every such path bit-exact
+        (measure ``M5``).
+        """
+        return (
+            self.input_normalizer is not None
+            and self.output_normalizer is not None
+            and self.input_normalizer.is_block
+            and self.input_normalizer.act_sub is not None
+            and self.output_normalizer.act_sub is not None
+            and self.input_normalizer.act_sub is not self.output_normalizer.act_sub
+        )
+
+    @property
+    def ar_bridge_gain_act(self) -> Optional[torch.Tensor]:
+        """The diagonal TARGET-space -> INPUT-space **act** map, or ``None``.
+
+        RLRP-761 ``S12.4``. Exact act analogue of :attr:`ar_bridge_gain`: the
+        commands / ``dt`` predicted by the MS forecast self-feed live in the
+        (innovation-scaled) act TARGET space and are re-injected into the
+        (state-std) act INPUT history window, so they cross the same diagonal
+        map ``z_input = z_target * (s / sigma_state)``. Returns ``None`` (strict
+        identity at the splice) for every type whose act facades are shared, so
+        the four legacy types and pre-``S12`` innovation runs stay bit-exact.
+        """
+        if not self.uses_decoupled_act_scales:
+            return None
+        return self._diagonal_bridge_gain(
+            self.output_normalizer.act_sub, self.input_normalizer.act_sub
+        )
+
+    def _diagonal_bridge_gain(self, target_wrapper, input_wrapper) -> torch.Tensor:
+        """Shared TARGET->INPUT diagonal gain for a decoupled sub-normalizer pair.
+
+        Used by both :attr:`ar_bridge_gain` (obs) and :attr:`ar_bridge_gain_act`
+        (act). The gain is ``s_target / sigma_input`` on the dims actually
+        rescaled and ``1`` elsewhere (``unit_norm`` / ``identity`` dims, whose
+        base transform is a pass-through in BOTH spaces).
+        """
         target_sub = getattr(target_wrapper, "base", target_wrapper)
         input_sub = getattr(input_wrapper, "base", input_wrapper)
         eps = float(getattr(input_sub, "eps", torch.tensor(1e-5)).reshape(-1)[0])
         gain = target_sub.std.reshape(-1) / torch.clamp(
             input_sub.std.reshape(-1), min=eps
         )
-
         rescaled = self._rescaled_dim_mask(target_wrapper, target_sub, gain)
         return torch.where(rescaled, gain, torch.ones_like(gain))
 
@@ -708,6 +776,24 @@ class OneDTransitionRewardModel(Model):
                 f"Unknown normalization space '{space}'; expected 'input' or 'target'."
             )
         return facade.obs_sub
+
+    def _act_sub_for(self, space: str):
+        """Return the act sub-normalizer of the requested space (RLRP-761 ``S12.2``).
+
+        Act analogue of :meth:`_obs_sub_for`. ``space='target'`` (default) stays
+        the historical output-facade behaviour; both spaces resolve to the SAME
+        object for every type whose act facades are shared (all legacy types and
+        pre-``S12`` innovation runs), so this is a strict no-op outside ``S12``.
+        """
+        if space == "input":
+            facade = self.input_normalizer
+        elif space == "target":
+            facade = self.output_normalizer
+        else:
+            raise ValueError(
+                f"Unknown normalization space '{space}'; expected 'input' or 'target'."
+            )
+        return facade.act_sub
 
     @property
     def obs_normalizer(self):
@@ -1031,13 +1117,14 @@ class OneDTransitionRewardModel(Model):
         # model-output (test-time-rollout feedback) values; ``None`` (default)
         # keeps the strict fail-fast used for training/data.
         #
-        # ``space`` (RLRP-761 S4.9) selects the obs scale. It matters ONLY for
-        # ``standard_symmetric_innovation``, whose input and target obs scales
-        # are decoupled; every other type resolves both to the same object.
-        # The default stays ``'target'`` so the historical behaviour of this
-        # shim (always the output facade) is preserved.
-        facade = self.output_normalizer
+        # ``space`` (RLRP-761 S4.9 / S12.2) selects BOTH the obs and the act
+        # scale. It matters ONLY for ``standard_symmetric_innovation``, whose
+        # input and target scales are decoupled (obs by ``S4``, act by ``S12``);
+        # every other type resolves both to the same object. The default stays
+        # ``'target'`` so the historical behaviour of this shim (always the
+        # output facade) is preserved.
         obs_sub = self._obs_sub_for(space)
+        act_sub = self._act_sub_for(space)
         Do, Da = self._Do, self._Da
         if not self._is_multistep:
             return obs_sub.normalize(composed_obs, strict_finite=strict_finite)
@@ -1052,7 +1139,7 @@ class OneDTransitionRewardModel(Model):
             obs_part.reshape(-1, Do), strict_finite=strict_finite
         ).reshape(*leading, Do * H)
         if act_part.shape[-1] > 0:
-            act_norm = facade.act_sub.normalize(
+            act_norm = act_sub.normalize(
                 act_part.reshape(-1, Da), strict_finite=strict_finite
             ).reshape(*leading, act_part.shape[-1])
             return torch.cat([obs_norm, act_norm], dim=-1)
@@ -1060,16 +1147,20 @@ class OneDTransitionRewardModel(Model):
 
     # (Priority) ToDo: refactor _normalize_composed_act to one_dim_tr_model_v2.py
     def _normalize_composed_act(
-        self, action: torch.Tensor, strict_finite=None
+        self, action: torch.Tensor, strict_finite=None, space: str = "target"
     ) -> torch.Tensor:
-        facade = self.output_normalizer
+        # ``space`` (RLRP-761 S12.2) selects the act scale. The model INPUT must
+        # pass ``space='input'`` (well-conditioned state z-score); the training
+        # target keeps ``'target'`` (innovation-scaled under ``S12``). Both
+        # resolve to the same object outside ``standard_symmetric_innovation``.
+        act_sub = self._act_sub_for(space)
         Da = self._Da
         if action.shape[-1] > Da:
             leading = action.shape[:-1]
-            return facade.act_sub.normalize(
+            return act_sub.normalize(
                 action.reshape(-1, Da), strict_finite=strict_finite
             ).reshape(*leading, action.shape[-1])
-        return facade.act_sub.normalize(action, strict_finite=strict_finite)
+        return act_sub.normalize(action, strict_finite=strict_finite)
 
     @deprecated(reason="DEPRECATED input-layout denorm shim (RLRP-684).")
     def _denormalize_composed_obs(self, composed_obs_norm: torch.Tensor) -> torch.Tensor:
@@ -1189,10 +1280,25 @@ class OneDTransitionRewardModel(Model):
             act_current = action.reshape(-1, Da)
             act_pooled = torch.cat([act_from_composed, act_current], dim=0)
             self._update_obs_subs(obs_block, self._composed_history_sequence_ids(obs_block, H))
-            self.input_normalizer.act_sub.update_stats(act_pooled)
+            # RLRP-761 S12.1: the composed act TAIL is ``history_len - 1``
+            # consecutive act frames per row (input layout ``Do*H + Da*(H-1)``),
+            # so it carries the within-window adjacency the innovation act sub
+            # needs; the state-std input act sub is fitted on the full pool.
+            act_windows_len = max(H - 1, 1)
+            self._update_act_subs(
+                act_input_pool=act_pooled,
+                act_windows=act_from_composed,
+                sequence_ids=self._composed_history_sequence_ids(
+                    act_from_composed, act_windows_len
+                ),
+            )
         else:
             self._update_obs_subs(obs.reshape(-1, Do), None)
-            self.input_normalizer.act_sub.update_stats(action.reshape(-1, Da))
+            self._update_act_subs(
+                act_input_pool=action.reshape(-1, Da),
+                act_windows=action.reshape(-1, Da),
+                sequence_ids=None,
+            )
 
     def _composed_history_sequence_ids(
         self, obs_block: torch.Tensor, history_len: int
@@ -1251,6 +1357,39 @@ class OneDTransitionRewardModel(Model):
                 sub.update_stats(obs_block, sequence_ids=sequence_ids)
             else:
                 sub.update_stats(obs_block)
+
+    def _update_act_subs(
+        self,
+        act_input_pool: torch.Tensor,
+        act_windows: torch.Tensor,
+        sequence_ids: Optional[torch.Tensor],
+    ) -> None:
+        """Fit the act sub-normalizer(s) (RLRP-761 ``S12.1``).
+
+        - Shared act facades (every legacy type and pre-``S12`` innovation runs):
+          a SINGLE ``update_stats`` on ``act_input_pool`` — byte-identical to the
+          historical ``self.input_normalizer.act_sub.update_stats(act_pooled)``.
+        - Decoupled act facades (``S12`` innovation): the state-std INPUT act sub
+          is fitted on ``act_input_pool`` (no sequence structure needed), and the
+          innovation TARGET act sub on the sequence-ordered ``act_windows`` with
+          ``sequence_ids`` so its one-step innovation is measured within a window.
+        """
+        input_act = self.input_normalizer.act_sub
+        output_act = (
+            self.output_normalizer.act_sub
+            if self.output_normalizer is not None
+            else None
+        )
+        if input_act is None:
+            return
+        if output_act is None or output_act is input_act:
+            input_act.update_stats(act_input_pool)
+            return
+        input_act.update_stats(act_input_pool)
+        if sequence_ids is not None and self._accepts_sequence_ids(output_act):
+            output_act.update_stats(act_windows, sequence_ids=sequence_ids)
+        else:
+            output_act.update_stats(act_windows)
 
     @staticmethod
     def _accepts_sequence_ids(sub) -> bool:
