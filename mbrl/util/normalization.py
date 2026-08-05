@@ -2182,6 +2182,20 @@ class InnovationScaledNormalizer(ZScoreNormalizer):
         space is the single elementwise multiply ``z_input = z_target * gain``
         (``S4.4``). Equals ``1`` whenever the innovation scale degenerates to
         the state std, which is what keeps every legacy path a no-op.
+
+        .. warning:: **PRECONDITION — the two facades MUST share ``mu``.**
+           "The mean cancels" is only true because the *same* symbol ``mu``
+           appears in both expressions above. If the input facade and the target
+           facade are fitted on **different pools**, their locations differ and
+           this pure-diagonal gain silently drops
+           ``(mu_target - mu_input) / sigma_input`` from every bridged slot.
+           That was RLRP-761 finding ``F-1`` (real, for the act block). It is now
+           enforced at the *fit*, not patched at the bridge: see the
+           ``location_data=`` keyword of :meth:`update_stats` and the
+           ``_warn_on_location_mismatch`` sentinel in
+           ``mbrl.models.one_dim_tr_model``. Do **not** reintroduce a call site
+           that fits the two facades on different pools without passing
+           ``location_data=``.
         """
         return self._std / torch.clamp(self._state_std, min=self.eps.item())
 
@@ -2238,14 +2252,33 @@ class InnovationScaledNormalizer(ZScoreNormalizer):
         self,
         data: mbrl.types.TensorType,
         sequence_ids: Optional[mbrl.types.TensorType] = None,
+        location_data: Optional[mbrl.types.TensorType] = None,
     ) -> None:
         """Fit ``mu``, the state std and the innovation scale.
 
-        :param data: ``(N, in_size)`` samples.
+        :param data: ``(N, in_size)`` samples. Always the pool the **innovation
+            scale** is estimated from (it must carry the within-sequence
+            adjacency).
         :param sequence_ids: optional ``(N,)`` integer tensor marking
             contiguous-in-time runs (see the class docstring).
+        :param location_data: optional ``(M, in_size)`` pool used **instead of**
+            ``data`` to fit the LOCATION ``mu`` and the state std (RLRP-761
+            ``F-1``).
+
+            Rationale: :attr:`bridge_gain` is a *pure diagonal multiply*, which
+            is exact only because the input and target facades share the same
+            ``mu`` ("the location cancels"). When a caller fits the input facade
+            on one pool and the target facade on a *subset* of it, the two
+            ``mu`` differ and the bridge silently drops
+            ``(mu_target - mu_input) / sigma_input``. Passing the input facade's
+            pool here restores the shared location **by construction**, at the
+            source, without making the bridge affine (which would break the
+            bit-exact ``None`` short-circuit ``M5`` relies on).
+
+            Defaults to ``None`` ⇒ historical behaviour (``mu`` fitted on
+            ``data``), so every existing call site is byte-identical.
         """
-        super().update_stats(data)
+        super().update_stats(data if location_data is None else location_data)
         self._state_std.copy_(self._std)
 
         tensor = self._to_tensor(data)

@@ -1373,6 +1373,19 @@ class OneDTransitionRewardModel(Model):
           is fitted on ``act_input_pool`` (no sequence structure needed), and the
           innovation TARGET act sub on the sequence-ordered ``act_windows`` with
           ``sequence_ids`` so its one-step innovation is measured within a window.
+
+        **RLRP-761 ``F-1``**: the two pools above are NOT the same
+        (``act_input_pool = cat([act_from_composed, act_current])`` strictly
+        contains ``act_windows``), so fitting both moments of each sub on its own
+        pool gave the input and target act facades two DIFFERENT locations
+        ``mu``. The AR bridge is a pure diagonal multiply whose exactness rests
+        on the location cancelling, so the mismatch was silently dropping
+        ``(mu_target - mu_input) / sigma_input`` from every bridged act slot.
+        Fixed at the source: the TARGET act sub is now told to take its LOCATION
+        (and state std) from ``act_input_pool`` via ``location_data=``, while
+        still estimating its innovation SCALE from the sequence-ordered
+        ``act_windows``. Subs that do not support the keyword keep the historical
+        call, so nothing outside the decoupled innovation path changes.
         """
         input_act = self.input_normalizer.act_sub
         output_act = (
@@ -1386,22 +1399,70 @@ class OneDTransitionRewardModel(Model):
             input_act.update_stats(act_input_pool)
             return
         input_act.update_stats(act_input_pool)
+        # RLRP-761 F-1: share the LOCATION with the input act sub (see docstring).
+        target_kwargs = {}
         if sequence_ids is not None and self._accepts_sequence_ids(output_act):
-            output_act.update_stats(act_windows, sequence_ids=sequence_ids)
-        else:
-            output_act.update_stats(act_windows)
+            target_kwargs["sequence_ids"] = sequence_ids
+        if self._accepts_kwarg(output_act.update_stats, "location_data"):
+            target_kwargs["location_data"] = act_input_pool
+        output_act.update_stats(act_windows, **target_kwargs)
+        self._warn_on_location_mismatch(input_act, output_act, who="act")
 
     @staticmethod
-    def _accepts_sequence_ids(sub) -> bool:
-        """Whether ``sub.update_stats`` takes the ``sequence_ids`` keyword."""
+    def _warn_on_location_mismatch(input_sub, output_sub, *, who: str) -> None:
+        """Sentinel for a decoupled input/target LOCATION drift (RLRP-761 ``F-1``).
+
+        The AR ``bridge_gain`` is a pure diagonal multiply, exact only while both
+        facades share ``mu``. This one-comparison-per-fit check is the sentinel
+        that would have surfaced ``F-1``.
+
+        The tolerance is deliberately ``~0`` (a small multiple of the dtype
+        ``eps``), NOT a hand-picked constant: once the location is shared *by
+        construction* the residual is zero up to float reduction noise, so any
+        finite tolerance would only let a smaller-but-still-harmful offset pass
+        silently — which is exactly what ``F-1`` was.
+        """
+        mu_i = getattr(input_sub, "mean", None)
+        mu_t = getattr(output_sub, "mean", None)
+        sigma_i = getattr(input_sub, "std", None)
+        if mu_i is None or mu_t is None or sigma_i is None:
+            return
+        eps = torch.finfo(mu_i.dtype).eps
+        residual = ((mu_t - mu_i).abs() / torch.clamp(sigma_i.abs(), min=eps)).max()
+        if float(residual.item()) <= 32.0 * eps:
+            return
+        warnings.warn(
+            f"OneDTransitionRewardModel: the INPUT and TARGET {who} "
+            f"sub-normalizers are centred differently "
+            f"(max |mu_target - mu_input| / sigma_input = "
+            f"{float(residual.item()):.3e} > ~0). The AR target->input bridge is "
+            f"a PURE DIAGONAL multiply and assumes the location cancels, so this "
+            f"offset is silently dropped from every bridged slot "
+            f"(RLRP-761 F-1).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    @staticmethod
+    def _accepts_kwarg(callable_, name: str) -> bool:
+        """Whether ``callable_`` accepts the keyword argument ``name``.
+
+        Tolerates un-introspectable callables (C extensions, some mocks) by
+        answering ``False``, i.e. the caller keeps its historical signature.
+        """
         try:
-            signature = inspect.signature(sub.update_stats)
+            signature = inspect.signature(callable_)
         except (TypeError, ValueError):
             return False
         parameters = signature.parameters
-        return "sequence_ids" in parameters or any(
+        return name in parameters or any(
             p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
         )
+
+    @classmethod
+    def _accepts_sequence_ids(cls, sub) -> bool:
+        """Whether ``sub.update_stats`` takes the ``sequence_ids`` keyword."""
+        return cls._accepts_kwarg(sub.update_stats, "sequence_ids")
 
     def loss(
         self,

@@ -266,9 +266,81 @@ class TestDecoupledBlockFacade:
         # for an autocorrelated signal.
         assert torch.all(target_sub.std < input_sub.std)
 
-    def test_the_act_sub_is_shared_between_the_two_facades(self):
+    def test_the_act_sub_is_decoupled_between_the_two_facades(self):
+        """RLRP-761 ``S12.1`` re-baseline (was
+        ``test_the_act_sub_is_shared_between_the_two_facades``).
+
+        The original assertion encoded the ``S4.3`` contract, where only the OBS
+        block was decoupled and the act block stayed a single shared
+        ``standard_symmetric`` sub. ``S12.1`` deliberately decoupled the act
+        block too: the MS forecast self-feed predicts and re-injects the
+        commands, so the act TARGET is a genuine forecast target and is
+        innovation-scaled, while the act INPUT keeps the well-conditioned state
+        z-score. The two are reconciled by :attr:`ar_bridge_gain_act`.
+
+        Keeping the old assertion would have pinned a contract the production
+        code abandoned, so it is replaced (not deleted) by the current one.
+        """
         wrapper = _build_wrapper("standard_symmetric_innovation")
-        assert wrapper.input_normalizer.act_sub is wrapper.output_normalizer.act_sub
+        input_act = wrapper.input_normalizer.act_sub
+        target_act = wrapper.output_normalizer.act_sub
+
+        assert input_act is not target_act, (
+            "S12.1: the act block must be decoupled under the innovation type."
+        )
+        assert isinstance(input_act, ZScoreNormalizer)
+        assert isinstance(target_act, InnovationScaledNormalizer)
+        assert wrapper.uses_decoupled_act_scales
+
+    def test_the_act_facades_share_one_location(self):
+        """RLRP-761 ``F-1`` precondition, pinned.
+
+        ``ar_bridge_gain_act`` is a PURE diagonal multiply, which is only the
+        exact ``target -> input`` conversion because the same ``mu`` appears in
+        both facades' affine maps. ``F-1`` was precisely the violation of that
+        premise (the input act sub was fitted on a pooled tensor while the
+        target act sub was fitted on the tail only), silently dropping
+        ``(mu_target - mu_input) / sigma_input`` from every bridged act slot.
+
+        The fix lives at the FIT (``update_stats(location_data=...)``), so this
+        test guards the invariant at its source rather than at the bridge.
+        """
+        wrapper = _build_wrapper("standard_symmetric_innovation")
+        obs, act = _composed_batch()
+        wrapper.update_normalizer(_Batch(obs, act))
+
+        input_mu = wrapper.input_normalizer.act_sub.mean.reshape(-1)
+        target_mu = wrapper.output_normalizer.act_sub.mean.reshape(-1)
+        assert torch.allclose(input_mu, target_mu, rtol=0.0, atol=0.0), (
+            "F-1 regression: the act facades no longer share one location, so "
+            "the pure-diagonal act bridge silently drops the offset. Fit the "
+            "target act sub with ``location_data=`` (see _update_act_subs)."
+        )
+
+    def test_the_act_bridge_is_the_exact_target_to_input_conversion(self):
+        """``S12.4`` — the act analogue of
+        :meth:`test_bridge_is_the_exact_target_to_input_conversion`.
+
+        This is the behavioural consequence of the two tests above: with the
+        location shared, the diagonal gain reproduces the INPUT-space value
+        exactly. Had ``F-1`` still been live, this identity would fail by the
+        dropped offset.
+        """
+        wrapper = _build_wrapper(
+            "standard_symmetric_innovation", double_precision=True
+        )
+        obs, act = _composed_batch()
+        wrapper.update_normalizer(_Batch(obs, act))
+
+        gain = wrapper.ar_bridge_gain_act
+        assert gain is not None, "S12.4: the act bridge gain must be registered."
+
+        raw = act[:2].to(torch.float64)
+        target_space = wrapper.output_normalizer.act_sub.normalize(raw)
+        via_bridge = target_space * gain.to(torch.float64)
+        direct = wrapper.input_normalizer.act_sub.normalize(raw)
+        ulp = 4 * torch.finfo(torch.float64).eps
+        assert torch.allclose(via_bridge, direct, rtol=ulp, atol=1e-12)
 
     def test_bridge_gain_equals_the_scale_ratio(self):
         wrapper = _build_wrapper("standard_symmetric_innovation")
