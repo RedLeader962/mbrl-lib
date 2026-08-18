@@ -2450,6 +2450,25 @@ class StrategyAwareNormalizer(Normalizer):
         self._has_zscore: bool = bool(self._zscore_mask.any().item())
         # RLRP-761 S11.1 -- cached masked affine, see :meth:`_zscore_affine`.
         self._zscore_affine_cache = None
+        # RLRP-777 -- `eps` / `_zscore_mask` are registered HERE, i.e. AFTER the base
+        # normalizer already ran `self.to(device)` in its own constructor, so they would
+        # otherwise stay host-resident while the base lives on the GPU, splitting the
+        # module across devices (RLRP-757-E4 Jetson investigation). Follow the base.
+        self._align_buffers_to_base()
+
+    def _align_buffers_to_base(self) -> None:
+        """Move our OWN (non-persistent) buffers onto the base normalizer's device.
+
+        ``eps`` / ``_zscore_mask`` are registered in :meth:`__init__`, i.e. AFTER the
+        base already ran ``self.to(device)`` in its own constructor, so they would
+        otherwise stay host-resident while the base lives on the GPU (RLRP-777,
+        RLRP-757-E4 2026-08-18). Called from :meth:`__init__`, :meth:`update_stats`
+        and :meth:`load` -- the three places that can (re)place the base or re-derive
+        our buffers. A no-op when devices already match.
+        """
+        base_device = getattr(self.base, "device", None)
+        if base_device is not None and self.eps.device != base_device:
+            self.to(base_device)
 
     @staticmethod
     def _resolve_zscore_mask(strategy: Sequence[str]) -> torch.Tensor:
@@ -2513,7 +2532,7 @@ class StrategyAwareNormalizer(Normalizer):
         std = self.base.std.reshape(-1).to(dtype=dtype)
         base_eps = getattr(self.base, "eps", None)
         eps = (
-            base_eps.to(dtype=dtype).reshape(-1)[0]
+            base_eps.to(device=std.device, dtype=dtype).reshape(-1)[0]
             if torch.is_tensor(base_eps)
             else torch.tensor(1e-5, dtype=dtype, device=std.device)
         )
@@ -2552,7 +2571,7 @@ class StrategyAwareNormalizer(Normalizer):
             return val
         if not torch.is_tensor(val):
             val = torch.as_tensor(val)
-        eps = self.eps.to(val.dtype)
+        eps = self.eps.to(device=val.device, dtype=val.dtype)
         # Reassemble the last dimension out of contiguous segments, projecting
         # only the ``unit_norm`` blocks onto the L2 unit sphere. We build the
         # result via ``torch.cat`` of freshly-computed slices instead of an
@@ -2613,6 +2632,9 @@ class StrategyAwareNormalizer(Normalizer):
             }
         self.base.update_stats(data, **kwargs)
         self._invalidate_zscore_cache()
+        # RLRP-777 -- the base may have been re-fitted / re-placed; keep our buffers
+        # on its device.
+        self._align_buffers_to_base()
 
     def normalize(
         self,
@@ -2703,6 +2725,10 @@ class StrategyAwareNormalizer(Normalizer):
             )
             self._has_zscore = bool(self._zscore_mask.any().item())
         self._invalidate_zscore_cache()
+        # RLRP-777 -- `load()` re-derives the mask with `.to(self._zscore_mask.device)`,
+        # i.e. it PRESERVES the existing (possibly host-resident) device rather than
+        # adopting the base's. Re-assert the follow-the-base invariant explicitly.
+        self._align_buffers_to_base()
 
 
 def create_normalizer(
