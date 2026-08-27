@@ -207,10 +207,34 @@ class Model(pl.LightningModule, abc.ABC):
         loss, meta = self.loss(model_in, target)
         loss.backward()
         if meta is not None:
+            # A1 (RLRP-783): on-device ``grad_norm`` reduction (upstream twin of the base
+            # model loop). Introduced by action ``A1`` of the RLRC MTM-Pro models code
+            # optimization `.junie` plan
+            # (``perf_RLRP-783_mtm_pro_models_code_optimization_plan_20260827.md``): replaces
+            # one ``.item()`` device->host sync per parameter tensor with ONE fused kernel +
+            # ONE sync PER DEVICE. ``torch._foreach_norm`` requires every tensor on a single
+            # device, so the grads are grouped by device first (a model may hold parameters on
+            # a device different from the network weights; the legacy per-tensor ``.item()``
+            # loop tolerated that -- A1 must too, and a single-device model still incurs exactly
+            # one sync). The squared sum is accumulated in float64 to match the float64
+            # accumulation of the previous Python-level ``+=`` loop. Diagnostic only.
             with torch.no_grad():
-                grad_norm = 0.0
-                for p in list(filter(lambda p: p.grad is not None, self.parameters())):
-                    grad_norm += p.grad.data.norm(2).item() ** 2
+                grads = [p.grad for p in self.parameters() if p.grad is not None]
+                if grads:
+                    grads_by_device: dict = {}
+                    for _g in grads:
+                        grads_by_device.setdefault(_g.device, []).append(_g)
+                    grad_norm = 0.0
+                    for _device_grads in grads_by_device.values():
+                        grad_norm += (
+                            torch.stack(torch._foreach_norm(_device_grads))
+                            .double()
+                            .pow(2)
+                            .sum()
+                            .item()
+                        )
+                else:
+                    grad_norm = 0.0
                 meta["grad_norm"] = grad_norm
         optimizer.step()
         return loss.item(), meta
