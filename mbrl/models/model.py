@@ -57,6 +57,18 @@ class Model(pl.LightningModule, abc.ABC):
 
     _MODEL_FNAME = "model.pth"
 
+    #: Diagnostic ``meta`` collection master switch. When ``False`` every ``meta[...]``
+    #: assignment AND the tensor work feeding it (``detach().mean().item()`` device->host
+    #: syncs, the stashed-scalar reductions and the intra-call read-back diagnostics) is
+    #: skipped, so a non-monitored run (HPO / multirun) pays nothing for TensorBoard
+    #: scalars. Driven by the config key ``pipeline.tensorboard.enable_meta_collection``
+    #: (default ``True`` -> today's behaviour, bit-exact loss + identical ``meta`` key set).
+    #: Load-bearing keys (``meta["score"]`` / ``meta["loss"]`` in ``model_trainer`` and the
+    #: ``basic_ensemble`` aggregation keys) are NEVER gated. Permanent diagnostic plumbing.
+    #: Introduced by action ``A7`` of the RLRC meta-collection kill-switch `.junie` plan
+    #: (``perf_RLRP-788_meta_collection_killswitch_plan_20260827.md``).
+    _enable_meta_collection: bool = True
+
     def __init__(
         self,
         device: Union[str, torch.device],
@@ -67,6 +79,35 @@ class Model(pl.LightningModule, abc.ABC):
         # self.device is a read-only property in LightningModule.
         # It's automatically updated when using self.to(device).
         self.to(device)
+
+    @property
+    def meta_collection_enabled(self) -> bool:
+        """Whether diagnostic ``meta`` collection is enabled for this model.
+
+        Permanent diagnostic accessor. Introduced by action ``A7`` of the RLRC
+        meta-collection kill-switch `.junie` plan
+        (``perf_RLRP-788_meta_collection_killswitch_plan_20260827.md``).
+        """
+        return self._enable_meta_collection
+
+    def set_meta_collection_enabled(self, enable: bool) -> None:
+        """Post-construction seam mirroring :meth:`set_training_frame` (``setup.py``).
+
+        Permanent diagnostic setter. Introduced by action ``A7`` of the RLRC
+        meta-collection kill-switch `.junie` plan
+        (``perf_RLRP-788_meta_collection_killswitch_plan_20260827.md``). Also
+        propagates the flag to owned ``nn.Module`` diagnostic writers that are NOT
+        ``Model`` subclasses (e.g. ``CompositeLossAutomaticWeighting``) and thus cannot
+        inherit it; only modules already declaring ``_enable_meta_collection`` are
+        touched, so non-writer submodules are left untouched.
+        """
+        enable = bool(enable)
+        self._enable_meta_collection = enable
+        for _submodule in self.modules():
+            if _submodule is not self and hasattr(
+                _submodule, "_enable_meta_collection"
+            ):
+                _submodule._enable_meta_collection = enable
 
     def _process_batch(
         self, batch: TransitionBatch, as_float: bool = True

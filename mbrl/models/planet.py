@@ -518,11 +518,17 @@ class PlaNetModel(Model):
         loss.backward()
         nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip_norm, norm_type=2)
 
-        with torch.no_grad():
-            grad_norm = 0.0
-            for p in list(filter(lambda p: p.grad is not None, self.parameters())):
-                grad_norm += p.grad.data.norm(2).item()
-            meta["grad_norm"] = grad_norm
+        # A7 (RLRP-788): the ``grad_norm`` diagnostic costs one device->host ``.item()``
+        # sync PER parameter; gate the whole computation behind the meta-collection
+        # kill-switch so a non-monitored run pays nothing. Guarded by
+        # ``perf_RLRP-788_meta_collection_killswitch_plan_20260827.md`` (RLRC
+        # meta-collection kill-switch `.junie` plan).
+        if self._enable_meta_collection:
+            with torch.no_grad():
+                grad_norm = 0.0
+                for p in list(filter(lambda p: p.grad is not None, self.parameters())):
+                    grad_norm += p.grad.data.norm(2).item()
+                meta["grad_norm"] = grad_norm
         optimizer.step()
         return loss.item(), meta
 
