@@ -368,6 +368,8 @@ class ModelTrainer:
         dataloader_pin_memory: bool = False,
         dataloader_persistent_workers: bool = False,
         dataloader_prefetch_factor: Optional[int] = None,
+        optim_fused: Optional[bool] = None,
+        optim_capturable: Optional[bool] = None,
     ):
         """
         ``use_preallocated_best_weights_buffer`` (opt-in, default False):
@@ -396,6 +398,21 @@ class ModelTrainer:
             raises otherwise). Legacy defaults preserve the historical
             behaviour bit-exact (single-process data loading, no
             pinned host memory, no prefetch).
+
+        ``optim_fused`` / ``optim_capturable`` (opt-in, default legacy: ``None``):
+            RLRP-783 follow-up action ``A8`` (see
+            ``perf_RLRP-783_mtm_pro_models_code_optimization_plan_20260827.md``).
+            When left ``None`` the default single-tensor Adam kernel is built
+            unchanged (its ``torch.optim.optimizer._get_value(step)`` does one
+            ``.item()`` device->host sync per parameter, every step). Passing
+            ``optim_fused=True`` (CUDA-only) collapses the step into one fused
+            kernel with no per-parameter ``.item()``; ``optim_capturable=True``
+            keeps ``step`` on device (portable fallback, also removes the sync).
+            Only forwarded to ``optim.Adam`` when not ``None`` so the legacy
+            call site stays byte-for-byte identical when unused. NOTE: fused
+            Adam is NOT bit-exact vs the single-tensor kernel — the RLRC seam
+            (:func:`tools.torch_tools.optimizer_instantiation.change_optimizer`)
+            gates it behind a config flag and a CUDA-availability guard.
         """
         self.model = model
         self._train_iteration = 0
@@ -437,11 +454,21 @@ class ModelTrainer:
         self.weight_decay = weight_decay
         self.optim_eps = optim_eps
 
+        # RLRP-783 (A8): thread the opt-in fused/capturable Adam kwargs only
+        # when explicitly requested so the legacy single-tensor path is
+        # byte-for-byte unchanged when they are ``None``
+        # (``perf_RLRP-783_mtm_pro_models_code_optimization_plan_20260827.md``).
+        _adam_extra_kwargs: Dict[str, bool] = {}
+        if optim_fused is not None:
+            _adam_extra_kwargs["fused"] = bool(optim_fused)
+        if optim_capturable is not None:
+            _adam_extra_kwargs["capturable"] = bool(optim_capturable)
         self.optimizer = optim.Adam(
             self.model.parameters(),
             lr=self.optim_lr,
             weight_decay=self.weight_decay,
             eps=self.optim_eps,
+            **_adam_extra_kwargs,
         )
 
         # Monkey-patch ``configure_optimizers`` on the model instance so that
