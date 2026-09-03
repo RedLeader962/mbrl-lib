@@ -953,6 +953,38 @@ class ReplayBuffer:
                 f"No replay buffer found at '{pt_path}' or '{npz_path}'."
             )
 
+    def to(self, device: Optional[Union[torch.device, str]]) -> "ReplayBuffer":
+        """Relocates the whole storage to ``device``, in place.
+
+        NOTE (RLRP-775 action ``A19``): companion of the ``device=`` ctor
+        kwarg (actions ``C1`` + ``F-C1b``). Some RLRC call-sites cannot
+        allocate on-device up front because they fill the buffer row by
+        row in a python loop (one tiny synchronous H→D copy per ``add``,
+        plus a device sync on every ``if terminated`` read). Those build
+        on CPU and relocate ONCE at the end with this method, which keeps
+        the cheap host-side build AND the on-device batch gathers.
+
+        ``device=None`` moves the storage back to the host and restores
+        the legacy CPU path. Bookkeeping (``num_stored``, ``cur_idx``,
+        ``trajectory_indices``, ``rng``) is preserved; a no-op when the
+        storage already lives on ``device``.
+        """
+        new_device = torch.device(device) if device is not None else None
+        if new_device == self.device:
+            return self
+
+        total = self.capacity + (self.max_trajectory_length or 0)
+        td_all = self._storage[:total]
+        td_all = td_all.cpu() if new_device is None else td_all.to(new_device)
+
+        self._storage = TensorStorage(storage=td_all)
+        self._torchrl_rb = TensorDictReplayBuffer(
+            storage=self._storage,
+            sampler=SamplerWithoutReplacement(drop_last=False, shuffle=True),
+        )
+        self.device = new_device
+        return self
+
     def get_all(self, shuffle: bool = False) -> TransitionBatch:
         """Returns all transitions stored in the replay buffer."""
         if self.num_stored == 0:
