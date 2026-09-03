@@ -20,6 +20,8 @@ import pytorch_lightning as pl
 from mbrl.util.logger import Logger
 from mbrl.util.replay_buffer import BootstrapIterator, TransitionIterator
 
+from .epoch_profiler import maybe_build_epoch_profiler_callbacks
+
 from .model import Ensemble, Model
 from .one_dim_tr_model import OneDTransitionRewardModel
 
@@ -70,10 +72,31 @@ class _WarmupAwareEarlyStopping(EarlyStopping):
 
 
 class _IteratorDataset(IterableDataset):
+    """``IterableDataset`` bridge exposing a :class:`TransitionIterator` to Lightning.
+
+    RLRP-775 action A12 (plan ``perf_tcn_ms2ss_training_speed_RLRP-775.md``, §6.5.3):
+    this bridge is deliberately **unsharded** -- a ``TransitionIterator`` owns its
+    own permutation/bootstrap RNG and cannot be split across worker processes
+    without re-homing that RNG. With ``num_workers >= 2`` every forked worker
+    therefore replays the FULL iterator, silently multiplying the epoch (measured:
+    40 -> 80 batches at 2 workers) and hence the number of optimizer steps. Since a
+    silent gradient-update multiplier must never be reachable from a config key,
+    ``__iter__`` now **fails loud** instead.
+    """
+
     def __init__(self, it: TransitionIterator):
         self.it = it
 
     def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None and worker_info.num_workers > 1:
+            raise RuntimeError(
+                "`_IteratorDataset` is not shardable: it wraps a `TransitionIterator` "
+                "that owns its own permutation/bootstrap RNG, so every DataLoader "
+                f"worker would replay the whole epoch ({worker_info.num_workers=} "
+                "=> that many times more optimizer steps per epoch). Set "
+                "`mbrl_lib.dataloader.num_workers` to 0 or 1 (RLRP-775 action A12)."
+            )
         return iter(self.it)
 
     def __len__(self):
@@ -623,6 +646,19 @@ class ModelTrainer:
         # on does not crash or warn on those runners.
         _num_workers = self._dataloader_num_workers
         _pin_memory = self._dataloader_pin_memory and self.model.device.type == "cuda"
+
+        # RLRP-775 action A12 -- hazard H1: `_IteratorDataset` is unshardable
+        # (see its docstring), so `num_workers >= 2` duplicates the epoch. Refuse
+        # it at the seam where the intent is expressed, with an actionable message,
+        # rather than letting the run silently train on N copies of every batch.
+        if _num_workers > 1:
+            raise ValueError(
+                f"Unsupported `mbrl_lib.dataloader.num_workers={_num_workers}`: the "
+                "`TransitionIterator` -> `IterableDataset` bridge is not shardable, "
+                "so each worker would replay the full epoch. Use 0 (in-process, the "
+                "benchmarked-fastest default) or 1 (RLRP-775 action A12)."
+            )
+
         _dl_kwargs = {
             "batch_size": None,
             "num_workers": _num_workers,
@@ -631,8 +667,21 @@ class ModelTrainer:
         if _num_workers > 0:
             # ``persistent_workers`` / ``prefetch_factor`` are only
             # valid when ``num_workers > 0``; PyTorch raises otherwise.
-            if self._dataloader_persistent_workers:
-                _dl_kwargs["persistent_workers"] = True
+            #
+            # RLRP-775 action A12 -- hazard H2: a NON-persistent worker is re-forked
+            # every epoch from the parent's pre-iteration state, which freezes the
+            # per-epoch reshuffle (the same batch order forever) on top of paying the
+            # respawn cost. `persistent_workers` is therefore FORCED whenever workers
+            # are used; the cfg flag can no longer select the broken combination.
+            _dl_kwargs["persistent_workers"] = True
+            if not self._dataloader_persistent_workers:
+                warnings.warn(
+                    "Forcing `persistent_workers=True` because "
+                    f"`num_workers={_num_workers} > 0`: non-persistent workers freeze "
+                    "the per-epoch reshuffle of the underlying `TransitionIterator` "
+                    "(RLRP-775 action A12).",
+                    RuntimeWarning,
+                )
             if self._dataloader_prefetch_factor is not None:
                 _dl_kwargs["prefetch_factor"] = self._dataloader_prefetch_factor
         train_loader = DataLoader(_IteratorDataset(dataset_train), **_dl_kwargs)
@@ -677,6 +726,12 @@ class ModelTrainer:
         )
         callbacks.append(legacy_cb)
 
+        # RLRP-775 action A11: opt-in per-epoch profiler (loader wait vs. compute,
+        # train vs. validation share, encoder share of device time). Returns an
+        # EMPTY list unless `RLRC_PROFILE_EPOCH` is set, so a production run is
+        # completely unaffected.
+        callbacks.extend(maybe_build_epoch_profiler_callbacks())
+
         max_epochs = num_epochs if num_epochs is not None else 1000
 
         with warnings.catch_warnings():
@@ -695,7 +750,16 @@ class ModelTrainer:
                     callbacks=callbacks,
                     enable_progress_bar=False,
                     enable_model_summary=False,
-                    devices="auto",
+                    # RLRP-775 action A15: PIN a single device. With
+                    # `devices="auto"` Lightning selects EVERY visible
+                    # accelerator and silently switches to a distributed
+                    # strategy -- on a multi-GPU node (e.g. the 4xA100 Valeria
+                    # nodes, whenever `CUDA_VISIBLE_DEVICES` is not narrowed by
+                    # `--gres`) that would wrap a training loop this codebase
+                    # explicitly documents as single-device. Multi-GPU support
+                    # must be an explicit feature, never an accident of the
+                    # environment.
+                    devices=1,
                     accelerator=self._accelerator,
                     logger=False,
                     num_sanity_val_steps=0,
